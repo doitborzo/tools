@@ -31,7 +31,10 @@
 #   WORK=/workspace        where the venv, model cache, dataset and runs go
 #                          (default /workspace if writable, else ~/lora-work)
 #   WIDTH=896              frame width fed to the model (train and eval)
-#   EPOCHS=2               passes over the training cows
+#   EPOCHS=1               passes over the training cows
+#   TRAIN_FIELDS=posture   what the loss trains: "posture" leaves the activity answer
+#                          to the base model (activity learned on ava_train did not
+#                          carry over to val); "both" trains posture and activity
 #   TRAIN_LIMIT=0          cap on training cows, 0 = all (e.g. 6000 for a quick proof)
 #   BATCH=4 ACCUM=4        per-step batch and gradient accumulation (effective 16)
 #   LR=5e-5 RANK=8         LoRA learning rate and rank
@@ -45,7 +48,8 @@
 #   HF_TOKEN=...           only for qlora: the BF16 repo may be gated
 #   CUDA_WANT=12.8         newest CUDA toolkit to install, or "skip"
 #   TORCH_BACKEND=cu128    force a torch build instead of matching CUDA
-#   RUN_NAME=...           default: lora2_w<WIDTH>[_n<TRAIN_LIMIT>] - stable, so a rerun resumes it
+#   RUN_NAME=...           default: lora2pose_w<WIDTH> (lora2_w<WIDTH> with TRAIN_FIELDS=both),
+#                          plus _n<TRAIN_LIMIT> - stable, so a rerun resumes it
 #   LOCAL_DATA=~/cbvd5-local  local-disk copy of the keyframes read during training
 #                          and eval, when $WORK is on another (network) volume; "off" to skip
 #   TRIES=6                attempts at the whole run before giving up. Every step
@@ -64,7 +68,8 @@ if [ -z "${WORK:-}" ]; then
     else WORK="$HOME/lora-work"; fi
 fi
 WIDTH="${WIDTH:-896}"
-EPOCHS="${EPOCHS:-2}"
+EPOCHS="${EPOCHS:-1}"
+TRAIN_FIELDS="${TRAIN_FIELDS:-posture}"
 TRAIN_LIMIT="${TRAIN_LIMIT:-0}"
 BATCH="${BATCH:-4}"
 ACCUM="${ACCUM:-4}"
@@ -80,8 +85,10 @@ PRECISION="${PRECISION:-auto}"
 # No date in the default name: a run restarted after midnight must find its
 # own checkpoints, not start a fresh directory. "lora2": held-out dev clips
 # and best-snapshot selection; lora_w896 was the first run, without them.
-if [ "$TRAIN_LIMIT" != "0" ]; then RUN_NAME="${RUN_NAME:-lora2_w${WIDTH}_n${TRAIN_LIMIT}}"; fi
-RUN_NAME="${RUN_NAME:-lora2_w${WIDTH}}"
+# "pose": posture-only loss.
+run_kind=lora2; [ "$TRAIN_FIELDS" = "posture" ] && run_kind=lora2pose
+if [ "$TRAIN_LIMIT" != "0" ]; then RUN_NAME="${RUN_NAME:-${run_kind}_w${WIDTH}_n${TRAIN_LIMIT}}"; fi
+RUN_NAME="${RUN_NAME:-${run_kind}_w${WIDTH}}"
 
 MODEL="RedHatAI/Muse-Glimmer-30B-FP8-block"
 MODEL_BF16="meta-models/Muse-Glimmer-30B"
@@ -192,7 +199,7 @@ if [ -z "${LORA_IN_TMUX:-}" ]; then
         exit 1
     fi
     knobs=""
-    for v in WORK WIDTH EPOCHS TRAIN_LIMIT BATCH ACCUM LR RANK EVAL_BASE PRECISION RUN_NAME KEEP_ZIP HF_TOKEN CUDA_WANT TORCH_BACKEND LOCAL_DATA TRIES HOLDOUT DEV_EVERY FRAMES_PER_CLIP; do
+    for v in WORK WIDTH EPOCHS TRAIN_LIMIT BATCH ACCUM LR RANK EVAL_BASE PRECISION RUN_NAME KEEP_ZIP HF_TOKEN CUDA_WANT TORCH_BACKEND LOCAL_DATA TRIES HOLDOUT DEV_EVERY FRAMES_PER_CLIP TRAIN_FIELDS; do
         [ -n "${!v:-}" ] && knobs+="$v=$(printf '%q' "${!v}") "
     done
     self="$(printf '%q' "$HERE/$(basename "${BASH_SOURCE[0]}")")"
@@ -687,6 +694,7 @@ if [ -f "$OUT/adapter/adapter_config.json" ] && [ -f "$OUT/train_meta.json" ]; t
     echo "adapter already trained: $OUT/adapter"
 else
     python lora/train_lora.py train "${COMMON[@]}" "${SPLIT[@]}" --dev-every "$DEV_EVERY" \
+        --train-fields "$TRAIN_FIELDS" \
         --epochs "$EPOCHS" --batch "$BATCH" --accum "$ACCUM" --lr "$LR" --rank "$RANK" \
         --alpha "$((RANK * 2))"
 fi

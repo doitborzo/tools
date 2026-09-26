@@ -248,6 +248,23 @@ class Chat:
     def suffix_ids(self, text):
         return self.tok(text, add_special_tokens=False)["input_ids"]
 
+    def loss_flags(self, posture, activity, fields):
+        """One flag per suffix token: does the loss train it. fields="posture"
+        leaves out the tokens of the activity value, so the adapter learns
+        the answer format and the posture but is never told what activity
+        to answer - that stays the base model's call. Activity learned from
+        ava_train did not carry over to val, which looks like another
+        recording session (clips 341-394)."""
+        text = self.suffix(posture, activity)
+        ids = self.tok(text, add_special_tokens=False, return_offsets_mapping=True)
+        if fields == "both":
+            return [True] * len(ids["input_ids"])
+        body = answer_json(posture, activity)
+        key = '"activity": "'
+        start = len(self.answer_open) + body.index(key) + len(key)
+        end = start + len(activity)
+        return [not (a < end and b > start) for a, b in ids["offset_mapping"]]
+
 
 _NESTED = {}
 
@@ -268,27 +285,29 @@ def encode(processor, texts, images):
 
 
 class Collator:
-    def __init__(self, processor, chat, root, width, quality):
+    def __init__(self, processor, chat, root, width, quality, fields="both"):
         self.processor, self.chat = processor, chat
         self.root, self.width, self.quality = root, width, quality
+        self.fields = fields
 
     def __call__(self, rows):
         import torch
-        texts, images, n_answer = [], [], []
+        texts, images, flags = [], [], []
         for r in rows:
             suffix = self.chat.suffix(r["gt_posture"], r["gt_activity"])
             texts.append(self.chat.prefix + suffix)
             images.append(make_image(self.root, r, self.width, self.quality))
-            n_answer.append(len(self.chat.suffix_ids(suffix)))
+            flags.append(self.chat.loss_flags(r["gt_posture"], r["gt_activity"], self.fields))
         enc = encode(self.processor, texts, images)
         # Left padding puts every answer at the very end of its row, so the
         # answer is always the last n tokens and the loss only needs the logits
-        # of the last max(n)+1 positions - not a 202k-wide vocabulary over the
+        # of the last n+1 positions - not a 202k-wide vocabulary over the
         # whole ~1000-token sequence.
         mask = torch.zeros_like(enc["input_ids"], dtype=torch.bool)
-        for i, n in enumerate(n_answer):
-            mask[i, -n:] = True
+        for i, f in enumerate(flags):
+            mask[i, -len(f):] = torch.tensor(f)
         enc["answer_mask"] = mask
+        enc["answer_len"] = torch.tensor([len(f) for f in flags])
         return dict(enc)
 
 
@@ -421,7 +440,9 @@ def answer_loss(model, batch):
     import torch.nn.functional as F
     batch = dict(batch)
     mask = batch.pop("answer_mask")
-    k = int(mask.sum(1).max())
+    # The whole answer, not just its trained tokens: with fields="posture"
+    # the mask has a gap where the activity value is.
+    k = int(batch.pop("answer_len").max())
     try:
         logits = model(**batch, logits_to_keep=k + 1, use_cache=False).logits
     except TypeError:
@@ -531,20 +552,23 @@ def cmd_train(args):
     processor.tokenizer.padding_side = "left"
     chat = Chat(processor)
     print(f"[chat] answer wrapped as {chat.answer_open!r} ... {chat.answer_close!r}", flush=True)
-    collate = Collator(processor, chat, args.root, args.width, args.jpeg_quality)
+    collate = Collator(processor, chat, args.root, args.width, args.jpeg_quality,
+                       args.train_fields)
 
     # --- sanity, before any hour is spent -----------------------------
     probe = collate(rows[:2])
     ids, mask = probe["input_ids"], probe["answer_mask"]
     for i, r in enumerate(rows[:2]):
         want = chat.suffix_ids(chat.suffix(r["gt_posture"], r["gt_activity"]))
-        got = ids[i][mask[i]].tolist()
+        got = ids[i][-len(want):].tolist()
         if got != want:
             raise SystemExit("answer tokens do not line up with the sequence end - the loss "
                              f"would train on the wrong tokens.\nwant {want}\ngot  {got}")
     seq_len = int(ids.shape[1])
-    print(f"[data] {len(rows)} examples, {seq_len} tokens each, "
-          f"answer {int(mask.sum(1).max())} tokens", flush=True)
+    trained = chat.tok.decode(ids[0][mask[0]].tolist())
+    print(f"[data] {len(rows)} examples, {seq_len} tokens each, answer "
+          f"{int(probe['answer_len'].max())} tokens; fields={args.train_fields}, "
+          f"loss on: {trained!r}", flush=True)
 
     val = read_jsonl(args.manifest)
     pick = random.Random(0).sample(val, min(16, len(val)))
@@ -683,6 +707,7 @@ def cmd_train(args):
                  "modules": n_targets, "trainable_params": trainable},
         "optim": {"lr": args.lr, "epochs": args.epochs, "batch": args.batch, "accum": args.accum,
                   "effective_batch": args.batch * args.accum, "steps": trainer.state.global_step},
+        "train_fields": args.train_fields,
         "zero_shot_answer_loss": zero_shot,
         "dev": {"best": best, "every": args.dev_every, "history": hist_path},
         "first_loss": losses[0] if losses else None,
@@ -825,6 +850,8 @@ def main(argv=None):
     p.add_argument("--dev-batch", type=int, default=8)
     p.add_argument("--frames-per-clip", type=int, default=3,
                    help="training keyframes kept per clip, spread over it; 0 = all six")
+    p.add_argument("--train-fields", choices=("both", "posture"), default="both",
+                   help="posture: no loss on the activity value; activity stays the base model's")
     p.add_argument("--sample", type=int, default=800,
                    help="manifest: training cows to pick (whole keyframes)")
     p.add_argument("--manifest-out", default=None,
