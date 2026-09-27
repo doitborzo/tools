@@ -173,7 +173,7 @@ def cmd_run(args):
     cli = client_mod.MuseClient(
         base_url=args.base_url, model=args.model, api_key=args.api_key,
         temperature=args.temperature, max_tokens=args.max_tokens,
-        timeout=args.timeout, retries=args.retries)
+        timeout=args.timeout, retries=args.retries, answer_now=args.answer_now)
 
     info = cli.server_info()
     meta = {
@@ -185,7 +185,9 @@ def cmd_run(args):
         "server": info,
         "temperature": args.temperature,
         "seed": 0,
-        "max_tokens": args.max_tokens,
+        "max_tokens": 64 if args.answer_now else args.max_tokens,
+        "reasoning": ("off: the answer is prefilled with " + client_mod.ANSWER_PREFILL
+                      if args.answer_now else "on"),
         "render_mode": args.mode,
         "min_width": args.min_width,
         "frames": args.frames,
@@ -384,6 +386,9 @@ def main(argv=None):
     sr.add_argument("--timeout", type=float, default=300.0)
     sr.add_argument("--retries", type=int, default=3)
     sr.add_argument("--fresh", action="store_true", help="discard previous results")
+    sr.add_argument("--answer-now", action="store_true",
+                    help="no reasoning, no json_schema: start the answer for the model, as a "
+                         "LoRA from lora/train_lora.py was trained (use with --max-width 896)")
     sr.set_defaults(func=cmd_run)
 
     ss = sub.add_parser("score", help="compute metrics")

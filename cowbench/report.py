@@ -97,8 +97,11 @@ def render(meta: dict, metrics: dict, results=None) -> str:
             add(f"| Adapter | `{meta['adapter']}` |")
     else:
         add(f"| Serving | vLLM {meta.get('vllm_version') or '?'} |")
+        output = ("structured output (json_schema)"
+                  if not str(meta.get("reasoning", "")).startswith("off")
+                  else f"reasoning {meta['reasoning']}, no json_schema")
         add(f"| Sampling | temperature={meta.get('temperature')}, seed={meta.get('seed')}, "
-            f"max_tokens={meta.get('max_tokens')}, structured output (json_schema) |")
+            f"max_tokens={meta.get('max_tokens')}, {output} |")
     frames = meta.get("frames") or 1
     temporal = ("annotated keyframe only (single still)" if frames <= 1
                 else f"{frames} frames over {meta.get('span')}s from the clip")

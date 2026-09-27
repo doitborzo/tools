@@ -73,6 +73,27 @@ SCHEMA = {
 }
 
 
+# --answer-now: the assistant turn is started for the model, so it answers at
+# once instead of reasoning first - what a LoRA from lora/train_lora.py was
+# trained on, token for token: the chat template renders this prefill as
+# "<|start|>assistant to=user<|message|>{"posture": "". No json_schema then:
+# guided decoding would demand a fresh object, not the rest of this one, and
+# the adapter answers without the confidence field the schema requires.
+ANSWER_PREFILL = '{"posture": "'
+
+
+def parse_enums(text: str):
+    """The two fields from an answer that is not clean JSON: the enum values
+    named after their keys."""
+    import re
+    out = {}
+    for key, values in (("posture", POSTURES), ("activity", ACTIVITIES)):
+        m = re.search(r'"%s"\s*:\s*"(%s)"' % (key, "|".join(values)), text)
+        if m:
+            out[key] = m.group(1)
+    return out
+
+
 class ModelError(RuntimeError):
     pass
 
@@ -80,7 +101,8 @@ class ModelError(RuntimeError):
 class MuseClient:
     def __init__(self, base_url: str, model: str, api_key: str = "EMPTY",
                  temperature: float = 0.0, max_tokens: int = 2048,
-                 timeout: float = 300.0, retries: int = 3):
+                 timeout: float = 300.0, retries: int = 3, answer_now: bool = False):
+        self.answer_now = answer_now
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.temperature = temperature
@@ -110,6 +132,9 @@ class MuseClient:
         return info
 
     def classify(self, data_urls, n_frames: int = 1, span: float = 0.0) -> dict:
+        if self.answer_now:
+            # About 12 tokens of answer; nothing to think through first.
+            return self._once(data_urls, n_frames, span, 64)
         out = self._once(data_urls, n_frames, span, self.max_tokens)
         # Muse Glimmer thinks before it answers, and the more frames it is given
         # the longer it thinks: five frames routinely overrun a budget one frame
@@ -134,6 +159,11 @@ class MuseClient:
                 "json_schema": {"name": "cow_behaviour", "schema": SCHEMA, "strict": True},
             },
         }
+        if self.answer_now:
+            del payload["response_format"]
+            payload["messages"].append({"role": "assistant", "content": ANSWER_PREFILL})
+            payload["continue_final_message"] = True
+            payload["add_generation_prompt"] = False
 
         last = None
         for attempt in range(self.retries):
@@ -155,6 +185,11 @@ class MuseClient:
 
         message = body["choices"][0]["message"]
         raw = message.get("content") or ""
+        if self.answer_now:
+            # A reasoning parser that finds no reasoning block may file the
+            # whole answer under "reasoning"; the answer is wherever the text is.
+            raw = ANSWER_PREFILL + (raw or message.get("reasoning")
+                                    or message.get("reasoning_content") or "")
         out = {
             "raw": raw,
             # Muse Glimmer runs with --reasoning-parser, so the chain of thought
@@ -173,5 +208,10 @@ class MuseClient:
             out["activity"] = parsed.get("activity")
             out["confidence"] = parsed.get("confidence")
         except Exception as exc:
-            out["parse_error"] = f"{type(exc).__name__}: {exc}"
+            found = parse_enums(raw) if self.answer_now else {}
+            if found:
+                out.update(found)
+                out["parse_note"] = f"not clean JSON ({type(exc).__name__}); fields read by name"
+            else:
+                out["parse_error"] = f"{type(exc).__name__}: {exc}"
         return out
