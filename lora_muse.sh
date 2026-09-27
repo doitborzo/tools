@@ -324,7 +324,8 @@ exec vllm serve "$MODEL" \
     --reasoning-parser muse_glimmer \
     --trust-remote-code \
     --enable-lora --max-lora-rank 8 --max-loras 2 \
-    --lora-modules pose200=/workspace/lora2pose_w896/adapter pose638=/workspace/lora2pose_w896/adapters/step-00638
+    --lora-modules pose200=/workspace/lora-runs/lora2pose_w896/adapter \ 
+                   pose638=/workspace/lora-runs/lora2pose_w896/adapters/step-00638
     --max-model-len "$MAX_MODEL_LEN" \
     --gpu-memory-utilization 0.95 \
     --port "$PORT"
