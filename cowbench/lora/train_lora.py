@@ -249,15 +249,24 @@ class Chat:
         return self.tok(text, add_special_tokens=False)["input_ids"]
 
     def loss_flags(self, posture, activity, fields):
-        """One flag per suffix token: does the loss train it. fields="posture"
-        leaves out the tokens of the activity value, so the adapter learns
-        the answer format and the posture but is never told what activity
-        to answer - that stays the base model's call. Activity learned from
-        ava_train did not carry over to val, which looks like another
-        recording session (clips 341-394)."""
+        """One flag per suffix token: does the loss train it.
+
+        both             every answer token
+        posture          not the activity value: the adapter learns the format
+                         and the posture, the activity answer stays the base
+                         model's. Activity learned from ava_train did not carry
+                         over to val, which looks like another recording
+                         session (clips 341-394).
+        skip-ruminating  not the activity value of cows labelled ruminating;
+                         feeding, drinking and none are trained. Rumination
+                         cannot be seen on a still, is labelled per clip rather
+                         than per cow, and its 1106 standing-at-the-barrier
+                         labels in train are what taught the first adapters to
+                         call feeding cows ruminating on val.
+        """
         text = self.suffix(posture, activity)
         ids = self.tok(text, add_special_tokens=False, return_offsets_mapping=True)
-        if fields == "both":
+        if fields == "both" or (fields == "skip-ruminating" and activity != "ruminating"):
             return [True] * len(ids["input_ids"])
         body = answer_json(posture, activity)
         key = '"activity": "'
@@ -684,15 +693,18 @@ def cmd_train(args):
 
     adapter = os.path.join(args.out, "adapter")
     best = None
+    # Judged on what was trained: a posture-only adapter by posture, where
+    # small activity drift between steps is noise, not something it learnt.
+    metric = "posture" if args.train_fields == "posture" else "exact"
     if dev:
         if trainer.state.global_step not in done_steps:
             dev_eval(model, trainer.state.global_step)
         scored = {h["step"]: h for h in read_jsonl(hist_path) if h["step"] > 0}
-        best = min(scored.values(), key=lambda h: (h["exact"], h["step"]))
+        best = min(scored.values(), key=lambda h: (h[metric], h["exact"], h["step"]))
         shutil.rmtree(adapter, ignore_errors=True)
         shutil.copytree(os.path.join(args.out, "adapters", f"step-{best['step']:05d}"), adapter)
-        print(f"[dev] best: step {best['step']} of {trainer.state.global_step}, "
-              f"exact {best['exact']:.1%} (base {read_jsonl(hist_path)[0]['exact']:.1%}) "
+        print(f"[dev] best by {metric}: step {best['step']} of {trainer.state.global_step}, "
+              f"posture {best['posture']:.1%}, exact {best['exact']:.1%} (base {read_jsonl(hist_path)[0]['exact']:.1%}) "
               f"-> {adapter}", flush=True)
     else:
         model.save_pretrained(adapter)
@@ -709,7 +721,7 @@ def cmd_train(args):
                   "effective_batch": args.batch * args.accum, "steps": trainer.state.global_step},
         "train_fields": args.train_fields,
         "zero_shot_answer_loss": zero_shot,
-        "dev": {"best": best, "every": args.dev_every, "history": hist_path},
+        "dev": {"best": best, "chosen_by": metric, "every": args.dev_every, "history": hist_path},
         "first_loss": losses[0] if losses else None,
         "last_loss": sum(losses[-10:]) / len(losses[-10:]) if losses else None,
         "hours_this_session": round(hours, 2),
@@ -850,8 +862,9 @@ def main(argv=None):
     p.add_argument("--dev-batch", type=int, default=8)
     p.add_argument("--frames-per-clip", type=int, default=3,
                    help="training keyframes kept per clip, spread over it; 0 = all six")
-    p.add_argument("--train-fields", choices=("both", "posture"), default="both",
-                   help="posture: no loss on the activity value; activity stays the base model's")
+    p.add_argument("--train-fields", choices=("both", "posture", "skip-ruminating"), default="both",
+                   help="posture: no loss on the activity value; skip-ruminating: none on the "
+                        "activity value of ruminating cows (see Chat.loss_flags)")
     p.add_argument("--sample", type=int, default=800,
                    help="manifest: training cows to pick (whole keyframes)")
     p.add_argument("--manifest-out", default=None,

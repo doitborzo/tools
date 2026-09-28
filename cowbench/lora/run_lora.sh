@@ -30,13 +30,18 @@
 # Knobs, all optional:
 #   WORK=/workspace        where the venv, model cache, dataset and runs go
 #                          (default /workspace if writable, else ~/lora-work)
-#   WIDTH=896              frame width fed to the model (train and eval)
+#   WIDTH=1920             frame width fed to the model (train and eval); 1920 is the
+#                          keyframes' own width, ~2900 tokens a cow against ~850 at 896,
+#                          so a step takes ~3.5x as long
 #   EPOCHS=1               passes over the training cows
-#   TRAIN_FIELDS=posture   what the loss trains: "posture" leaves the activity answer
-#                          to the base model (activity learned on ava_train did not
-#                          carry over to val); "both" trains posture and activity
+#   TRAIN_FIELDS=skip-ruminating  what the loss trains: posture and activity, but not
+#                          the activity of cows labelled ruminating (see loss_flags in
+#                          train_lora.py); "posture" leaves activity to the base model,
+#                          "both" trains every answer token
 #   TRAIN_LIMIT=0          cap on training cows, 0 = all (e.g. 6000 for a quick proof)
-#   BATCH=4 ACCUM=4        per-step batch and gradient accumulation (effective 16)
+#   BATCH=2 ACCUM=8        per-step batch and gradient accumulation (effective 16);
+#                          4 x 4 fits 80 GB at 896 px, not at 1920
+#   EVAL_BATCH=8           cows per generate call, in dev scoring and in the val eval
 #   LR=5e-5 RANK=8         LoRA learning rate and rank
 #   HOLDOUT=0.1            share of training clips held out as dev; the adapter is
 #                          scored on 300 of their cows every DEV_EVERY=100 steps, and
@@ -48,8 +53,9 @@
 #   HF_TOKEN=...           only for qlora: the BF16 repo may be gated
 #   CUDA_WANT=12.8         newest CUDA toolkit to install, or "skip"
 #   TORCH_BACKEND=cu128    force a torch build instead of matching CUDA
-#   RUN_NAME=...           default: lora2pose_w<WIDTH> (lora2_w<WIDTH> with TRAIN_FIELDS=both),
-#                          plus _n<TRAIN_LIMIT> - stable, so a rerun resumes it
+#   RUN_NAME=...           default: lora3norum_w<WIDTH>, lora2pose_w<WIDTH> or
+#                          lora2_w<WIDTH> by TRAIN_FIELDS, plus _n<TRAIN_LIMIT> -
+#                          stable, so a rerun resumes it
 #   LOCAL_DATA=~/cbvd5-local  local-disk copy of the keyframes read during training
 #                          and eval, when $WORK is on another (network) volume; "off" to skip
 #   TRIES=6                attempts at the whole run before giving up. Every step
@@ -67,12 +73,13 @@ if [ -z "${WORK:-}" ]; then
     if mkdir -p /workspace 2>/dev/null && [ -w /workspace ]; then WORK=/workspace
     else WORK="$HOME/lora-work"; fi
 fi
-WIDTH="${WIDTH:-896}"
+WIDTH="${WIDTH:-1920}"
 EPOCHS="${EPOCHS:-1}"
-TRAIN_FIELDS="${TRAIN_FIELDS:-posture}"
+TRAIN_FIELDS="${TRAIN_FIELDS:-skip-ruminating}"
 TRAIN_LIMIT="${TRAIN_LIMIT:-0}"
-BATCH="${BATCH:-4}"
-ACCUM="${ACCUM:-4}"
+BATCH="${BATCH:-2}"
+ACCUM="${ACCUM:-8}"
+EVAL_BATCH="${EVAL_BATCH:-8}"
 LR="${LR:-5e-5}"
 RANK="${RANK:-8}"
 HOLDOUT="${HOLDOUT:-0.1}"
@@ -85,8 +92,12 @@ PRECISION="${PRECISION:-auto}"
 # No date in the default name: a run restarted after midnight must find its
 # own checkpoints, not start a fresh directory. "lora2": held-out dev clips
 # and best-snapshot selection; lora_w896 was the first run, without them.
-# "pose": posture-only loss.
-run_kind=lora2; [ "$TRAIN_FIELDS" = "posture" ] && run_kind=lora2pose
+# "pose": posture-only loss; "norum": activity trained except rumination.
+case "$TRAIN_FIELDS" in
+    posture) run_kind=lora2pose ;;
+    skip-ruminating) run_kind=lora3norum ;;
+    *) run_kind=lora2 ;;
+esac
 if [ "$TRAIN_LIMIT" != "0" ]; then RUN_NAME="${RUN_NAME:-${run_kind}_w${WIDTH}_n${TRAIN_LIMIT}}"; fi
 RUN_NAME="${RUN_NAME:-${run_kind}_w${WIDTH}}"
 
@@ -199,7 +210,7 @@ if [ -z "${LORA_IN_TMUX:-}" ]; then
         exit 1
     fi
     knobs=""
-    for v in WORK WIDTH EPOCHS TRAIN_LIMIT BATCH ACCUM LR RANK EVAL_BASE PRECISION RUN_NAME KEEP_ZIP HF_TOKEN CUDA_WANT TORCH_BACKEND LOCAL_DATA TRIES HOLDOUT DEV_EVERY FRAMES_PER_CLIP TRAIN_FIELDS; do
+    for v in WORK WIDTH EPOCHS TRAIN_LIMIT BATCH ACCUM LR RANK EVAL_BASE PRECISION RUN_NAME KEEP_ZIP HF_TOKEN CUDA_WANT TORCH_BACKEND LOCAL_DATA TRIES HOLDOUT DEV_EVERY FRAMES_PER_CLIP TRAIN_FIELDS EVAL_BATCH; do
         [ -n "${!v:-}" ] && knobs+="$v=$(printf '%q' "${!v}") "
     done
     self="$(printf '%q' "$HERE/$(basename "${BASH_SOURCE[0]}")")"
@@ -663,7 +674,8 @@ else
     BASE_ARG=()
 fi
 
-COMMON=(--root "$RUN_DATA" --out "$OUT" --width "$WIDTH" --precision "$PRECISION" "${BASE_ARG[@]}")
+COMMON=(--root "$RUN_DATA" --out "$OUT" --width "$WIDTH" --precision "$PRECISION" "${BASE_ARG[@]}"
+        --eval-batch "$EVAL_BATCH" --dev-batch "$EVAL_BATCH")
 # What picks the training and dev cows: the data check must see the same.
 SPLIT=(--train-limit "$TRAIN_LIMIT" --holdout "$HOLDOUT" --frames-per-clip "$FRAMES_PER_CLIP")
 # The base model at a given width scores the same in every run: done once,
