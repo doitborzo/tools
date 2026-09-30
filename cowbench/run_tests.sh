@@ -18,6 +18,8 @@
 #   WORK=/workspace                 where the dataset, adapter and results live
 #   ADAPTER=$WORK/lora-runs/lora2pose_w896/adapters/step-00638
 #   LORA_NAME=pose638               the adapter's model name on the server
+#   WIDTH=896                       frame width for the adapter's questions: the width
+#                                   it was trained at (lora2pose: 896, lora3norum: 1920)
 #   STREAMS=12                      cameras in the stress tests
 #   INTERVAL=10                     seconds between frames per camera, paced test
 #   DURATION=300                    seconds measured per stress test
@@ -32,11 +34,12 @@ WORK="${WORK:-/workspace}"
 ROOT="$WORK/cbvd5"
 ADAPTER="${ADAPTER:-$WORK/lora-runs/lora2pose_w896/adapters/step-00638}"
 LORA_NAME="${LORA_NAME:-pose638}"
+WIDTH="${WIDTH:-896}"
 STREAMS="${STREAMS:-12}"
 INTERVAL="${INTERVAL:-10}"
 DURATION="${DURATION:-300}"
 PORT="${PORT:-8000}"
-OUT="${OUT:-$HERE/runs/tests_${LORA_NAME}}"
+OUT="${OUT:-$HERE/runs/tests_${LORA_NAME}_w${WIDTH}}"
 BASE_URL="http://127.0.0.1:$PORT"
 PLAN="$HERE/runs/2026-09-25_val-full_w1920_f1"   # the full-val sample every run used
 SESSION=cowtests
@@ -59,7 +62,7 @@ if [ -z "${COWTESTS_IN_TMUX:-}" ]; then
         echo "already running in tmux session '$SESSION':  bash $0 log"; exit 1
     fi
     knobs=""
-    for v in WORK ADAPTER LORA_NAME STREAMS INTERVAL DURATION PORT OUT; do
+    for v in WORK ADAPTER LORA_NAME WIDTH STREAMS INTERVAL DURATION PORT OUT; do
         knobs+="$v=$(printf '%q' "${!v}") "
     done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
@@ -149,10 +152,11 @@ bench() { "$PY" cowbench.py --out "$OUT" "$@"; }
 [ -f "$OUT/manifest.jsonl" ] || cp "$PLAN/manifest.jsonl" "$PLAN/plan_meta.json" "$OUT/"
 
 step "5/7  Bench with the adapter: the known answer, as a check of the server"
-# 23.3% exact-match error was measured for pose638 through vLLM; far from it,
+# pose638 (lora2pose_w896, step 638) gave 23.3% exact-match error through vLLM
+# at 896 px; for another adapter, compare with its own eval-lora/. Far from it,
 # something in this setup differs and the tests below mean less.
 bench run --root "$ROOT" --base-url "$BASE_URL" --model "$LORA_NAME" --answer-now \
-    --max-width 896 --concurrency 16
+    --max-width "$WIDTH" --concurrency 16
 bench score
 bench score --vote
 bench report
@@ -168,8 +172,8 @@ stress() {   # skip a test whose report is already there
     bench stress --root "$ROOT" --base-url "$BASE_URL" --streams "$STREAMS" \
         --duration "$DURATION" "$@"
 }
-stress "stress_classify_${STREAMS}x_max" --model "$LORA_NAME" --answer-now --max-width 896
-stress "stress_classify_${STREAMS}x_${INTERVAL}s" --model "$LORA_NAME" --answer-now --max-width 896 \
+stress "stress_classify_${STREAMS}x_max" --model "$LORA_NAME" --answer-now --max-width "$WIDTH"
+stress "stress_classify_${STREAMS}x_${INTERVAL}s" --model "$LORA_NAME" --answer-now --max-width "$WIDTH" \
     --interval "$INTERVAL"
 stress "stress_detect_${STREAMS}x_max" --task detect --model muse-glimmer
 
@@ -177,7 +181,7 @@ tarball="$WORK/cow_tests_$(basename "$OUT").tgz"
 tar czf "$tarball" -C "$(dirname "$OUT")" "$(basename "$OUT")"
 echo
 echo "Done. Reports in $OUT:"
-echo "  report.md                         bench with $LORA_NAME (expect ~23% exact-match error)"
+echo "  report.md                         bench with $LORA_NAME at $WIDTH px"
 echo "  detect_report.md                  finding the cows without boxes"
 echo "  stress_*.md                       $STREAMS cameras at once"
 echo "Everything in one file: $tarball"
