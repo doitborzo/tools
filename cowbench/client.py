@@ -145,6 +145,56 @@ class MuseClient:
             out["retried_for_length"] = True
         return out
 
+    def _post(self, payload) -> dict:
+        last = None
+        for attempt in range(self.retries):
+            try:
+                resp = self.session.post(f"{self.base_url}/v1/chat/completions",
+                                         json=payload, timeout=self.timeout)
+                if resp.status_code >= 500 or resp.status_code == 429:
+                    raise ModelError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as exc:
+                last = exc
+                if attempt == self.retries - 1:
+                    raise ModelError(str(exc)) from exc
+                time.sleep(2 ** attempt)
+        raise ModelError(str(last))  # pragma: no cover
+
+    def ask(self, data_urls, text: str, schema: dict, name: str, max_tokens=None) -> dict:
+        """One images+text question with a JSON-schema answer, for tasks other
+        than the per-cow classification (detect.py). The parsed answer is in
+        "parsed"; the rest is kept as classify keeps it."""
+        content = [{"type": "image_url", "image_url": {"url": u}} for u in data_urls]
+        content.append({"type": "text", "text": text})
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": self.temperature,
+            "max_tokens": max_tokens or self.max_tokens,
+            "seed": 0,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": name, "schema": schema, "strict": True},
+            },
+        }
+        t0 = time.perf_counter()
+        body = self._post(payload)
+        message = body["choices"][0]["message"]
+        out = {
+            "raw": message.get("content") or "",
+            "reasoning": message.get("reasoning") or message.get("reasoning_content"),
+            "finish_reason": body["choices"][0].get("finish_reason"),
+            "usage": body.get("usage"),
+            "seconds": round(time.perf_counter() - t0, 3),
+        }
+        try:
+            out["parsed"] = json.loads(out["raw"])
+        except Exception as exc:
+            out["parse_error"] = f"{type(exc).__name__}: {exc}"
+        return out
+
     def _once(self, data_urls, n_frames, span, max_tokens) -> dict:
         content = [{"type": "image_url", "image_url": {"url": u}} for u in data_urls]
         content.append({"type": "text", "text": build_prompt(n_frames, span)})
@@ -165,23 +215,9 @@ class MuseClient:
             payload["continue_final_message"] = True
             payload["add_generation_prompt"] = False
 
-        last = None
-        for attempt in range(self.retries):
-            try:
-                resp = self.session.post(f"{self.base_url}/v1/chat/completions",
-                                         json=payload, timeout=self.timeout)
-                if resp.status_code >= 500 or resp.status_code == 429:
-                    raise ModelError(f"HTTP {resp.status_code}: {resp.text[:300]}")
-                resp.raise_for_status()
-                body = resp.json()
-                break
-            except Exception as exc:
-                last = exc
-                if attempt == self.retries - 1:
-                    raise ModelError(str(exc)) from exc
-                time.sleep(2 ** attempt)
-        else:  # pragma: no cover
-            raise ModelError(str(last))
+        t0 = time.perf_counter()
+        body = self._post(payload)
+        seconds = time.perf_counter() - t0
 
         message = body["choices"][0]["message"]
         raw = message.get("content") or ""
@@ -201,6 +237,7 @@ class MuseClient:
             "reasoning": message.get("reasoning") or message.get("reasoning_content"),
             "finish_reason": body["choices"][0].get("finish_reason"),
             "usage": body.get("usage"),
+            "seconds": round(seconds, 3),
         }
         try:
             parsed = json.loads(raw)

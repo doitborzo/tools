@@ -89,6 +89,8 @@ def render(frame_path, box_xyxy, mode: str = "marked",
     crop   - the box plus a margin. Bigger cow, no context. Useful as a
              contrast run to tell "cannot see the cow" apart from
              "cannot read the scene".
+    plain  - the whole frame, nothing drawn: for finding the cows (detect.py),
+             where no box is given.
     """
     # Either a path to a keyframe on disk or an already-decoded video frame.
     img = (frame_path if isinstance(frame_path, Image.Image)
@@ -102,6 +104,8 @@ def render(frame_path, box_xyxy, mode: str = "marked",
         x2 = min(img.width, x2 + bw * margin)
         y2 = min(img.height, y2 + bh * margin)
         img = img.crop((int(x1), int(y1), int(x2), int(y2)))
+    elif mode == "plain":
+        pass
     elif mode == "marked":
         draw = ImageDraw.Draw(img)
         # Scale the stroke with the frame so it survives the downscale below.

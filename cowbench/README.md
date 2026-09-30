@@ -172,3 +172,30 @@ version, sampling params, image mode, prompt hash) plus:
 
 `drinking` has 6 boxes in clip 371 (53 in all of val). Any per-class number for
 it is indicative only — that is what the confidence intervals are there to show.
+
+## Two more tests: finding the cows, and many cameras at once
+
+Both run on a plan made with `plan`, like the bench.
+
+**Finding the cows** (`detect.py`). The bench hands the model a box from the
+annotation; on a farm nobody does. `detect` sends each keyframe bare and asks
+for every cow as `[x1, y1, x2, y2]` in pixels, with posture and activity.
+`detect-score` matches found cows to annotated ones by IoU (0.5 and 0.3) and
+reports recall, precision, the count per frame, recall by cow size, the
+behaviour error on the cows found, and the end-to-end error: found *and* both
+answers right, over every annotated cow. It also shows recall with the boxes
+read as 0-1000 or 0-1, in case the model does not answer in pixels. Precision
+is a lower bound: a cow the annotators skipped counts as an extra.
+
+    python cowbench.py --out out-val detect
+    python cowbench.py --out out-val detect-score
+
+**Many cameras** (`stress.py`). `stress --streams 12` runs 12 cameras, each
+replaying its own val clip (the busiest clips first). `--task classify` asks
+one question per annotated cow, the cows of a frame in parallel - the bench's
+question, add `--answer-now` for a LoRA; `--task detect` asks one question per
+frame. `--interval 0` measures the most each camera gets; `--interval S` paces
+every camera at one frame per S seconds and says whether the server keeps up.
+
+    python cowbench.py --out out-val stress --streams 12 --duration 300
+    python cowbench.py --out out-val stress --streams 12 --interval 10 --model pose638 --answer-now --max-width 896

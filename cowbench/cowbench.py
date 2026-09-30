@@ -10,6 +10,11 @@ repeatable without asking the model 120 more questions.
     score  -> metrics.json     error rates, per-class, confusion
     report -> report.md        the document to hand over
 
+Two more tests on the same plan, for what a farm needs beyond the bench:
+
+    detect / detect-score      no box given: does the model find every cow?
+    stress                     N cameras at once: does the server keep up?
+
 Typical session, model served on a pod and reached through an SSH tunnel:
 
     python cowbench.py plan   --video 371
@@ -33,9 +38,11 @@ import threading
 import cbvd
 import client as client_mod
 import compare as compare_mod
+import detect as detect_mod
 import render as render_mod
 import report as report_mod
 import scoring
+import stress as stress_mod
 import tracks as tracks_mod
 
 DEFAULT_ROOT = r"C:\Users\Work\Downloads\archive"
@@ -333,6 +340,60 @@ def cmd_compare(args):
 
 # ---------------------------------------------------------------------- cli
 
+# ------------------------------------------------------- detect and stress
+
+def cmd_detect(args):
+    detect_mod.run(args, client_mod, _jsonl_read)
+
+
+def cmd_detect_score(args):
+    results = _jsonl_read(os.path.join(args.out, "detect_results.jsonl"))
+    if not results:
+        sys.exit("no detect results in {} - run `detect` first".format(args.out))
+    m = detect_mod.score(results, args.box_format)
+    with open(os.path.join(args.out, "detect_metrics.json"), "w", encoding="utf-8") as fh:
+        json.dump(m, fh, indent=2, ensure_ascii=False)
+    meta = _load_meta_file(os.path.join(args.out, "detect_meta.json"))
+    path = os.path.join(args.out, "detect_report.md")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(detect_mod.render_report(meta, m))
+    d5, d3 = m["iou0.5"], m["iou0.3"]
+    print("keyframes         : {} ({} annotated cows)".format(m["n_keyframes"], m["n_annotated"]))
+    print("recall / precision: {:.1%} / {:.1%} at IoU 0.5,  {:.1%} / {:.1%} at IoU 0.3".format(
+        d5["recall"], d5["precision"], d3["recall"], d3["precision"]))
+    print("count per frame   : {:.1f} annotated, {:.1f} found, off by {:.2f}".format(
+        m["count"]["annotated_mean"], m["count"]["found_mean"], m["count"]["mean_abs_error"]))
+    if m["end_to_end_error"] is not None:
+        print("end to end error  : {:.1%}  (found and both answers right)".format(
+            m["end_to_end_error"]))
+    print("recall by format  : " + ", ".join(
+        "{} {:.1%}".format(k, v) for k, v in m["recall_iou0.5_by_format"].items()))
+    print("-> {}".format(path))
+
+
+def _load_meta_file(path):
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def cmd_stress(args):
+    stress_mod.run(args, client_mod, _jsonl_read)
+
+
+def _server_args(sp, max_tokens):
+    sp.add_argument("--root", default=None, help="override the root recorded by plan")
+    sp.add_argument("--base-url", default="http://127.0.0.1:8000")
+    sp.add_argument("--model", default="muse-glimmer")
+    sp.add_argument("--api-key", default="EMPTY")
+    sp.add_argument("--max-width", type=int, default=1920)
+    sp.add_argument("--jpeg-quality", type=int, default=90)
+    sp.add_argument("--temperature", type=float, default=0.0)
+    sp.add_argument("--max-tokens", type=int, default=max_tokens)
+    sp.add_argument("--timeout", type=float, default=600.0)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         prog="cowbench", description=__doc__,
@@ -413,6 +474,31 @@ def main(argv=None):
     sc.add_argument("--label-b", default=None)
     sc.add_argument("--output", default=None)
     sc.set_defaults(func=cmd_compare)
+
+    sd = sub.add_parser("detect", help="find every cow on bare keyframes (no box given)")
+    _server_args(sd, 8192)   # reasoning plus a list of ~8 cows
+    sd.add_argument("--concurrency", type=int, default=4)
+    sd.add_argument("--retries", type=int, default=3)
+    sd.add_argument("--fresh", action="store_true", help="discard previous detect results")
+    sd.set_defaults(func=cmd_detect)
+
+    sds = sub.add_parser("detect-score", help="score detect results against the annotation")
+    sds.add_argument("--box-format", choices=detect_mod.BOX_FORMATS, default="pixel",
+                     help="how the model's box numbers are read (the prompt asks for pixels)")
+    sds.set_defaults(func=cmd_detect_score)
+
+    sst = sub.add_parser("stress", help="N cameras at once: throughput and latency")
+    _server_args(sst, 4096)
+    sst.add_argument("--task", choices=("classify", "detect"), default="classify",
+                     help="classify: one request per annotated cow; detect: one per frame")
+    sst.add_argument("--streams", type=int, default=12, help="cameras, one val clip each")
+    sst.add_argument("--duration", type=float, default=300, help="seconds measured")
+    sst.add_argument("--warmup", type=float, default=30, help="seconds run first, not counted")
+    sst.add_argument("--interval", type=float, default=0,
+                     help="seconds between frames per camera; 0 = as fast as possible")
+    sst.add_argument("--answer-now", action="store_true",
+                     help="classify as a LoRA from lora/train_lora.py was trained (see run)")
+    sst.set_defaults(func=cmd_stress)
 
     args = p.parse_args(argv)
     args.func(args)
