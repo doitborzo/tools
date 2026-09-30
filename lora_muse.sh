@@ -15,6 +15,9 @@ SERVED_NAME="muse-glimmer"
 PORT=8000
 GPUS="0"
 MAX_MODEL_LEN=131072
+# LoRA adapters as name=path, space-separated; cowbench/run_tests.sh sets it.
+LORA_MODULES="${LORA_MODULES:-pose638=/workspace/lora-runs/lora2pose_w896/adapters/step-00638}"
+MAX_LORA_RANK="${MAX_LORA_RANK:-16}"
 
 # "auto" resolves the torch build from the driver. It is right only when uv is
 # recent enough: uv 0.9.0 did not know CUDA 13 and quietly installed
@@ -323,8 +326,8 @@ exec vllm serve "$MODEL" \
     --tool-call-parser muse_glimmer \
     --reasoning-parser muse_glimmer \
     --trust-remote-code \
-    --enable-lora --max-lora-rank 8 --max-loras 2 \
-    --lora-modules pose638=/workspace/lora-runs/lora2pose_w896/adapters/step-00638 \
+    --enable-lora --max-lora-rank "$MAX_LORA_RANK" --max-loras 2 \
+    --lora-modules $LORA_MODULES \
     --max-model-len "$MAX_MODEL_LEN" \
     --gpu-memory-utilization 0.95 \
     --port "$PORT"
