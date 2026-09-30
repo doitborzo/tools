@@ -36,7 +36,7 @@ Find every cow in the frame: standing or lying, near or far from the camera, and
 
 For each cow give:
 
-box - [x1, y1, x2, y2], the tightest rectangle around the cow's visible body, in pixels of this image: x counted from the left edge (0 to {w}), y from the top edge (0 to {h})
+box - [x1, y1, x2, y2], the tightest rectangle around the cow's visible body, on a 0-1000 scale: x from 0 at the left edge to 1000 at the right edge, y from 0 at the top edge to 1000 at the bottom edge
 
 posture - exactly one of:
   standing  the cow carries its weight on its legs, body upright
@@ -72,7 +72,10 @@ SCHEMA = {
     "additionalProperties": False,
 }
 
-BOX_FORMATS = ("pixel", "norm1000", "norm1")
+# The prompt asks for 0-1000: asked for pixels on the full-val run, the model
+# answered 0-1000 anyway (recall at IoU 0.5: 53.2% read as 0-1000, 4.3% as
+# pixels) - its own grounding convention.
+BOX_FORMATS = ("norm1000", "pixel", "norm1")
 
 
 def frames_of(manifest):
@@ -201,7 +204,7 @@ def _predicted(rec, fmt):
     return out
 
 
-def score(results, fmt="pixel"):
+def score(results, fmt="norm1000"):
     ok = [r for r in results if "width" in r and "error" not in r]
     m = {"n_keyframes": len(results), "n_failed": len(results) - len(ok),
          "n_annotated": sum(len(r["gt"]) for r in ok), "box_format": fmt}
@@ -309,8 +312,8 @@ def render_report(meta, m) -> str:
         f"End to end - found **and** both answers right, over every annotated cow: "
         f"error **{pct(m['end_to_end_error'])}**.", "",
         "## Coordinate convention check", "",
-        "Recall at IoU 0.5 if the boxes are read as pixels, as 0-1000, or as 0-1. "
-        "The prompt asks for pixels; a much higher number under another convention "
+        "Recall at IoU 0.5 if the boxes are read as 0-1000, as pixels, or as 0-1. "
+        "The prompt asks for 0-1000; a much higher number under another convention "
         "means the model uses that one, and `detect-score --box-format` should follow it.", "",
         "| Read as | Recall |", "|---|---|",
     ]

@@ -483,8 +483,8 @@ def main(argv=None):
     sd.set_defaults(func=cmd_detect)
 
     sds = sub.add_parser("detect-score", help="score detect results against the annotation")
-    sds.add_argument("--box-format", choices=detect_mod.BOX_FORMATS, default="pixel",
-                     help="how the model's box numbers are read (the prompt asks for pixels)")
+    sds.add_argument("--box-format", choices=detect_mod.BOX_FORMATS, default="norm1000",
+                     help="how the model's box numbers are read (the prompt asks for 0-1000)")
     sds.set_defaults(func=cmd_detect_score)
 
     sst = sub.add_parser("stress", help="N cameras at once: throughput and latency")

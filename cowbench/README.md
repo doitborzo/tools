@@ -179,12 +179,13 @@ Both run on a plan made with `plan`, like the bench.
 
 **Finding the cows** (`detect.py`). The bench hands the model a box from the
 annotation; on a farm nobody does. `detect` sends each keyframe bare and asks
-for every cow as `[x1, y1, x2, y2]` in pixels, with posture and activity.
+for every cow as `[x1, y1, x2, y2]` on a 0-1000 scale (the model's own
+convention: asked for pixels, it answered 0-1000 anyway), with posture and activity.
 `detect-score` matches found cows to annotated ones by IoU (0.5 and 0.3) and
 reports recall, precision, the count per frame, recall by cow size, the
 behaviour error on the cows found, and the end-to-end error: found *and* both
 answers right, over every annotated cow. It also shows recall with the boxes
-read as 0-1000 or 0-1, in case the model does not answer in pixels. Precision
+read as pixels or 0-1, in case the model answers another way. Precision
 is a lower bound: a cow the annotators skipped counts as an extra.
 
     python cowbench.py --out out-val detect
