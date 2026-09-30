@@ -544,11 +544,13 @@ if [ ! -f "$DATA/annotations/ava_train_v2.1.csv" ] || [ ! -d "$DATA/labelframes"
     fi
     # Only what training reads: the annotations and the keyframes. The mp4s
     # and the rawframes are two thirds of the archive and are not used.
+    # "(^|/)" before the name: the archive also holds miniannotations/, the
+    # 256 px copy, and a bare suffix match picks whichever comes first.
     # awk reads the whole listing. A `grep -m1` here stopped after the first
     # match, unzip died of SIGPIPE on the rest, and with pipefail + set -e the
     # script exited silently right after the download.
     if ! prefix="$(unzip -Z1 "$ZIP" | awk '
-            !found && /annotations\/ava_train_v2\.1\.csv$/ { sub(/annotations\/ava_train_v2\.1\.csv$/, ""); print; found = 1 }
+            !found && /(^|\/)annotations\/ava_train_v2\.1\.csv$/ { sub(/annotations\/ava_train_v2\.1\.csv$/, ""); print; found = 1 }
             END { exit !found }')"; then
         echo "!! annotations/ava_train_v2.1.csv not found in $ZIP - broken download? Delete it and rerun."
         exit 1
