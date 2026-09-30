@@ -142,7 +142,7 @@ def run(args, client_mod, jsonl_read):
         while time.perf_counter() < deadline:
             time.sleep(5)
             with lock:
-                n = sum(f["start"] >= args.warmup for f in frames_log)
+                n = sum(f["end"] >= args.warmup for f in frames_log)
             phase = "warm-up" if time.perf_counter() < count_from else "measuring"
             print(f"\r  {time.perf_counter() - start:5.0f} s  {phase}  "
                   f"{n} frames counted   ", end="", flush=True)
@@ -156,8 +156,12 @@ def run(args, client_mod, jsonl_read):
         th.join()
     print()
 
+    # Frames that finished inside the measured window, wherever they began:
+    # throughput is completions per second. Requiring the start inside the
+    # window too counted nothing when a frame takes longer than the window
+    # minus one frame - detect with reasoning, ~3 min a frame at 12 cameras.
     counted = [f for f in frames_log
-               if f["start"] >= args.warmup and f["end"] <= args.warmup + args.duration]
+               if args.warmup <= f["end"] <= args.warmup + args.duration]
     window = args.duration
     lat = [f["latency"] for f in counted]
     req = [s for f in counted for s in f["request_seconds"]]
@@ -200,6 +204,9 @@ def run(args, client_mod, jsonl_read):
     with open(os.path.join(args.out, tag + ".md"), "w", encoding="utf-8") as fh:
         fh.write(report)
     print(report)
+    if len(counted) < 2 * args.streams:
+        print(f"!! only {len(counted)} frames finished in the window - a frame takes about "
+              f"{_pct(lat, 50) or 0:.0f} s here; a longer --duration gives steadier numbers")
     print(f"-> {os.path.join(args.out, tag + '.md')}")
 
 
