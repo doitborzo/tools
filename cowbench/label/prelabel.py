@@ -407,8 +407,9 @@ def main(argv=None):
     n_boxes = sum(len(f["boxes"]) for f in frames)
     print(f"{len(frames)} keyframes ({size[0]}x{size[1]}, every {step} frames of {fps:.2f} fps), "
           f"{n_boxes} boxes, {n_tracks} tracks -> {args.out}")
-    print(f"  {n_boxes / len(frames):.1f} cows a keyframe on average; look at a few keyframes before "
-          f"trusting it (--det-threshold to change)")
+    if det:
+        print(f"  {n_boxes / len(frames):.1f} cows a keyframe on average; look at a few keyframes before "
+              f"trusting it (--det-threshold to change)")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,8 @@
 # Labelling a new video
 
+Fully manual labelling, step by step, in Ukrainian: [manual_labeling_uk.docx](manual_labeling_uk.docx)
+(keyframes with `prelabel.py --detector none`, every box drawn by hand in CVAT).
+
     prelabel.py   video -> keyframes (1/s) -> cows found -> tracks -> [Muse labels] -> CVAT import file
     CVAT          a person corrects boxes, joins tracks, sets posture / activity
     cvat2ava.py   CVAT export -> annotations/ava_<split>_v2.1.csv, CBVD-5's format
