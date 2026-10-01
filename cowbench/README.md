@@ -172,3 +172,94 @@ version, sampling params, image mode, prompt hash) plus:
 
 `drinking` has 6 boxes in clip 371 (53 in all of val). Any per-class number for
 it is indicative only — that is what the confidence intervals are there to show.
+
+## Two more tests: finding the cows, and many cameras at once
+
+Both run on a plan made with `plan`, like the bench.
+
+**Finding the cows** (`detect.py`). The bench hands the model a box from the
+annotation; on a farm nobody does. `detect` sends each keyframe bare and asks
+for every cow as `[x1, y1, x2, y2]` on a 0-1000 scale (the model's own
+convention: asked for pixels, it answered 0-1000 anyway), with posture and activity.
+`detect-score` matches found cows to annotated ones by IoU (0.5 and 0.3) and
+reports recall, precision, the count per frame, recall by cow size, the
+behaviour error on the cows found, and the end-to-end error: found *and* both
+answers right, over every annotated cow. It also shows recall with the boxes
+read as pixels or 0-1, in case the model answers another way. Precision
+is a lower bound: a cow the annotators skipped counts as an extra.
+
+    python cowbench.py --out out-val detect
+    python cowbench.py --out out-val detect-score
+
+**Many cameras** (`stress.py`). `stress --streams 12` runs 12 cameras, each
+replaying its own val clip (the busiest clips first). `--task classify` asks
+one question per annotated cow, the cows of a frame in parallel - the bench's
+question, add `--answer-now` for a LoRA; `--task detect` asks one question per
+frame. `--interval 0` measures the most each camera gets; `--interval S` paces
+every camera at one frame per S seconds and says whether the server keeps up.
+
+    python cowbench.py --out out-val stress --streams 12 --duration 300
+    python cowbench.py --out out-val stress --streams 12 --interval 10 --model pose638 --answer-now --max-width 896
+
+## Every cow of a frame in one question (`--unit frame`)
+
+The per-cow question sends the whole frame once per cow; on one A100 that
+held 12 cameras to an update every ~77 s. `frame.py` asks once per keyframe:
+every cow outlined in lime and numbered (reading order), the same boxes listed
+in the text on the 0-1000 scale, and one answer
+`{"cows": [{"id": 1, "posture": ..., "activity": ...}, ...]}`. Without
+`--boxes` the boxes are the annotation's; the tests take them from the
+detector (below). Results are still written one record per cow, so `score`,
+`report`, `compare` and `--vote` work unchanged.
+
+    python cowbench.py --out out-val run --unit frame                      # base model, reasoning, json_schema
+    python cowbench.py --out out-val run --unit frame --model <lora> --answer-now --max-width 1920
+    python cowbench.py --out out-val stress --task frame --model <lora> --answer-now --max-width 1920
+
+Training an adapter for it: `UNIT=frame` is `lora/run_lora.sh`'s default -
+one example per keyframe at 1920 px, all six keyframes of a clip, activity
+trained except rumination (`TRAIN_FIELDS=skip-ruminating`). `run_tests.sh`
+reads the unit and width from the adapter's `train_meta.json`.
+
+## Boxes from a detector (`detector.py`, `--boxes`)
+
+The tests never ask about the annotation's boxes. `detector.py` fine-tunes
+RT-DETRv2 (`PekingU/rtdetr_v2_r50vd`, Apache-2.0; r18/r34/r101 also work) on
+the boxes of CBVD-5 train - val clips excluded, 10% of train clips held out
+to pick the epoch and the score threshold (best F1) - and runs it on every val
+keyframe:
+
+    python detector.py train  --root /workspace/cbvd5 --out /workspace/lora-runs/detector
+    python detector.py detect --root /workspace/cbvd5 --out /workspace/lora-runs/detector
+    python detector.py score  --out /workspace/lora-runs/detector      # det_report.md
+
+`val_detections.jsonl` keeps every box down to score 0.05; the threshold is in
+`det_meta.json` beside it and is applied when the file is read
+(`--det-threshold` overrides it). `run`, `stress` and `lora/train_lora.py
+eval` take `--boxes <val_detections.jsonl>`: the model is asked about the
+detector's boxes, each answer is matched back to an annotated cow (IoU >= 0.5,
+greedy), and an annotated cow the detector missed is an error
+(`missed_by_detector`, its own line in `score` and the report). Detections
+that match no annotated cow are answered too and kept in
+`detections_answered.jsonl`. `--vote` does not fill in missed cows from
+their track.
+
+`lora/run_lora.sh` trains the detector after the adapter (`DETECTOR=1`) and
+evaluates the adapter on its boxes in `eval-lora-det/`. `run_tests.sh` runs
+the detector itself from `$WORK/lora-runs/detector/best` (in its own venv,
+`$WORK/det/.venv`, before vLLM takes the GPU) and uses its boxes for the bench
+and the stress tests; without the weights it takes ready boxes from `BOXES`.
+
+Detector and model share the GPU: `run_tests.sh` starts vLLM with
+`GPU_MEM_UTIL` set to leave `DET_RESERVE_MIB=4096` free (0.94 of an 80 GB
+card; `lora_muse.sh` reads `GPU_MEM_UTIL`, default 0.95), and the camera
+test runs `stress --live-detector <detector/best>`: every frame of every
+camera goes through RT-DETRv2 in the stress process, on that free memory,
+and the model is asked about what it found - the farm's chain, timed as a
+whole. The report gives the detector's own ms a frame beside the totals.
+
+## A new video
+
+`label/` pre-labels an unannotated video (OWLv2 or the trained RT-DETRv2,
+tracks, optionally Muse), hands it to CVAT for a person to correct, and turns
+CVAT's export into CBVD-5's format: see [label/README.md](label/README.md).

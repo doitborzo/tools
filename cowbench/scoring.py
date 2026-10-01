@@ -146,6 +146,7 @@ def score(results):
         "by_size": by_size,
         "by_clip": by_clip,
         "n_failed": len(failed),
+        "n_missed_by_detector": sum(1 for r in results if r.get("missed_by_detector")),
         "exact_match": rates(exact_ok),
         "posture": rates(posture_ok),
         "activity": rates(activity_ok),
@@ -171,7 +172,7 @@ def score(results):
         "failures": [
             {"id": r.get("id"), "reason": r.get("error") or r.get("parse_error")
              or "empty prediction", "raw": (r.get("raw") or "")[:200]}
-            for r in failed
+            for r in failed if not r.get("missed_by_detector")   # counted on their own
         ][:50],
     }
 

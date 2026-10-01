@@ -13,6 +13,13 @@ Stages, each resumable and each its own process:
     train  load, sanity-check, train the adapter (resumes from checkpoints)
     eval   answer the val manifest with or without the adapter
 
+Two units of question, --unit:
+
+    cow    one cow outlined, one answer - the bench's own question
+    frame  every cow of the keyframe outlined and numbered, one answer listing
+           them all (../frame.py): the frame is encoded once instead of once
+           per cow. Results are still written per cow.
+
 Weights. The published checkpoint is FP8 block-quantized (compressed-tensors),
 and an A100 has no FP8 matmul. The FP8 weights are expanded to BF16 on load
 (weight * per-128x128-block scale) - no 60 GB BF16 download, and the adapter
@@ -36,6 +43,7 @@ import math
 import os
 import random
 import re
+import shutil
 import sys
 import time
 
@@ -45,6 +53,7 @@ sys.path.insert(0, BENCH)
 
 import cbvd  # noqa: E402
 import client as client_mod  # noqa: E402
+import frame as frame_mod  # noqa: E402
 import render as render_mod  # noqa: E402
 
 FP8_REPO = "RedHatAI/Muse-Glimmer-30B-FP8-block"
@@ -75,7 +84,9 @@ def answer_json(posture: str, activity: str) -> str:
 def load_train(root, include_val_clips=False):
     boxes = cbvd.load_boxes(os.path.join(root, "annotations", "ava_train_v2.1.csv"))
     usable, rejected = cbvd.partition(boxes)
-    val = cbvd.load_boxes(os.path.join(root, "annotations", "ava_val_v2.1.csv"))
+    val_csv = os.path.join(root, "annotations", "ava_val_v2.1.csv")
+    # A newly labelled video may have only a train file (label/cvat2ava.py --split train).
+    val = cbvd.load_boxes(val_csv) if os.path.exists(val_csv) else []
     val_clips = {b.video_id for b in val}
     kept = usable if include_val_clips else [b for b in usable if b.video_id not in val_clips]
     rows = [{"id": b.uid, "video_id": b.video_id, "timestamp": b.timestamp,
@@ -108,11 +119,88 @@ def subsample(rows, limit, seed):
     return sorted(out, key=lambda r: r["id"])
 
 
+def split_dev(rows, frac, seed):
+    """Hold out whole clips. Frames of one clip share the camera, the cows
+    and often the labels, so a dev set cut by frame would be scored on
+    scenes the adapter was trained on - the first LoRA got 8.7% error on
+    its own training cows and 44% on val."""
+    if frac <= 0:
+        return rows, []
+    clips = sorted({r["video_id"] for r in rows}, key=lambda v: (len(v), v))
+    random.Random(seed).shuffle(clips)
+    dev = set(clips[:max(1, round(len(clips) * frac))])
+    return ([r for r in rows if r["video_id"] not in dev],
+            [r for r in rows if r["video_id"] in dev])
+
+
+def thin_frames(rows, per_clip):
+    """Keep `per_clip` keyframes of each clip, spread over it. The six
+    annotated seconds of a clip are near-duplicates - same cows, same
+    camera - so all six mostly repeat one scene to memorise."""
+    if not per_clip:
+        return rows
+    stamps = collections.defaultdict(set)
+    for r in rows:
+        stamps[r["video_id"]].add(r["timestamp"])
+    keep = set()
+    for vid, ts in stamps.items():
+        ts = sorted(ts)
+        if len(ts) <= per_clip:
+            idx = range(len(ts))
+        elif per_clip == 1:
+            idx = [len(ts) // 2]
+        else:
+            idx = {round(i * (len(ts) - 1) / (per_clip - 1)) for i in range(per_clip)}
+        keep.update((vid, ts[i]) for i in idx)
+    return [r for r in rows if (r["video_id"], r["timestamp"]) in keep]
+
+
+def training_rows(args):
+    """(training rows, dev rows, info): dev clips first, then thinning and
+    the training cap, so the dev set does not move with those knobs."""
+    rows, info = load_train(args.root)
+    rows, dev_all = split_dev(rows, args.holdout, args.seed)
+    rows = thin_frames(rows, args.frames_per_clip)
+    rows = subsample(rows, args.train_limit, args.seed)
+    dev = subsample(dev_all, args.dev_size, args.seed)
+    info.update({
+        "dev_clips": sorted({r["video_id"] for r in dev_all}, key=lambda v: (len(v), v)),
+        "dev_cows_held_out": len(dev_all), "dev_cows_scored": len(dev),
+        "frames_per_clip": args.frames_per_clip,
+        "train_clips": len({r["video_id"] for r in rows}),
+        "train_keyframes": len({(r["video_id"], r["timestamp"]) for r in rows}),
+    })
+    return rows, dev, info
+
+
 def read_jsonl(path):
     if not os.path.exists(path):
         return []
     with open(path, encoding="utf-8") as fh:
         return [json.loads(l) for l in fh if l.strip()]
+
+
+def read_frame(root, box, tries=10):
+    """The keyframe, decoded. Retried: on a network volume (RunPod's
+    /workspace is MooseFS) a read can fail for a minute or two - ENXIO,
+    EIO, or the file briefly "missing" - and one failed read in a DataLoader
+    worker would otherwise end hours of training."""
+    from PIL import Image
+    delay = 2.0
+    for attempt in range(1, tries + 1):
+        try:
+            with open(cbvd.frame_path(root, box), "rb") as fh:
+                data = fh.read()
+            img = Image.open(io.BytesIO(data))
+            img.load()
+            return img
+        except OSError as e:   # FileNotFoundError and PIL's truncated-file errors included
+            if attempt == tries:
+                raise
+            print(f"[io] {box.video_id} t={box.timestamp}: {e!r} - retry {attempt}/{tries - 1} "
+                  f"in {delay:.0f}s", file=sys.stderr, flush=True)
+            time.sleep(delay)
+            delay = min(delay * 2, 60.0)
 
 
 def make_image(root, row, width, quality):
@@ -121,8 +209,20 @@ def make_image(root, row, width, quality):
     on the same compression it is tested on."""
     from PIL import Image
     box = cbvd.Box(row["video_id"], row["timestamp"], *row["bbox"], "1", ())
-    img = render_mod.render(cbvd.frame_path(root, box), row["bbox"], mode="marked",
+    img = render_mod.render(read_frame(root, box), row["bbox"], mode="marked",
                             max_width=width)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    buf.seek(0)
+    return Image.open(buf).convert("RGB")
+
+
+def make_frame_image(root, fr, width, quality):
+    """The frame unit's image: every cow of the keyframe outlined and numbered
+    (frame.render), then the same JPEG round trip."""
+    from PIL import Image
+    box = cbvd.Box(fr["video_id"], fr["timestamp"], 0, 0, 0, 0, "1", ())
+    img = frame_mod.render(read_frame(root, box), fr["cows"], width)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=quality)
     buf.seek(0)
@@ -131,10 +231,10 @@ def make_image(root, row, width, quality):
 
 # ------------------------------------------------------------------ prompting
 
-def messages():
+def messages(text=None):
     # Image first, then text: the order the bench's client sends them in.
-    return [{"role": "user", "content": [{"type": "image"},
-                                         {"type": "text", "text": client_mod.build_prompt(1, 0.0)}]}]
+    text = client_mod.build_prompt(1, 0.0) if text is None else text
+    return [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}]
 
 
 class Chat:
@@ -163,12 +263,71 @@ class Chat:
         at = tail.index(probe)
         self.answer_open = tail[:at]                     # " to=user<|message|>"
         self.answer_close = tail[at + len(probe):]       # "<|eot|>"
+        self._prefixes = {}
+
+    def prefix_for(self, text):
+        """The generation prompt for another question text (the frame unit's
+        prompt lists the frame's boxes, so it differs per frame)."""
+        if text not in self._prefixes:
+            if len(self._prefixes) > 4096:
+                self._prefixes.clear()
+            self._prefixes[text] = self.processor.apply_chat_template(
+                messages(text), tokenize=False, add_generation_prompt=True)
+        return self._prefixes[text]
+
+    def wrap(self, body):
+        return self.answer_open + body + self.answer_close
+
+    def flags(self, body, masked):
+        """One flag per token of wrap(body): False where the token overlaps a
+        masked (start, end) character span of body."""
+        ids = self.tok(self.wrap(body), add_special_tokens=False, return_offsets_mapping=True)
+        off = len(self.answer_open)
+        spans = [(s + off, e + off) for s, e in masked]
+        return [not any(a < e and b > s for s, e in spans) for a, b in ids["offset_mapping"]]
+
+    def frame_flags(self, cows, fields):
+        """loss_flags for the frame unit: the same three policies, per cow."""
+        spans = frame_mod.activity_spans(cows)
+        if fields == "both":
+            masked = []
+        elif fields == "posture":
+            masked = [(s, e) for s, e, _ in spans]
+        else:
+            masked = [(s, e) for s, e, a in spans if a == "ruminating"]
+        return self.flags(frame_mod.answer_json(cows), masked)
 
     def suffix(self, posture, activity):
         return self.answer_open + answer_json(posture, activity) + self.answer_close
 
     def suffix_ids(self, text):
         return self.tok(text, add_special_tokens=False)["input_ids"]
+
+    def loss_flags(self, posture, activity, fields):
+        """One flag per suffix token: does the loss train it.
+
+        both             every answer token
+        posture          not the activity value: the adapter learns the format
+                         and the posture, the activity answer stays the base
+                         model's. Activity learned from ava_train did not carry
+                         over to val, which looks like another recording
+                         session (clips 341-394).
+        skip-ruminating  not the activity value of cows labelled ruminating;
+                         feeding, drinking and none are trained. Rumination
+                         cannot be seen on a still, is labelled per clip rather
+                         than per cow, and its 1106 standing-at-the-barrier
+                         labels in train are what taught the first adapters to
+                         call feeding cows ruminating on val.
+        """
+        text = self.suffix(posture, activity)
+        ids = self.tok(text, add_special_tokens=False, return_offsets_mapping=True)
+        if fields == "both" or (fields == "skip-ruminating" and activity != "ruminating"):
+            return [True] * len(ids["input_ids"])
+        body = answer_json(posture, activity)
+        key = '"activity": "'
+        start = len(self.answer_open) + body.index(key) + len(key)
+        end = start + len(activity)
+        return [not (a < end and b > start) for a, b in ids["offset_mapping"]]
 
 
 _NESTED = {}
@@ -190,27 +349,40 @@ def encode(processor, texts, images):
 
 
 class Collator:
-    def __init__(self, processor, chat, root, width, quality):
+    """A batch of cows (unit "cow") or of keyframes (unit "frame")."""
+
+    def __init__(self, processor, chat, root, width, quality, fields="both", unit="cow"):
         self.processor, self.chat = processor, chat
         self.root, self.width, self.quality = root, width, quality
+        self.fields, self.unit = fields, unit
+
+    def suffix(self, item):
+        if self.unit == "frame":
+            return self.chat.wrap(frame_mod.answer_json(item["cows"]))
+        return self.chat.suffix(item["gt_posture"], item["gt_activity"])
 
     def __call__(self, rows):
         import torch
-        texts, images, n_answer = [], [], []
+        texts, images, flags = [], [], []
         for r in rows:
-            suffix = self.chat.suffix(r["gt_posture"], r["gt_activity"])
-            texts.append(self.chat.prefix + suffix)
-            images.append(make_image(self.root, r, self.width, self.quality))
-            n_answer.append(len(self.chat.suffix_ids(suffix)))
+            if self.unit == "frame":
+                texts.append(self.chat.prefix_for(frame_mod.prompt(r["cows"])) + self.suffix(r))
+                images.append(make_frame_image(self.root, r, self.width, self.quality))
+                flags.append(self.chat.frame_flags(r["cows"], self.fields))
+            else:
+                texts.append(self.chat.prefix + self.suffix(r))
+                images.append(make_image(self.root, r, self.width, self.quality))
+                flags.append(self.chat.loss_flags(r["gt_posture"], r["gt_activity"], self.fields))
         enc = encode(self.processor, texts, images)
         # Left padding puts every answer at the very end of its row, so the
         # answer is always the last n tokens and the loss only needs the logits
-        # of the last max(n)+1 positions - not a 202k-wide vocabulary over the
+        # of the last n+1 positions - not a 202k-wide vocabulary over the
         # whole ~1000-token sequence.
         mask = torch.zeros_like(enc["input_ids"], dtype=torch.bool)
-        for i, n in enumerate(n_answer):
-            mask[i, -n:] = True
+        for i, f in enumerate(flags):
+            mask[i, -len(f):] = torch.tensor(f)
         enc["answer_mask"] = mask
+        enc["answer_len"] = torch.tensor([len(f) for f in flags])
         return dict(enc)
 
 
@@ -343,7 +515,9 @@ def answer_loss(model, batch):
     import torch.nn.functional as F
     batch = dict(batch)
     mask = batch.pop("answer_mask")
-    k = int(mask.sum(1).max())
+    # The whole answer, not just its trained tokens: with fields="posture"
+    # the mask has a gap where the activity value is.
+    k = int(batch.pop("answer_len").max())
     try:
         logits = model(**batch, logits_to_keep=k + 1, use_cache=False).logits
     except TypeError:
@@ -355,22 +529,81 @@ def answer_loss(model, batch):
     return (loss * m).sum() / m.sum()
 
 
+def answer_rows(model, processor, chat, rows, args, batch):
+    """Greedy answers, `batch` cows (or, unit "frame", keyframes) at a time;
+    yields the per-cow records of each batch. Generation starts where the
+    final answer begins - no reasoning - which is what the adapter is trained
+    to do. For frames, `rows` must hold every cow of each keyframe: the
+    question lists them all."""
+    import torch
+    tok = processor.tokenizer
+    prefix = chat.prefix + chat.answer_open
+    stop = [tok.convert_tokens_to_ids(t) for t in re.findall(r"<\|[a-z_]+\|>", chat.answer_close)]
+    if getattr(args, "unit", "cow") == "frame":
+        frames = frame_mod.group(rows)
+        with torch.no_grad():
+            for i in range(0, len(frames), batch):
+                chunk = frames[i:i + batch]
+                images = [make_frame_image(args.root, f, args.width, args.jpeg_quality) for f in chunk]
+                texts = [chat.prefix_for(frame_mod.prompt(f["cows"])) + chat.answer_open for f in chunk]
+                enc = encode(processor, texts, images)
+                enc = {k: (v.to(model.device) if hasattr(v, "to") else v) for k, v in enc.items()}
+                # ~16 tokens a cow, with room to spare
+                most = max(len(f["cows"]) for f in chunk)
+                out = model.generate(**enc, max_new_tokens=24 * most + 32, do_sample=False,
+                                     use_cache=True, eos_token_id=stop or None,
+                                     pad_token_id=tok.pad_token_id)
+                answers = tok.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
+                yield [rec for f, text in zip(chunk, answers)
+                       for rec in frame_mod.records(f["cows"], text)]
+        return
+    with torch.no_grad():
+        for i in range(0, len(rows), batch):
+            chunk = rows[i:i + batch]
+            images = [make_image(args.root, r, args.width, args.jpeg_quality) for r in chunk]
+            enc = encode(processor, [prefix] * len(chunk), images)
+            enc = {k: (v.to(model.device) if hasattr(v, "to") else v) for k, v in enc.items()}
+            out = model.generate(**enc, max_new_tokens=48, do_sample=False, use_cache=True,
+                                 eos_token_id=stop or None, pad_token_id=tok.pad_token_id)
+            texts = tok.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
+            recs = []
+            for r, text in zip(chunk, texts):
+                p, a, err = parse_answer(text)
+                rec = dict(r, posture=p, activity=a, content=text)
+                if err:
+                    rec["parse_error"] = err
+                recs.append(rec)
+            yield recs
+
+
+def error_rates(recs):
+    n = max(len(recs), 1)
+    bad_p = [r["posture"] != r["gt_posture"] for r in recs]
+    bad_a = [r["activity"] != r["gt_activity"] for r in recs]
+    return {"n": len(recs),
+            "exact": sum(p or a for p, a in zip(bad_p, bad_a)) / n,
+            "posture": sum(bad_p) / n, "activity": sum(bad_a) / n,
+            "activity_answers": dict(collections.Counter(r["activity"] for r in recs))}
+
+
 # ------------------------------------------------------------------ stages
 
 def cmd_data(args):
-    rows, info = load_train(args.root)
-    rows = subsample(rows, args.train_limit, args.seed)
+    rows, dev, info = training_rows(args)
     print(json.dumps(info, indent=1))
     print("training on:", len(rows), "examples")
     print("  posture :", dict(collections.Counter(r["gt_posture"] for r in rows)))
     print("  activity:", dict(collections.Counter(r["gt_activity"] for r in rows)))
+    print(f"dev: {len(dev)} cows scored, from {info['dev_cows_held_out']} in "
+          f"{len(info['dev_clips'])} held-out clips")
+    print("  activity:", dict(collections.Counter(r["gt_activity"] for r in dev)))
     val = read_jsonl(args.manifest)
     print("eval manifest:", args.manifest, len(val), "examples")
     overlap = {r["video_id"] for r in rows} & {r["video_id"] for r in val}
     if overlap:
         raise SystemExit(f"train and eval share clips {sorted(overlap)}")
     missing = set()
-    for r in rows + val:
+    for r in rows + dev + val:
         try:
             cbvd.frame_path(args.root, cbvd.Box(r["video_id"], r["timestamp"], *r["bbox"], "1", ()))
         except FileNotFoundError as exc:
@@ -379,53 +612,89 @@ def cmd_data(args):
         raise SystemExit("missing keyframes:\n  " + "\n  ".join(sorted(missing)[:10]))
     sample_dir = os.path.join(args.out, "samples")
     os.makedirs(sample_dir, exist_ok=True)
+    if args.unit == "frame":
+        frames = frame_mod.group(rows)
+        print(f"unit frame: {len(frames)} keyframes, "
+              f"{sum(len(f['cows']) for f in frames) / max(len(frames), 1):.1f} cows each, "
+              f"up to {max(len(f['cows']) for f in frames)}")
+        for f in random.Random(args.seed).sample(frames, min(3, len(frames))):
+            stem = os.path.join(sample_dir, f"frame_{f['video_id']}_{f['timestamp']:05d}")
+            make_frame_image(args.root, f, args.width, args.jpeg_quality).save(stem + ".jpg")
+            with open(stem + ".txt", "w", encoding="utf-8") as fh:
+                fh.write(frame_mod.prompt(f["cows"]) + "\n\n" + frame_mod.answer_json(f["cows"]) + "\n")
     for r in random.Random(args.seed).sample(rows, 4):
         make_image(args.root, r, args.width, args.jpeg_quality).save(
             os.path.join(sample_dir, f"{r['id']}_{r['gt_posture']}_{r['gt_activity']}.jpg"))
     print("samples ->", sample_dir)
 
 
+def cmd_manifest(args):
+    """A manifest of training cows, in the val manifest's format, so `eval`
+    can score an adapter on the data it was trained on. Near train labels
+    there means the training worked and val differs; far from them means the
+    training itself went wrong."""
+    rows, _, _ = training_rows(args)
+    rows = subsample(rows, args.sample, args.seed + 1)
+    out = args.manifest_out or os.path.join(args.out, "train-sample", "manifest.jsonl")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    with open(out, "w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    print(f"{len(rows)} training cows on {len({(r['video_id'], r['timestamp']) for r in rows})} "
+          f"keyframes from {len({r['video_id'] for r in rows})} clips -> {out}")
+    print("  posture :", dict(collections.Counter(r["gt_posture"] for r in rows)))
+    print("  activity:", dict(collections.Counter(r["gt_activity"] for r in rows)))
+
+
 def cmd_train(args):
     import torch
     from transformers import Trainer, TrainingArguments
 
-    rows, info = load_train(args.root)
-    rows = subsample(rows, args.train_limit, args.seed)
+    rows, dev, info = training_rows(args)
     os.makedirs(args.out, exist_ok=True)
 
     model, processor, minfo = load_model(args)
     processor.tokenizer.padding_side = "left"
     chat = Chat(processor)
     print(f"[chat] answer wrapped as {chat.answer_open!r} ... {chat.answer_close!r}", flush=True)
-    collate = Collator(processor, chat, args.root, args.width, args.jpeg_quality)
+    collate = Collator(processor, chat, args.root, args.width, args.jpeg_quality,
+                       args.train_fields, args.unit)
+    # What the Trainer iterates over: cows, or whole keyframes.
+    items = frame_mod.group(rows) if args.unit == "frame" else rows
 
     # --- sanity, before any hour is spent -----------------------------
-    probe = collate(rows[:2])
+    probe = collate(items[:2])
     ids, mask = probe["input_ids"], probe["answer_mask"]
-    for i, r in enumerate(rows[:2]):
-        want = chat.suffix_ids(chat.suffix(r["gt_posture"], r["gt_activity"]))
-        got = ids[i][mask[i]].tolist()
+    for i, r in enumerate(items[:2]):
+        want = chat.suffix_ids(collate.suffix(r))
+        got = ids[i][-len(want):].tolist()
         if got != want:
             raise SystemExit("answer tokens do not line up with the sequence end - the loss "
                              f"would train on the wrong tokens.\nwant {want}\ngot  {got}")
     seq_len = int(ids.shape[1])
-    print(f"[data] {len(rows)} examples, {seq_len} tokens each, "
-          f"answer {int(mask.sum(1).max())} tokens", flush=True)
+    trained = chat.tok.decode(ids[0][mask[0]].tolist())
+    print(f"[data] {len(items)} {args.unit} examples ({len(rows)} cows), {seq_len} tokens, answer "
+          f"{int(probe['answer_len'].max())} tokens; fields={args.train_fields}, "
+          f"loss on: {trained!r}", flush=True)
 
     val = read_jsonl(args.manifest)
-    pick = random.Random(0).sample(val, min(16, len(val)))
+    if args.unit == "frame":
+        pick, step_ = random.Random(0).sample(frame_mod.group(val), 4), 2
+    else:
+        pick, step_ = random.Random(0).sample(val, min(16, len(val))), 4
     model.eval()
     zs = []
     with torch.no_grad():
-        for i in range(0, len(pick), 4):
+        for i in range(0, len(pick), step_):
             b = {k: (v.to(model.device) if hasattr(v, "to") else v)
-                 for k, v in collate(pick[i:i + 4]).items()}
+                 for k, v in collate(pick[i:i + step_]).items()}
             zs.append(float(answer_loss(model, b)))
     zero_shot = sum(zs) / len(zs)
     # A healthy base model knows JSON and knows these words. A loss far above
     # this bound means the weights did not load right - a missed scale, a
     # wrong layer mapping - and training would only paper over it.
-    print(f"[sanity] zero-shot answer loss on 16 val cows: {zero_shot:.3f} nats/token", flush=True)
+    print(f"[sanity] zero-shot answer loss on {len(pick)} val {args.unit}s: {zero_shot:.3f} nats/token",
+          flush=True)
     if zero_shot > args.max_zero_shot_loss:
         raise SystemExit(f"zero-shot loss {zero_shot:.2f} > {args.max_zero_shot_loss}: "
                          "the weights look broken. Not training.")
@@ -441,6 +710,43 @@ def cmd_train(args):
         raise SystemExit(f"LoRA matched {n_targets} modules, expected {expected}. "
                          f"Layer 0 modules: {names}")
 
+    # --- dev: held-out training clips, scored while training ------------
+    # The adapter is snapshotted at every dev score and the best one - not
+    # the last - becomes adapter/. Val stays untouched until the end, so it
+    # remains an honest estimate.
+    hist_path = os.path.join(args.out, "dev_history.jsonl")
+    done_steps = {h["step"] for h in read_jsonl(hist_path)}
+
+    def dev_eval(model, step):
+        t = time.time()
+        was_training = model.training
+        model.eval()
+        recs = [r for chunk in answer_rows(model, processor, chat, dev, args, args.dev_batch)
+                for r in chunk]
+        if was_training:
+            model.train()
+        torch.cuda.empty_cache()
+        m = dict(step=step, **error_rates(recs), seconds=round(time.time() - t))
+        if step > 0:
+            model.save_pretrained(os.path.join(args.out, "adapters", f"step-{step:05d}"))
+        with open(hist_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(m, ensure_ascii=False) + "\n")
+        done_steps.add(step)
+        print(f"\n[dev] step {step}: exact {m['exact']:.1%}  posture {m['posture']:.1%}  "
+              f"activity {m['activity']:.1%}  answers {m['activity_answers']}  "
+              f"({m['seconds']} s)", flush=True)
+
+    from transformers import TrainerCallback
+
+    class DevCallback(TrainerCallback):
+        def on_step_end(self, _args, state, control, model=None, **kwargs):
+            step = state.global_step
+            if dev and args.dev_every and step % args.dev_every == 0 and step not in done_steps:
+                dev_eval(model, step)
+
+    if dev and 0 not in done_steps:
+        dev_eval(model, 0)   # the adapter starts at zero: this is the base model
+
     class AnswerOnlyTrainer(Trainer):
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
             loss = answer_loss(model, inputs)
@@ -453,7 +759,9 @@ def cmd_train(args):
         num_train_epochs=args.epochs,
         learning_rate=args.lr,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
+        # A float below 1 is a fraction of all steps. transformers 5 dropped
+        # the separate warmup_ratio argument.
+        warmup_steps=0.03,
         weight_decay=0.0,
         max_grad_norm=1.0,
         bf16=True,
@@ -469,7 +777,8 @@ def cmd_train(args):
         seed=args.seed,
         optim="adamw_torch_fused",
     )
-    trainer = AnswerOnlyTrainer(model=model, args=targs, train_dataset=rows, data_collator=collate)
+    trainer = AnswerOnlyTrainer(model=model, args=targs, train_dataset=items, data_collator=collate,
+                                callbacks=[DevCallback()])
     # The loss is already a per-token mean; let Trainer do the plain
     # 1/accumulation scaling rather than look for token counts in `labels`.
     trainer.model_accepts_loss_kwargs = False
@@ -485,19 +794,37 @@ def cmd_train(args):
     hours = (time.time() - t0) / 3600
 
     adapter = os.path.join(args.out, "adapter")
-    model.save_pretrained(adapter)
+    best = None
+    # Judged on what was trained: a posture-only adapter by posture, where
+    # small activity drift between steps is noise, not something it learnt.
+    metric = "posture" if args.train_fields == "posture" else "exact"
+    if dev:
+        if trainer.state.global_step not in done_steps:
+            dev_eval(model, trainer.state.global_step)
+        scored = {h["step"]: h for h in read_jsonl(hist_path) if h["step"] > 0}
+        best = min(scored.values(), key=lambda h: (h[metric], h["exact"], h["step"]))
+        shutil.rmtree(adapter, ignore_errors=True)
+        shutil.copytree(os.path.join(args.out, "adapters", f"step-{best['step']:05d}"), adapter)
+        print(f"[dev] best by {metric}: step {best['step']} of {trainer.state.global_step}, "
+              f"posture {best['posture']:.1%}, exact {best['exact']:.1%} (base {read_jsonl(hist_path)[0]['exact']:.1%}) "
+              f"-> {adapter}", flush=True)
+    else:
+        model.save_pretrained(adapter)
     losses = [h["loss"] for h in trainer.state.log_history if "loss" in h]
     meta = {
         "date": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         **minfo, **info,
-        "trained_on": len(rows), "train_limit": args.train_limit,
+        "unit": args.unit, "trained_on": len(rows), "train_examples": len(items),
+        "train_limit": args.train_limit,
         "width": args.width, "jpeg_quality": args.jpeg_quality, "tokens_per_example": seq_len,
-        "prompt_sha": client_mod.prompt_sha(1, 0.0),
+        "prompt_sha": frame_mod.PROMPT_SHA if args.unit == "frame" else client_mod.prompt_sha(1, 0.0),
         "lora": {"rank": args.rank, "alpha": args.alpha, "dropout": args.dropout,
                  "modules": n_targets, "trainable_params": trainable},
         "optim": {"lr": args.lr, "epochs": args.epochs, "batch": args.batch, "accum": args.accum,
                   "effective_batch": args.batch * args.accum, "steps": trainer.state.global_step},
+        "train_fields": args.train_fields,
         "zero_shot_answer_loss": zero_shot,
+        "dev": {"best": best, "chosen_by": metric, "every": args.dev_every, "history": hist_path},
         "first_loss": losses[0] if losses else None,
         "last_loss": sum(losses[-10:]) / len(losses[-10:]) if losses else None,
         "hours_this_session": round(hours, 2),
@@ -531,8 +858,6 @@ def parse_answer(text):
 
 
 def cmd_eval(args):
-    import torch
-
     manifest = read_jsonl(args.manifest)
     if args.eval_limit:
         manifest = manifest[:args.eval_limit]
@@ -543,6 +868,24 @@ def cmd_eval(args):
     print(f"[eval] {len(manifest)} examples, {len(done)} done, {len(todo)} to go", flush=True)
     if not todo:
         return
+    dets = None
+    if args.boxes:
+        # Ask about the detector's boxes; the annotation only scores.
+        dets, det_meta = frame_mod.load_detections(args.boxes)
+        thr = args.det_threshold if args.det_threshold is not None else det_meta.get("threshold", 0.5)
+        open_frames = [f for f in frame_mod.group(manifest)
+                       if any(c["id"] not in done for c in f["cows"])]
+        gt_of = {(f["video_id"], f["timestamp"]): f["cows"] for f in open_frames}
+        pseudo = {k: frame_mod.detected_cows(dict(dets.get(k, {"boxes": []}), video_id=k[0],
+                                                  timestamp=k[1]), thr) for k in gt_of}
+        ask = [c for k in gt_of for c in pseudo[k]]
+    elif args.unit == "frame":
+        # The question lists every cow of the keyframe: ask with all of them,
+        # write only the ones not answered yet.
+        open_frames = {(r["video_id"], r["timestamp"]) for r in todo}
+        ask = [r for r in manifest if (r["video_id"], r["timestamp"]) in open_frames]
+    else:
+        ask = todo
 
     model, processor, minfo = load_model(args)
     adapter = None if args.adapter in (None, "", "none") else args.adapter
@@ -557,10 +900,6 @@ def cmd_eval(args):
     # begins. For the adapter that is what it was trained to do; for the base
     # model it makes the base arm a like-for-like control - same width, same
     # no-thinking setup - so the difference between the two is the training.
-    prefix = chat.prefix + chat.answer_open
-    tok = processor.tokenizer
-    stop = [tok.convert_tokens_to_ids(t) for t in re.findall(r"<\|[a-z_]+\|>", chat.answer_close)]
-
     meta_src = os.path.join(os.path.dirname(os.path.abspath(args.manifest)), "run_meta.json")
     excluded = []
     if os.path.exists(meta_src):
@@ -578,35 +917,62 @@ def cmd_eval(args):
         "engine": "transformers generate, greedy",
         "reasoning": "off: generation starts at the final answer",
         "temperature": 0.0, "seed": 0,
-        "render_mode": "marked", "frames": 1, "span": 0.0, "min_width": 0,
+        "render_mode": "numbered (all cows of the frame)" if args.unit == "frame" else "marked",
+        "unit": args.unit, "frames": 1, "span": 0.0, "min_width": 0,
         "max_width": args.width, "jpeg_quality": args.jpeg_quality,
-        "prompt_sha": client_mod.prompt_sha(1, 0.0),
-        "prompt": client_mod.build_prompt(1, 0.0),
+        "prompt_sha": frame_mod.PROMPT_SHA if args.unit == "frame" else client_mod.prompt_sha(1, 0.0),
+        "prompt": (frame_mod._PROMPT if args.unit == "frame" else client_mod.build_prompt(1, 0.0)),
         "annotations": os.path.join("annotations", "ava_val_v2.1.csv"),
         "videos": ", ".join(sorted({r["video_id"] for r in manifest}, key=int)),
         "excluded": excluded,
+        "boxes": ({"source": "detector", "detections": os.path.abspath(args.boxes), "threshold": thr,
+                   "detector": det_meta.get("base_model"), "match_iou": 0.5}
+                  if dets is not None else {"source": "annotation"}),
     }
     with open(os.path.join(args.eval_out, "run_meta.json"), "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2, ensure_ascii=False)
 
     t0 = time.time()
-    with open(results_path, "a", encoding="utf-8") as fh, torch.no_grad():
-        for i in range(0, len(todo), args.eval_batch):
-            chunk = todo[i:i + args.eval_batch]
-            images = [make_image(args.root, r, args.width, args.jpeg_quality) for r in chunk]
-            enc = encode(processor, [prefix] * len(chunk), images)
-            enc = {k: (v.to(model.device) if hasattr(v, "to") else v) for k, v in enc.items()}
-            out = model.generate(**enc, max_new_tokens=48, do_sample=False,
-                                 eos_token_id=stop or None, pad_token_id=tok.pad_token_id)
-            texts = tok.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
-            for r, text in zip(chunk, texts):
-                p, a, err = parse_answer(text)
-                rec = dict(r, posture=p, activity=a, content=text)
-                if err:
-                    rec["parse_error"] = err
+    if dets is not None:
+        # Answers about detections arrive in batches that need not end on a
+        # frame; a frame is matched to its annotated cows once all its
+        # detections are answered.
+        finished = [0]
+
+        def frames_done(pending, recs, fh, xfh):
+            for r in recs:
+                pending[(r["video_id"], r["timestamp"])].append(r)
+            for k in [k for k, got in pending.items() if len(got) == len(pseudo[k])]:
+                finished[0] += 1
+                gts, extras = frame_mod.to_gt(gt_of[k], pending.pop(k))
+                for g in gts:
+                    if g["id"] not in done:
+                        fh.write(json.dumps(g, ensure_ascii=False) + "\n")
+                for e in extras:
+                    xfh.write(json.dumps(e, ensure_ascii=False) + "\n")
+            fh.flush()
+            xfh.flush()
+
+        pending = collections.defaultdict(list)
+        with open(results_path, "a", encoding="utf-8") as fh, \
+                open(os.path.join(args.eval_out, "detections_answered.jsonl"), "a", encoding="utf-8") as xfh:
+            for k in gt_of:
+                if not pseudo[k]:
+                    pending[k] = []        # nothing found: every cow there is missed
+            frames_done(pending, [], fh, xfh)
+            for recs in answer_rows(model, processor, chat, ask, args, args.eval_batch):
+                frames_done(pending, recs, fh, xfh)
+                print(f"\r  {finished[0]}/{len(gt_of)} frames", end="", flush=True)
+        print(f"\n[eval] detector boxes -> {results_path}", flush=True)
+        return
+    with open(results_path, "a", encoding="utf-8") as fh:
+        n = 0
+        for recs in answer_rows(model, processor, chat, ask, args, args.eval_batch):
+            recs = [r for r in recs if r["id"] not in done]
+            for rec in recs:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             fh.flush()
-            n = i + len(chunk)
+            n += len(recs)
             rate = n / (time.time() - t0)
             print(f"\r  {n}/{len(todo)}  {rate:.1f}/s  eta {(len(todo) - n) / rate / 60:.0f} min",
                   end="", flush=True)
@@ -618,7 +984,7 @@ def cmd_eval(args):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("stage", choices=("data", "train", "eval"))
+    p.add_argument("stage", choices=("data", "train", "eval", "manifest"))
     p.add_argument("--root", required=True, help="unpacked CBVD-5 (with annotations/, labelframes/)")
     p.add_argument("--out", default="lora-out", help="training run directory")
     p.add_argument("--manifest", default=VAL_MANIFEST,
@@ -633,25 +999,47 @@ def main(argv=None):
     p.add_argument("--train-limit", type=int, default=0,
                    help="cap on training cows (whole keyframes); 0 = all")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--rank", type=int, default=16)
-    p.add_argument("--alpha", type=int, default=32)
+    p.add_argument("--rank", type=int, default=8)
+    p.add_argument("--alpha", type=int, default=16)
     p.add_argument("--dropout", type=float, default=0.05)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--epochs", type=float, default=1.0)
     p.add_argument("--batch", type=int, default=4)
     p.add_argument("--accum", type=int, default=4)
     p.add_argument("--workers", type=int, default=6)
-    p.add_argument("--save-steps", type=int, default=100)
+    p.add_argument("--save-steps", type=int, default=50)
     p.add_argument("--max-zero-shot-loss", type=float, default=4.0)
     p.add_argument("--adapter", default=None, help="eval: adapter dir, or 'none' for the base model")
     p.add_argument("--eval-out", default=None, help="eval: output dir (default <out>/eval-lora|eval-base)")
     p.add_argument("--eval-batch", type=int, default=16)
     p.add_argument("--eval-limit", type=int, default=0)
+    p.add_argument("--holdout", type=float, default=0.1,
+                   help="share of training clips held out as dev (0: none, last adapter wins)")
+    p.add_argument("--dev-size", type=int, default=300, help="dev cows scored (whole keyframes)")
+    p.add_argument("--dev-every", type=int, default=100, help="score dev every N optimizer steps")
+    p.add_argument("--dev-batch", type=int, default=8)
+    p.add_argument("--frames-per-clip", type=int, default=3,
+                   help="training keyframes kept per clip, spread over it; 0 = all six")
+    p.add_argument("--boxes", default=None,
+                   help="eval: val_detections.jsonl from ../detector.py - ask about the detector's "
+                        "boxes; the annotation only scores, a missed cow is an error")
+    p.add_argument("--det-threshold", type=float, default=None)
+    p.add_argument("--unit", choices=("cow", "frame"), default="cow",
+                   help="cow: one outlined cow per question; frame: every cow of the keyframe, "
+                        "numbered, in one question (see ../frame.py)")
+    p.add_argument("--train-fields", choices=("both", "posture", "skip-ruminating"), default="both",
+                   help="posture: no loss on the activity value; skip-ruminating: none on the "
+                        "activity value of ruminating cows (see Chat.loss_flags)")
+    p.add_argument("--sample", type=int, default=800,
+                   help="manifest: training cows to pick (whole keyframes)")
+    p.add_argument("--manifest-out", default=None,
+                   help="manifest: output file (default <out>/train-sample/manifest.jsonl)")
     args = p.parse_args(argv)
     if args.stage == "eval" and not args.eval_out:
         args.eval_out = os.path.join(
             args.out, "eval-base" if args.adapter in (None, "", "none") else "eval-lora")
-    {"data": cmd_data, "train": cmd_train, "eval": cmd_eval}[args.stage](args)
+    {"data": cmd_data, "train": cmd_train, "eval": cmd_eval,
+     "manifest": cmd_manifest}[args.stage](args)
 
 
 if __name__ == "__main__":

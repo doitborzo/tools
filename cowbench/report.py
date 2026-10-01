@@ -85,7 +85,15 @@ def render(meta: dict, metrics: dict, results=None) -> str:
         clips = f"{metrics['n_clips']} clips"
     add(f"| Clips | {clips} |")
     add(f"| Keyframes | {metrics.get('n_keyframes', '?')} |")
-    add(f"| Examples (annotated boxes) | **{metrics['n_examples']}** |")
+    add(f"| Examples (annotated cows) | **{metrics['n_examples']}** |")
+    boxes = meta.get("boxes") or {"source": "annotation"}
+    if boxes.get("source") == "detector":
+        missed = metrics.get("n_missed_by_detector", 0)
+        add(f"| Cow boxes | from the detector ({boxes.get('detector')}, score >= {boxes.get('threshold')}); "
+            f"matched to the annotation at IoU {boxes.get('match_iou')}; "
+            f"**{missed} annotated cows not found**, counted as errors |")
+    else:
+        add("| Cow boxes | from the annotation |")
     add(f"| **Exact-match error rate** | **{_pct(metrics['exact_match']['error_rate'])}** |")
     if meta.get("engine"):
         # Runs made off the server, e.g. the LoRA eval in lora/train_lora.py:
@@ -97,8 +105,11 @@ def render(meta: dict, metrics: dict, results=None) -> str:
             add(f"| Adapter | `{meta['adapter']}` |")
     else:
         add(f"| Serving | vLLM {meta.get('vllm_version') or '?'} |")
+        output = ("structured output (json_schema)"
+                  if not str(meta.get("reasoning", "")).startswith("off")
+                  else f"reasoning {meta['reasoning']}, no json_schema")
         add(f"| Sampling | temperature={meta.get('temperature')}, seed={meta.get('seed')}, "
-            f"max_tokens={meta.get('max_tokens')}, structured output (json_schema) |")
+            f"max_tokens={meta.get('max_tokens')}, {output} |")
     frames = meta.get("frames") or 1
     temporal = ("annotated keyframe only (single still)" if frames <= 1
                 else f"{frames} frames over {meta.get('span')}s from the clip")
@@ -143,8 +154,13 @@ def render(meta: dict, metrics: dict, results=None) -> str:
             f"{_pct(m['ci95'][0])} – {_pct(m['ci95'][1])} | {base_txt} | "
             f"{m['correct']}/{m['n']} |")
     add("")
-    if metrics["n_failed"]:
-        add(f"{metrics['n_failed']} of {metrics['n_examples']} requests produced no usable "
+    missed = metrics.get("n_missed_by_detector", 0)
+    if missed:
+        add(f"{missed} of {metrics['n_examples']} annotated cows were not found by the detector: "
+            f"no question was asked about them, and they are counted as errors above.")
+        add("")
+    if metrics["n_failed"] - missed:
+        add(f"{metrics['n_failed'] - missed} of {metrics['n_examples']} requests produced no usable "
             f"answer (server error, refusal or truncated output). They are counted as "
             f"errors above and listed at the end.")
         add("")

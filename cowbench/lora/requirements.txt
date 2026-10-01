@@ -10,3 +10,5 @@ pillow
 requests
 jinja2
 sentencepiece
+# RT-DETR's loss (detector.py) matches queries to boxes with scipy's Hungarian solver
+scipy

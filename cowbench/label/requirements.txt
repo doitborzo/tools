@@ -1,0 +1,9 @@
+# label/prelabel.py and label/cvat2ava.py, on a PC (CPU is enough) or a pod.
+# torch: on a PC with an NVIDIA card take the CUDA build from pytorch.org;
+# the plain PyPI one runs on the CPU.
+torch
+transformers>=5.15
+opencv-python-headless
+pillow
+requests
+scipy

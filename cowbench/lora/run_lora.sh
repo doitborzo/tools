@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # LoRA fine-tuning of Muse Glimmer on CBVD-5, end to end, on one A100.
 #
-#   environment -> dataset -> model -> base-model control -> train -> eval -> compare
+#   environment -> dataset -> model -> base-model control -> train -> cow detector
+#   -> eval (annotated boxes, then the detector's) -> compare
 #
 # Every step is skipped when its output already exists, and training resumes
 # from its last checkpoint, so after a crash or a pod restart just run it again.
@@ -30,17 +31,48 @@
 # Knobs, all optional:
 #   WORK=/workspace        where the venv, model cache, dataset and runs go
 #                          (default /workspace if writable, else ~/lora-work)
-#   WIDTH=896              frame width fed to the model (train and eval)
-#   EPOCHS=1               passes over the training cows
-#   TRAIN_LIMIT=0          cap on training cows, 0 = all 22 478 (e.g. 6000 for a quick proof)
-#   BATCH=4 ACCUM=4        per-step batch and gradient accumulation (effective 16)
-#   LR=1e-4 RANK=16        LoRA learning rate and rank
+#   UNIT=frame             frame: one example per keyframe, every cow on it numbered
+#                          and answered in one list (../frame.py) - the question a farm
+#                          with a detector asks; cow: one outlined cow per example.
+#                          The defaults below marked [frame|cow] follow it.
+#   WIDTH=1920             frame width fed to the model (train and eval); 1920 is the
+#                          keyframes' own width, ~2900 tokens a cow against ~850 at 896,
+#                          so a step takes ~3.5x as long
+#   EPOCHS=[2|1]           passes over the training examples
+#   TRAIN_FIELDS=skip-ruminating  what the loss trains: posture and activity, but not
+#                          the activity of cows labelled ruminating (see loss_flags in
+#                          train_lora.py); "posture" leaves activity to the base model,
+#                          "both" trains every answer token
+#   TRAIN_LIMIT=0          cap on training cows, 0 = all (e.g. 6000 for a quick proof)
+#   BATCH=[1|2] ACCUM=[16|8]  per-step batch and gradient accumulation (effective 16);
+#                          a frame at 1920 px is ~3700 tokens, a cow ~2900
+#   EVAL_BATCH=[4|8]       frames or cows per generate call, in dev scoring and the val eval
+#   LR=5e-5 RANK=8         LoRA learning rate and rank
+#   HOLDOUT=0.1            share of training clips held out as dev; the adapter is
+#                          scored on 300 of their cows every DEV_EVERY=[50|100] steps,
+#                          and the best snapshot - not the last - becomes adapter/
+#   FRAMES_PER_CLIP=[0|3]  training keyframes per clip (of 6 near-duplicates); 0 = all.
+#                          All for frames: a clip is 6 examples there, not ~50
 #   EVAL_BASE=1            also score the untouched model the same way, as the control
+#                          (once per WIDTH, in lora-runs/base_w<WIDTH>, shared by runs)
 #   PRECISION=auto         bf16 on an 80 GB card, qlora on a 40 GB one
 #   HF_TOKEN=...           only for qlora: the BF16 repo may be gated
 #   CUDA_WANT=12.8         newest CUDA toolkit to install, or "skip"
 #   TORCH_BACKEND=cu128    force a torch build instead of matching CUDA
-#   RUN_NAME=...           default: lora_w<WIDTH>[_n<TRAIN_LIMIT>] - stable, so a rerun resumes it
+#   RUN_NAME=...           default by UNIT and TRAIN_FIELDS: lora4frame[pose|both]_w<WIDTH>,
+#                          lora3norum_w<WIDTH>, lora2pose_w<WIDTH>, lora2_w<WIDTH>;
+#                          plus _n<TRAIN_LIMIT> - stable, so a rerun resumes it
+#   LOCAL_DATA=~/cbvd5-local  local-disk copy of the keyframes read during training
+#                          and eval, when $WORK is on another (network) volume; "off" to skip
+#   DETECTOR=1             train RT-DETRv2 (../detector.py) on the train boxes, run it on
+#                          val and evaluate the adapter on ITS boxes too (eval-lora-det/):
+#                          the test a farm sees, where a cow the detector misses is an
+#                          error. Shared by runs, in lora-runs/detector. 0 to skip
+#   DET_MODEL=PekingU/rtdetr_v2_r50vd  r18vd / r34vd / r50vd / r101vd, all Apache-2.0
+#   DET_SIZE=960 DET_EPOCHS=24 DET_BATCH=8   detector input side, epochs, batch
+#   TRIES=6                attempts at the whole run before giving up. Every step
+#                          resumes, so a failed run is restarted after 1, 2, 4, 8,
+#                          15 min; a run that got 20+ min in starts the count over
 
 set -euo pipefail
 
@@ -53,19 +85,45 @@ if [ -z "${WORK:-}" ]; then
     if mkdir -p /workspace 2>/dev/null && [ -w /workspace ]; then WORK=/workspace
     else WORK="$HOME/lora-work"; fi
 fi
-WIDTH="${WIDTH:-896}"
-EPOCHS="${EPOCHS:-1}"
+UNIT="${UNIT:-frame}"
+case "$UNIT" in frame|cow) ;; *) echo "UNIT must be frame or cow"; exit 2 ;; esac
+pick() { if [ "$UNIT" = frame ]; then echo "$1"; else echo "$2"; fi; }
+WIDTH="${WIDTH:-1920}"
+EPOCHS="${EPOCHS:-$(pick 2 1)}"
+TRAIN_FIELDS="${TRAIN_FIELDS:-skip-ruminating}"
 TRAIN_LIMIT="${TRAIN_LIMIT:-0}"
-BATCH="${BATCH:-4}"
-ACCUM="${ACCUM:-4}"
-LR="${LR:-1e-4}"
-RANK="${RANK:-16}"
+BATCH="${BATCH:-$(pick 1 2)}"
+ACCUM="${ACCUM:-$(pick 16 8)}"
+EVAL_BATCH="${EVAL_BATCH:-$(pick 4 8)}"
+LR="${LR:-5e-5}"
+RANK="${RANK:-8}"
+HOLDOUT="${HOLDOUT:-0.1}"
+DEV_EVERY="${DEV_EVERY:-$(pick 50 100)}"
+FRAMES_PER_CLIP="${FRAMES_PER_CLIP:-$(pick 0 3)}"
 EVAL_BASE="${EVAL_BASE:-1}"
+LOCAL_DATA="${LOCAL_DATA:-$HOME/cbvd5-local}"
+TRIES="${TRIES:-6}"
+DETECTOR="${DETECTOR:-1}"
+DET_MODEL="${DET_MODEL:-PekingU/rtdetr_v2_r50vd}"
+DET_SIZE="${DET_SIZE:-960}"
+DET_EPOCHS="${DET_EPOCHS:-24}"
+DET_BATCH="${DET_BATCH:-8}"
 PRECISION="${PRECISION:-auto}"
 # No date in the default name: a run restarted after midnight must find its
-# own checkpoints, not start a fresh directory.
-if [ "$TRAIN_LIMIT" != "0" ]; then RUN_NAME="${RUN_NAME:-lora_w${WIDTH}_n${TRAIN_LIMIT}}"; fi
-RUN_NAME="${RUN_NAME:-lora_w${WIDTH}}"
+# own checkpoints, not start a fresh directory. "lora2": held-out dev clips
+# and best-snapshot selection; lora_w896 was the first run, without them.
+# "pose": posture-only loss; "norum": activity trained except rumination.
+# "frame": every cow of the keyframe in one example.
+case "$UNIT:$TRAIN_FIELDS" in
+    frame:skip-ruminating) run_kind=lora4frame ;;
+    frame:posture) run_kind=lora4framepose ;;
+    frame:*) run_kind=lora4frameboth ;;
+    *:posture) run_kind=lora2pose ;;
+    *:skip-ruminating) run_kind=lora3norum ;;
+    *) run_kind=lora2 ;;
+esac
+if [ "$TRAIN_LIMIT" != "0" ]; then RUN_NAME="${RUN_NAME:-${run_kind}_w${WIDTH}_n${TRAIN_LIMIT}}"; fi
+RUN_NAME="${RUN_NAME:-${run_kind}_w${WIDTH}}"
 
 MODEL="RedHatAI/Muse-Glimmer-30B-FP8-block"
 MODEL_BF16="meta-models/Muse-Glimmer-30B"
@@ -81,6 +139,7 @@ VENV="$WORK/lora/.venv"
 DATA="$WORK/cbvd5"
 OUT="$WORK/lora-runs/$RUN_NAME"
 RUNS="$WORK/lora-runs"
+DET_OUT="$RUNS/detector"
 SESSION=lora
 LOG="$OUT/log.txt"
 STAGE_FILE="$RUNS/current.stage"
@@ -123,6 +182,7 @@ ensure_system() {
 # ------------------------------------------------------------ watching
 case "${1:-}" in
     attach)
+        if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "$SESSION"; fi
         exec tmux attach -t "$SESSION" ;;
     log)
         # -F, not -f: keeps following across a restart that re-creates the file.
@@ -138,6 +198,8 @@ case "${1:-}" in
             [ -n "$bar" ] && echo "bar   : $bar"
             loss="$(tr '\r' '\n' < "$RUNS/current.log" | grep -oE "\{'loss'[^}]*\}" | tail -1 || true)"
             [ -n "$loss" ] && echo "loss  : $loss"
+            dev="$(grep -a '^\[dev\] step' "$RUNS/current.log" | tail -1 || true)"
+            [ -n "$dev" ] && echo "dev   : ${dev#\[dev\] }"
             echo "--- last lines ---"
             printf '%s\n' "$recent" | grep -v '^[[:space:]]*$' | tail -8
         fi
@@ -145,9 +207,15 @@ case "${1:-}" in
         nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw --format=csv
         exit 0 ;;
     stop)
+        # The run ignores SIGHUP (so a lost terminal cannot end it), which
+        # means kill-session alone would leave it running: TERM its process
+        # group - the pane's, shared by the script, python and tee.
+        pane_pid="$(tmux list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -1 || true)"
         tmux send-keys -t "$SESSION" C-c 2>/dev/null || true
         sleep 5
-        tmux kill-session -t "$SESSION" 2>/dev/null && echo "stopped" || echo "no session '$SESSION'"
+        [ -n "$pane_pid" ] && kill -TERM -- "-$pane_pid" 2>/dev/null || true
+        tmux kill-session -t "$SESSION" 2>/dev/null || true
+        if [ -n "$pane_pid" ]; then echo "stopped"; else echo "no session '$SESSION'"; fi
         exit 0 ;;
     "") ;;
     *)
@@ -155,10 +223,11 @@ case "${1:-}" in
 esac
 
 # ------------------------------------------------------------ into tmux
-# Started from a plain shell: re-launch this same script inside a detached
+# Started from a shell: re-launch this same script inside a detached
 # tmux session and return at once. The knobs are passed explicitly - a tmux
 # server that is already running would not see this shell's environment.
-if [ -z "${TMUX:-}" ] && [ -z "${LORA_IN_TMUX:-}" ]; then
+# Even from inside another tmux: running in that shell would tie the run to it.
+if [ -z "${LORA_IN_TMUX:-}" ]; then
     ensure_system
     if tmux has-session -t "$SESSION" 2>/dev/null; then
         echo "A run is already going in tmux session '$SESSION'. Watch it with:"
@@ -166,13 +235,14 @@ if [ -z "${TMUX:-}" ] && [ -z "${LORA_IN_TMUX:-}" ]; then
         exit 1
     fi
     knobs=""
-    for v in WORK WIDTH EPOCHS TRAIN_LIMIT BATCH ACCUM LR RANK EVAL_BASE PRECISION RUN_NAME KEEP_ZIP HF_TOKEN CUDA_WANT TORCH_BACKEND; do
+    for v in WORK WIDTH EPOCHS TRAIN_LIMIT BATCH ACCUM LR RANK EVAL_BASE PRECISION RUN_NAME KEEP_ZIP HF_TOKEN CUDA_WANT TORCH_BACKEND LOCAL_DATA TRIES HOLDOUT DEV_EVERY FRAMES_PER_CLIP TRAIN_FIELDS EVAL_BATCH UNIT DETECTOR DET_MODEL DET_SIZE DET_EPOCHS DET_BATCH; do
         [ -n "${!v:-}" ] && knobs+="$v=$(printf '%q' "${!v}") "
     done
     self="$(printf '%q' "$HERE/$(basename "${BASH_SOURCE[0]}")")"
     # The shell stays open after the script ends, so an attach after a failure
     # still shows the error instead of a vanished session.
-    tmux new-session -d -s "$SESSION" -x 200 -y 50         "env LORA_IN_TMUX=1 $knobs bash $self; echo; echo \"[run_lora.sh exited with code \$?]\"; exec bash"
+    env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
+        "env LORA_IN_TMUX=1 $knobs bash $self; echo; echo \"[run_lora.sh exited with code \$?]\"; exec bash"
     echo "Started in tmux session '$SESSION' (run: $RUN_NAME)."
     echo
     echo "  watch live :  bash $0 attach     (leave with Ctrl-b, then d - the run keeps going)"
@@ -182,14 +252,59 @@ if [ -z "${TMUX:-}" ] && [ -z "${LORA_IN_TMUX:-}" ]; then
     exit 0
 fi
 
+# A hangup (the tmux pane or the terminal going away) must not end the run.
+# Set before anything is started: tee, python and the rest inherit it.
+trap '' HUP
+
+# ------------------------------------------------------------ supervisor
+# $WORK on RunPod is a network volume (MooseFS), and any read from it - the
+# venv, the model, a keyframe, a checkpoint - can fail for a minute or two
+# (ENXIO, EIO). Retrying each read would never cover them all; instead the
+# whole script is rerun, which is cheap because every step skips work that
+# is already done and training resumes from its last checkpoint.
+if [ -z "${LORA_ATTEMPT:-}" ]; then
+    say() { echo "$*"; { mkdir -p "$OUT" && echo "$*" >> "$LOG"; } 2>/dev/null || true; }
+    self="$HERE/$(basename "${BASH_SOURCE[0]}")"
+    attempt=1
+    while :; do
+        t0=$SECONDS
+        LORA_ATTEMPT=$attempt bash "$self" && exit 0
+        rc=$?
+        # Stopped on purpose (Ctrl-c, `stop`): not a failure to retry.
+        if [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then exit "$rc"; fi
+        # A run that got well under way failed on something new, not on the
+        # same startup error again: give it the full set of attempts.
+        [ $((SECONDS - t0)) -ge 1200 ] && attempt=1
+        if [ "$attempt" -ge "$TRIES" ]; then
+            say "#### giving up after $attempt failed attempts in a row (TRIES=$TRIES)"
+            exit "$rc"
+        fi
+        delay=$((60 << (attempt - 1))); [ "$delay" -gt 900 ] && delay=900
+        say "#### $(date '+%H:%M:%S')  attempt $attempt of $TRIES failed (exit $rc) - rerunning in $((delay / 60)) min; it resumes where it stopped"
+        sleep "$delay"
+        attempt=$((attempt + 1))
+    done
+fi
+
 mkdir -p "$WORK/lora" "$OUT"
 ln -sfn "$LOG" "$RUNS/current.log"
 # Everything below goes to the screen and to the log file. Python is told not
 # to buffer, or the log would lag minutes behind what is actually happening.
-exec > >(tee -a "$LOG") 2>&1
+# --output-error=warn: if the screen goes away, tee keeps writing the log
+# instead of dying and taking the script down with SIGPIPE.
+if tee --output-error=warn /dev/null </dev/null >/dev/null 2>&1; then
+    exec > >(tee --output-error=warn -a "$LOG") 2>&1
+else
+    exec > >(tee -a "$LOG") 2>&1
+fi
 export PYTHONUNBUFFERED=1
-echo "#### run_lora.sh started $(date '+%Y-%m-%d %H:%M:%S')  run=$RUN_NAME"
-trap 'echo "$(date "+%H:%M:%S")  run_lora.sh exited with code $?" >> "$STAGE_FILE"' EXIT
+echo "#### run_lora.sh started $(date '+%Y-%m-%d %H:%M:%S')  run=$RUN_NAME  attempt=$LORA_ATTEMPT"
+# set -e stops the script on the first failing command without a word; say
+# which one it was, in the log, where `bash run_lora.sh log` shows it.
+set -E   # ...inside functions too
+trap 'rc=$?; echo "!! line $LINENO failed (exit $rc): $BASH_COMMAND"' ERR
+trap 'rc=$?; msg="$(date "+%H:%M:%S")  run_lora.sh exited with code $rc"
+      echo "$msg" >> "$STAGE_FILE"; echo "#### $msg"' EXIT
 
 step() {
     echo; echo "=============================================================="
@@ -198,7 +313,7 @@ step() {
     echo "$(date '+%H:%M:%S')  $RUN_NAME  $*" > "$STAGE_FILE"
 }
 
-step "1/9  System packages, GPU and disk"
+step "1/10  System packages, GPU and disk"
 ensure_system   # again: a run started inside an existing tmux skipped the check above
 nvidia-smi --query-gpu=name,memory.total,memory.used,driver_version --format=csv
 gpu_mib="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | tr -d ' ')"
@@ -222,7 +337,7 @@ if [ "$free_gb" -lt "$need_gb" ]; then
     echo "!! ${free_gb} GB free on $WORK, about ${need_gb} GB needed. Continuing, but expect a full disk."
 fi
 
-step "2/9  CUDA toolkit"
+step "2/10  CUDA toolkit"
 # torch wheels carry their own CUDA runtime, so training itself would run
 # without this. The toolkit (nvcc, headers, libs) is installed anyway so that
 # anything compiling kernels on first use - Triton, bitsandbytes, a
@@ -334,7 +449,7 @@ if [ -z "$TORCH_BACKEND" ]; then
 fi
 echo "torch build: $TORCH_BACKEND"
 
-step "3/9  Python environment"
+step "3/10  Python environment"
 if ! command -v uv >/dev/null 2>&1; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
@@ -348,6 +463,14 @@ uv --version
 if [ ! -d "$VENV" ]; then
     uv venv --python 3.12 --seed --managed-python "$VENV"
 fi
+# The venv is on $WORK and survives a pod restart; the Python it links to is
+# under ~/.local/share/uv on the container disk and does not. Put the same
+# version back rather than rebuild 8 GB of packages.
+if [ ! -x "$VENV/bin/python" ]; then
+    py_ver="$(sed -n 's/^version_info *= *//p' "$VENV/pyvenv.cfg")"
+    echo "the venv's Python ${py_ver:-?} is gone (pod restart?) - reinstalling it"
+    uv python install "${py_ver:-3.12}"
+fi
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
 
@@ -355,23 +478,54 @@ source "$VENV/bin/activate"
 # Glimmer": the architecture is new (its config was written by
 # transformers 5.15.0.dev0), and an older transformers imports fine and only
 # fails at from_pretrained with "model type muse_glimmer not recognized".
-env_ready() {
-    python - <<'PY' 2>/dev/null
+#
+# The exit code says what is wrong, because the fixes differ:
+#   2  something does not import         -> (re)install the packages
+#   3  transformers lacks muse_glimmer   -> transformers from main
+#   4  torch has no kernels for this GPU -> another torch build
+#   5  a read from the volume failed     -> nothing to install: $WORK is a
+#      network volume and it hiccuped; end this attempt and let the
+#      supervisor rerun it. Reinstalling here once swapped a working
+#      transformers 5.17 for a dev build from main.
+env_state() {
+    python - <<'PY'
 import sys
+IO = ("No such device or address", "Input/output error", "Stale file handle",
+      "Transport endpoint is not connected", "Connection timed out")
 try:
     import torch, peft, accelerate, safetensors, PIL, requests, jinja2  # noqa: F401
-    from transformers import AutoConfig
+    from transformers import AutoConfig  # noqa: F401
     from transformers.models.auto.modeling_auto import MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
-except Exception:
-    sys.exit(1)
+except Exception as e:
+    msg = f"{type(e).__name__}: {e}"
+    print("  env:", msg)
+    sys.exit(5 if any(s in msg for s in IO) else 2)
 if "muse_glimmer" not in MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES:
-    sys.exit(1)
-major, minor = torch.cuda.get_device_capability()
-sys.exit(0 if f"sm_{major}{minor}" in torch.cuda.get_arch_list() else 1)
+    import transformers
+    print("  env: transformers", transformers.__version__, "does not know muse_glimmer")
+    sys.exit(3)
+try:
+    major, minor = torch.cuda.get_device_capability()
+except Exception as e:
+    print(f"  env: torch {torch.__version__} cannot use the GPU: {type(e).__name__}: {e}")
+    sys.exit(4)
+if f"sm_{major}{minor}" not in torch.cuda.get_arch_list():
+    print(f"  env: torch {torch.__version__} has no sm_{major}{minor} kernels")
+    sys.exit(4)
 PY
 }
+env_rc() {
+    local rc=0
+    env_state || rc=$?
+    if [ "$rc" -eq 5 ]; then
+        echo "!! reading the venv on $WORK failed (network volume) - not reinstalling; this attempt ends here"
+        exit 1
+    fi
+    return "$rc"
+}
 
-if ! env_ready; then
+rc=0; env_rc || rc=$?
+if [ "$rc" -ne 0 ]; then
     # torch from the CUDA line picked in step 2; the PyTorch index directly if
     # this uv does not know that backend name.
     uv pip install torch torchvision --torch-backend="$TORCH_BACKEND" \
@@ -381,11 +535,13 @@ if ! env_ready; then
     # take transformers from main just below.
     uv pip install -r "$HERE/requirements.txt" \
         || uv pip install -r <(grep -v '^transformers' "$HERE/requirements.txt")
-    if ! env_ready; then
+    rc=0; env_rc || rc=$?
+    if [ "$rc" -eq 3 ]; then
         echo "  no released transformers knows muse_glimmer - installing from main"
         uv pip install "git+https://github.com/huggingface/transformers.git"
+        rc=0; env_rc || rc=$?
     fi
-    if ! env_ready; then
+    if [ "$rc" -ne 0 ]; then
         echo "!! The environment is still not usable:"
         python - <<'PY' || true
 import torch, transformers
@@ -398,21 +554,35 @@ PY
         exit 1
     fi
 fi
+# The detector's matching loss (Hungarian) needs scipy; a venv made before
+# the detector was added does not have it.
+python -c "import scipy" 2>/dev/null || uv pip install scipy
 if [ "$PRECISION" = "qlora" ] && ! python -c "import bitsandbytes" 2>/dev/null; then
     uv pip install bitsandbytes
 fi
 python -c "import torch, transformers, peft; print('torch', torch.__version__, '| transformers', transformers.__version__, '| peft', peft.__version__)"
 
-step "4/9  Dataset"
+step "4/10  Dataset"
 if [ ! -f "$DATA/annotations/ava_train_v2.1.csv" ] || [ ! -d "$DATA/labelframes" ]; then
     ZIP="$WORK/cbvd-5cow-behavior-video-dataset.zip"
+    [ -f "$ZIP" ] && echo "checking $ZIP (reads all 12 GB, takes a few minutes)"
     if ! unzip -tq "$ZIP" >/dev/null 2>&1; then
         echo "downloading CBVD-5 (~12 GB)"
         curl -L --fail --retry 5 -C - -o "$ZIP" "$DATASET_URL" || curl -L --fail --retry 5 -o "$ZIP" "$DATASET_URL"
     fi
     # Only what training reads: the annotations and the keyframes. The mp4s
     # and the rawframes are two thirds of the archive and are not used.
-    prefix="$(unzip -Z1 "$ZIP" | grep -m1 'annotations/ava_train_v2.1.csv$' | sed 's|annotations/ava_train_v2.1.csv$||')"
+    # "(^|/)" before the name: the archive also holds miniannotations/, the
+    # 256 px copy, and a bare suffix match picks whichever comes first.
+    # awk reads the whole listing. A `grep -m1` here stopped after the first
+    # match, unzip died of SIGPIPE on the rest, and with pipefail + set -e the
+    # script exited silently right after the download.
+    if ! prefix="$(unzip -Z1 "$ZIP" | awk '
+            !found && /(^|\/)annotations\/ava_train_v2\.1\.csv$/ { sub(/annotations\/ava_train_v2\.1\.csv$/, ""); print; found = 1 }
+            END { exit !found }')"; then
+        echo "!! annotations/ava_train_v2.1.csv not found in $ZIP - broken download? Delete it and rerun."
+        exit 1
+    fi
     echo "archive prefix: '${prefix}'"
     mkdir -p "$DATA"
     unzip -q -o "$ZIP" "${prefix}annotations/*" "${prefix}labelframes/*" -d "$DATA/_x"
@@ -422,9 +592,109 @@ if [ ! -f "$DATA/annotations/ava_train_v2.1.csv" ] || [ ! -d "$DATA/labelframes"
     rm -rf "$DATA/_x"
     [ "${KEEP_ZIP:-0}" = "1" ] || rm -f "$ZIP"
 fi
-echo "keyframes: $(find "$DATA/labelframes" -name '*.jpg' | wc -l)"
+n_frames="$(find "$DATA/labelframes" -name '*.jpg' | wc -l)"
+echo "keyframes: $n_frames"
 
-step "5/9  Model"
+# /workspace on RunPod is a network volume (MooseFS). A read there can fail
+# for a minute or two (ENXIO, EIO), and training reads ~90 000 keyframes.
+# A copy on the container's own disk takes a few minutes and ~3 GB and
+# takes the network out of the loop. The container disk is wiped with the
+# pod, so the copy is redone after a restart; the original stays on $WORK.
+# Copy SRC_ROOT/SUBDIR... to DST_ROOT. Not cp: one failed read there fails
+# the whole copy. Each file is retried, lands under a temporary name and is
+# renamed only once its size matches, and files copied by an earlier attempt
+# are skipped - so a later attempt finishes what this one could not.
+copy_retried() {
+    python - "$@" <<'PY'
+import os, shutil, sys, time
+src_root, dst_root, *subdirs = sys.argv[1:]
+
+def retried(what, fn, tries=8):
+    delay = 2
+    for attempt in range(1, tries + 1):
+        try:
+            return fn()
+        except OSError as e:
+            if attempt == tries:
+                print(f"  giving up on {what}: {e}", flush=True)
+                raise
+            print(f"  {what}: {e} - retry {attempt}/{tries - 1} in {delay}s", flush=True)
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
+def copy_file(src, dst):
+    size = os.stat(src).st_size
+    if os.path.exists(dst) and os.path.getsize(dst) == size:
+        return 0
+    part = dst + ".part"
+    with open(src, "rb") as fi, open(part, "wb") as fo:
+        shutil.copyfileobj(fi, fo, 1 << 20)
+    if os.path.getsize(part) != size:
+        raise OSError(f"copied {os.path.getsize(part)} of {size} bytes")
+    os.replace(part, dst)
+    return 1
+
+copied = 0
+try:
+    for sub in subdirs:
+        stack = [sub]
+        while stack:
+            rel = stack.pop()
+            src = os.path.join(src_root, rel)
+            os.makedirs(os.path.join(dst_root, rel), exist_ok=True)
+            for entry in retried(src, lambda: list(os.scandir(src))):
+                r = os.path.join(rel, entry.name)
+                if entry.is_dir():
+                    stack.append(r)
+                else:
+                    copied += retried(entry.path,
+                                      lambda: copy_file(entry.path, os.path.join(dst_root, r)))
+except OSError:
+    print(f"  copied {copied} files this time, stopped on a read that kept failing", flush=True)
+    sys.exit(1)
+print(f"  copied {copied} files", flush=True)
+PY
+}
+
+RUN_DATA="$DATA"
+fs_of() { df --output=target "$1" 2>/dev/null | tail -1; }
+if [ "$LOCAL_DATA" = "off" ]; then
+    echo "LOCAL_DATA=off - reading keyframes from $DATA"
+elif [ -f "$LOCAL_DATA/.complete" ] && [ "$(cat "$LOCAL_DATA/.complete")" = "$n_frames" ]; then
+    echo "local copy of the keyframes: $LOCAL_DATA"
+    RUN_DATA="$LOCAL_DATA"
+else
+    parent="$(dirname "$LOCAL_DATA")"
+    mkdir -p "$parent"
+    if [ "$(fs_of "$parent")" = "$(fs_of "$DATA")" ]; then
+        echo "keyframes are already on the disk $LOCAL_DATA would be on - no copy"
+    else
+        # What is already in a partial copy from an earlier attempt is kept.
+        need_mb="$( { du -sm "$DATA/labelframes" "$DATA/annotations" 2>/dev/null || true; } \
+                    | awk '{s += $1} END {print s + 2048}')"
+        have_mb="$( { du -sm "$LOCAL_DATA.tmp" 2>/dev/null || true; } | awk '{s += $1} END {print s + 0}')"
+        free_mb="$(df -BM --output=avail "$parent" | tail -1 | tr -dc '0-9')"
+        if [ "$((free_mb + have_mb))" -lt "$need_mb" ]; then
+            echo "!! ${free_mb} MB free under $parent, ${need_mb} MB needed for a local copy -"
+            echo "!! reading keyframes from $DATA (reads there are retried)"
+        else
+            echo "copying keyframes to the local disk: $LOCAL_DATA"
+            rm -rf "$LOCAL_DATA"
+            if copy_retried "$DATA" "$LOCAL_DATA.tmp" annotations labelframes \
+               && [ "$(find "$LOCAL_DATA.tmp/labelframes" -name '*.jpg' | wc -l)" = "$n_frames" ]; then
+                echo "$n_frames" > "$LOCAL_DATA.tmp/.complete"
+                mv "$LOCAL_DATA.tmp" "$LOCAL_DATA"
+                RUN_DATA="$LOCAL_DATA"
+                echo "  done: $(du -sh "$LOCAL_DATA" | cut -f1)"
+            else
+                echo "!! copy not finished - reading keyframes from $DATA for now (reads there"
+                echo "!! are retried); the next attempt continues the copy"
+            fi
+        fi
+    fi
+fi
+
+step "5/10  Model"
 if [ "$PRECISION" = "qlora" ]; then
     hf download "$MODEL_BF16"
     hf download "$MODEL" --include "*.json" "*.jinja"   # the processor and chat template
@@ -434,54 +704,99 @@ else
     BASE_ARG=()
 fi
 
-COMMON=(--root "$DATA" --out "$OUT" --width "$WIDTH" --precision "$PRECISION" "${BASE_ARG[@]}")
+COMMON=(--root "$RUN_DATA" --out "$OUT" --width "$WIDTH" --precision "$PRECISION" "${BASE_ARG[@]}" --unit "$UNIT"
+        --eval-batch "$EVAL_BATCH" --dev-batch "$EVAL_BATCH")
+# What picks the training and dev cows: the data check must see the same.
+SPLIT=(--train-limit "$TRAIN_LIMIT" --holdout "$HOLDOUT" --frames-per-clip "$FRAMES_PER_CLIP")
+# The base model at a given width scores the same in every run: done once,
+# kept beside the runs. The first run kept its copy inside its own folder.
+BASE_OUT="$RUNS/base_w${WIDTH}$(pick _frame "")"
+if [ "$UNIT" = cow ] && [ ! -s "$BASE_OUT/results.jsonl" ] && [ -s "$RUNS/lora_w${WIDTH}/eval-base/results.jsonl" ]; then
+    mkdir -p "$BASE_OUT"
+    cp -r "$RUNS/lora_w${WIDTH}/eval-base/." "$BASE_OUT/"
+    echo "base-model eval taken from $RUNS/lora_w${WIDTH}/eval-base"
+fi
 cd "$BENCH"
 
-step "6/9  Training data check"
-python lora/train_lora.py data "${COMMON[@]}" --train-limit "$TRAIN_LIMIT"
+step "6/10  Training data check"
+python lora/train_lora.py data "${COMMON[@]}" "${SPLIT[@]}"
 
-step "7/9  Control: the untouched model, same width, no reasoning"
+step "7/10  Control: the untouched model, same width, no reasoning"
 # The zero-shot runs in runs/ were made with reasoning on and at 1280/1920 px.
 # This arm changes only what the LoRA arm changes apart from the training -
 # width and no reasoning - so base-vs-LoRA isolates what the training bought.
 # Not fatal: a failure here should not cost the night's training.
 if [ "$EVAL_BASE" = "1" ]; then
-    python lora/train_lora.py eval "${COMMON[@]}" --adapter none \
+    python lora/train_lora.py eval "${COMMON[@]}" --adapter none --eval-out "$BASE_OUT" \
         || echo "!! base-model eval failed; continuing to training"
 fi
 
-step "8/9  Training"
+step "8/10  Training"
 if [ -f "$OUT/adapter/adapter_config.json" ] && [ -f "$OUT/train_meta.json" ]; then
     echo "adapter already trained: $OUT/adapter"
 else
-    python lora/train_lora.py train "${COMMON[@]}" --train-limit "$TRAIN_LIMIT" \
+    python lora/train_lora.py train "${COMMON[@]}" "${SPLIT[@]}" --dev-every "$DEV_EVERY" \
+        --train-fields "$TRAIN_FIELDS" \
         --epochs "$EPOCHS" --batch "$BATCH" --accum "$ACCUM" --lr "$LR" --rank "$RANK" \
         --alpha "$((RANK * 2))"
 fi
 
-step "9/9  Evaluation on all 2532 val cows"
+step "9/10  Cow detector: RT-DETRv2 on the train boxes, then every val keyframe"
+# After the LoRA, not before: a detector failure then costs a rerun of this
+# step only - the adapter is already saved and the rerun skips its training.
+DETS="$DET_OUT/val_detections.jsonl"
+if [ "$DETECTOR" = "1" ]; then
+    python detector.py train --root "$RUN_DATA" --out "$DET_OUT" --model "$DET_MODEL" \
+        --size "$DET_SIZE" --epochs "$DET_EPOCHS" --batch "$DET_BATCH"
+    python detector.py detect --root "$RUN_DATA" --out "$DET_OUT"
+    python detector.py score --out "$DET_OUT"
+else
+    echo "DETECTOR=0 - skipped"
+fi
+
+step "10/10  Evaluation on all 2532 val cows"
+# First on the annotated boxes - comparable with every earlier run - then on
+# the detector's: the model answers about what the detector found, the
+# annotation only scores, and an annotated cow the detector missed is an error.
 python lora/train_lora.py eval "${COMMON[@]}" --adapter "$OUT/adapter"
+if [ "$DETECTOR" = "1" ]; then
+    python lora/train_lora.py eval "${COMMON[@]}" --adapter "$OUT/adapter" \
+        --boxes "$DETS" --eval-out "$OUT/eval-lora-det"
+    cp "$DET_OUT/det_report.md" "$OUT/eval-lora-det/"
+fi
 
 ZS="$BENCH/runs/2026-09-25_val-full_w1920_f1"
-for arm in eval-base eval-lora; do
-    [ -s "$OUT/$arm/results.jsonl" ] || continue
-    python cowbench.py --out "$OUT/$arm" score
-    python cowbench.py --out "$OUT/$arm" score --vote
-    python cowbench.py --out "$OUT/$arm" report
+for arm in "$BASE_OUT" "$OUT/eval-lora" "$OUT/eval-lora-det"; do
+    [ -s "$arm/results.jsonl" ] || continue
+    python cowbench.py --out "$arm" score
+    python cowbench.py --out "$arm" score --vote
+    python cowbench.py --out "$arm" report
 done
 python cowbench.py compare --a "$ZS" --b "$OUT/eval-lora" \
     --label-a "zero-shot 1920px, reasoning" --label-b "LoRA ${WIDTH}px" \
     --output "$OUT/eval-lora/compare_vs_zeroshot1920.md"
-if [ -s "$OUT/eval-base/results.jsonl" ]; then
-    python cowbench.py compare --a "$OUT/eval-base" --b "$OUT/eval-lora" \
+if [ -s "$BASE_OUT/results.jsonl" ]; then
+    python cowbench.py compare --a "$BASE_OUT" --b "$OUT/eval-lora" \
         --label-a "base ${WIDTH}px, no reasoning" --label-b "LoRA ${WIDTH}px" \
         --output "$OUT/eval-lora/compare_vs_base.md"
+fi
+if [ -s "$OUT/eval-lora-det/results.jsonl" ]; then
+    python cowbench.py compare --a "$OUT/eval-lora" --b "$OUT/eval-lora-det" \
+        --label-a "LoRA, annotated boxes" --label-b "LoRA, RT-DETRv2 boxes" \
+        --output "$OUT/eval-lora-det/compare_vs_annotated_boxes.md"
 fi
 
 echo
 echo "Done. Everything is in $OUT:"
-echo "  adapter/                      the LoRA weights (~0.4 GB)"
-echo "  train_meta.json               what was trained, how long, loss before and after"
+echo "  adapter/                      the LoRA weights: the best dev snapshot"
+echo "  dev_history.jsonl             dev error every $DEV_EVERY steps; adapters/ has each snapshot"
+echo "  train_meta.json               what was trained, how long, loss, the best dev step"
 echo "  eval-lora/report.md           the bench report for the fine-tuned model"
 echo "  eval-lora/compare_*.md        paired comparisons against the zero-shot runs"
+if [ "$DETECTOR" = "1" ]; then
+echo "  eval-lora-det/report.md       the same on the detector's boxes - the farm's test"
+echo "  eval-lora-det/det_report.md   how many cows the detector found ($DET_OUT)"
+echo "  For the tests on another pod (cowbench/run_tests.sh) bring $OUT/adapter"
+echo "  and $DET_OUT/best (the detector's weights, ~170 MB); run_tests.sh runs the detector itself."
+fi
 echo "Copy it back into cowbench/runs/ to keep it with the rest."
