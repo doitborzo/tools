@@ -257,3 +257,9 @@ test runs `stress --live-detector <detector/best>`: every frame of every
 camera goes through RT-DETRv2 in the stress process, on that free memory,
 and the model is asked about what it found - the farm's chain, timed as a
 whole. The report gives the detector's own ms a frame beside the totals.
+
+## A new video
+
+`label/` pre-labels an unannotated video (OWLv2 or the trained RT-DETRv2,
+tracks, optionally Muse), hands it to CVAT for a person to correct, and turns
+CVAT's export into CBVD-5's format: see [label/README.md](label/README.md).

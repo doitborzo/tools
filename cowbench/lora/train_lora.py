@@ -84,7 +84,9 @@ def answer_json(posture: str, activity: str) -> str:
 def load_train(root, include_val_clips=False):
     boxes = cbvd.load_boxes(os.path.join(root, "annotations", "ava_train_v2.1.csv"))
     usable, rejected = cbvd.partition(boxes)
-    val = cbvd.load_boxes(os.path.join(root, "annotations", "ava_val_v2.1.csv"))
+    val_csv = os.path.join(root, "annotations", "ava_val_v2.1.csv")
+    # A newly labelled video may have only a train file (label/cvat2ava.py --split train).
+    val = cbvd.load_boxes(val_csv) if os.path.exists(val_csv) else []
     val_clips = {b.video_id for b in val}
     kept = usable if include_val_clips else [b for b in usable if b.video_id not in val_clips]
     rows = [{"id": b.uid, "video_id": b.video_id, "timestamp": b.timestamp,
