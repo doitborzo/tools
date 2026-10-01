@@ -2,13 +2,15 @@
 # Everything after training, on a fresh pod, in one go:
 #
 #   dataset -> adapter -> RT-DETRv2 on every val keyframe -> vLLM with the adapter
-#   -> bench with the adapter -> 12 cameras at once -> one tar.gz
+#   -> bench with the adapter -> 12 cameras at once, detector and model together
+#   -> one tar.gz
 #
 # The cows are those RT-DETRv2 finds, never the annotation's boxes: the model
 # answers about what the detector found, the annotation only scores, and a cow
 # the detector missed is an error. The detector is run here, from the weights
-# run_lora.sh trained (lora-runs/detector/best), in its own venv, before vLLM
-# takes the GPU.
+# run_lora.sh trained (lora-runs/detector/best), in its own venv. vLLM is
+# started with DET_RESERVE_MIB of the card left free, so in the camera test the
+# detector runs live on every frame on the same GPU, next to the model.
 #
 # Usage (the repo checked out; from the training pod, the adapter folder and
 # the detector's best/ folder - see ADAPTER and DET_DIR below):
@@ -31,6 +33,11 @@
 #   BOXES=$DET_DIR/val_detections.jsonl   boxes made elsewhere: used as they are when
 #                                   there are no weights to make them from
 #   DET_THRESHOLD                   override the detector's score threshold
+#   DET_RESERVE_MIB=4096            GPU memory kept free of vLLM for the detector
+#   GPU_MEM_UTIL                    vLLM's share of the card; by default 1 minus that
+#                                   reserve and 512 MiB of margin (0.94 on 80 GB)
+#   LIVE=1                          camera test with the detector live on every frame
+#                                   (when its weights are here); 0: its boxes from file
 #   MUSE_DETECT=0                   1: also let the base model find the cows by itself
 #                                   (the earlier test: 53% found) and stress that
 #   WIDTH, UNIT                     how the adapter is asked: by default as it was trained,
@@ -55,6 +62,9 @@ DET_DIR="${DET_DIR:-$WORK/lora-runs/detector}"
 BOXES="${BOXES:-$DET_DIR/val_detections.jsonl}"
 DET_THRESHOLD="${DET_THRESHOLD:-}"
 MUSE_DETECT="${MUSE_DETECT:-0}"
+DET_RESERVE_MIB="${DET_RESERVE_MIB:-4096}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-}"
+LIVE="${LIVE:-1}"
 # The width and unit the adapter was trained at, from its run's train_meta.json
 # (adapter/ or adapters/step-N sit one or two levels below it).
 trained() {
@@ -95,7 +105,7 @@ if [ -z "${COWTESTS_IN_TMUX:-}" ]; then
         echo "already running in tmux session '$SESSION':  bash $0 log"; exit 1
     fi
     knobs=""
-    for v in WORK ADAPTER LORA_NAME DET_DIR BOXES DET_THRESHOLD MUSE_DETECT WIDTH UNIT STREAMS INTERVAL DURATION PORT OUT; do
+    for v in WORK ADAPTER LORA_NAME DET_DIR BOXES DET_THRESHOLD MUSE_DETECT DET_RESERVE_MIB GPU_MEM_UTIL LIVE WIDTH UNIT STREAMS INTERVAL DURATION PORT OUT; do
         knobs+="$v=$(printf '%q' "${!v}") "
     done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
@@ -160,14 +170,17 @@ make_det_env() {
     uv pip install --python "$DET_PY" "transformers>=5.15" scipy pillow requests safetensors
     det_env_ok || { echo "!! the detector's venv does not import torch / transformers RT-DETRv2"; exit 1; }
 }
+gpu_mib() {   # memory.free or memory.total of GPU 0, MiB; empty without a GPU
+    { nvidia-smi --query-gpu="memory.$1" --format=csv,noheader,nounits 2>/dev/null || true; } | head -1 | tr -dc '0-9'
+}
 if [ -f "$DET_DIR/best/det_train_meta.json" ]; then
     make_det_env
-    # Before vLLM, which takes 95% of the card. When a server is already up,
-    # the detector goes to the GPU only if ~4 GB are still free, else to the CPU
-    # (a few minutes for 292 keyframes; its ms a frame is then a CPU number).
+    # A server started without the reserve (by hand, or an older run) may
+    # leave no room: then the CPU (a few minutes for 292 keyframes; the
+    # detector's ms a frame in det_report.md is then a CPU number).
     det_gpu=()
-    free_mib="$( { nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null || true; } | head -1 | tr -dc '0-9')"
-    if [ "${free_mib:-0}" -lt 4000 ]; then
+    free_mib="$(gpu_mib free)"
+    if [ "${free_mib:-0}" -lt "$DET_RESERVE_MIB" ]; then
         echo "GPU busy (${free_mib:-?} MiB free) - running the detector on the CPU"
         det_gpu=(env CUDA_VISIBLE_DEVICES=)
     fi
@@ -175,7 +188,9 @@ if [ -f "$DET_DIR/best/det_train_meta.json" ]; then
     "${det_gpu[@]}" "$DET_PY" "$HERE/detector.py" score --out "$DET_DIR"
     BOXES="$DET_DIR/val_detections.jsonl"
 elif [ -s "$BOXES" ] && [ -f "$(dirname "$BOXES")/det_meta.json" ]; then
-    echo "no detector weights in $DET_DIR/best - using the boxes in $BOXES as they are"
+    echo "no detector weights in $DET_DIR/best - using the boxes in $BOXES as they are,"
+    echo "and in the camera test too (no live detector without its weights)"
+    LIVE=0
 else
     echo "!! no detector in $DET_DIR/best (and no ready boxes in $BOXES)."
     echo "!! run_lora.sh trains it (step 9) into lora-runs/detector/best on the training pod."
@@ -189,20 +204,40 @@ if [ -f "$BOX_DIR/det_report.md" ]; then cp "$BOX_DIR/det_report.md" "$OUT/"; ca
 BOX_ARGS=(--boxes "$BOXES")
 [ -n "$DET_THRESHOLD" ] && BOX_ARGS+=(--det-threshold "$DET_THRESHOLD")
 
-step "4/7  vLLM with the adapter"
+step "4/7  vLLM with the adapter, ${DET_RESERVE_MIB} MiB left for the detector"
+gpu_total="$(gpu_mib total)"
+if [ -z "$GPU_MEM_UTIL" ]; then
+    GPU_MEM_UTIL=0.95
+    [ -n "$gpu_total" ] && GPU_MEM_UTIL="$(awk -v t="$gpu_total" -v r="$DET_RESERVE_MIB" \
+        'BEGIN { u = int(100 * (t - r - 512) / t) / 100; if (u > 0.95) u = 0.95; printf "%.2f", u }')"
+fi
+echo "vLLM gets ${GPU_MEM_UTIL} of ${gpu_total:-?} MiB"
 server_has_adapter() { curl -sf "$BASE_URL/v1/models" 2>/dev/null | grep -q "\"$LORA_NAME\""; }
-if server_has_adapter; then
-    echo "already serving $LORA_NAME on $BASE_URL"
+room_for_detector() {   # true too without nvidia-smi: nothing to measure there
+    local free; free="$(gpu_mib free)"
+    [ "$LIVE" != 1 ] || [ -z "$free" ] || [ "$free" -ge "$DET_RESERVE_MIB" ]
+}
+if server_has_adapter && room_for_detector; then
+    echo "already serving $LORA_NAME on $BASE_URL, $(gpu_mib free) MiB free for the detector"
+elif server_has_adapter && ! tmux has-session -t vllm 2>/dev/null; then
+    echo "!! $LORA_NAME is served by a vLLM this script did not start, and only $(gpu_mib free) MiB"
+    echo "!! are free: the live detector may not fit. Restart that server with"
+    echo "!! GPU_MEM_UTIL=$GPU_MEM_UTIL, or stop it and rerun - this script then starts its own."
 else
     if tmux has-session -t vllm 2>/dev/null; then
-        echo "a tmux session 'vllm' exists but does not serve $LORA_NAME - restarting it"
+        if server_has_adapter; then
+            echo "the tmux session 'vllm' leaves only $(gpu_mib free) MiB for the detector - restarting it"
+        else
+            echo "a tmux session 'vllm' exists but does not serve $LORA_NAME - restarting it"
+        fi
         tmux kill-session -t vllm
+        sleep 10   # the GPU memory is released when the process is gone
     fi
     rm -f "$WORK/vllm.exit"
     # lora_muse.sh may ask "Continue anyway?" about open files; that concerns
     # data-parallel, which one GPU does not use, so the answer is yes.
     tmux new-session -d -s vllm -x 200 -y 50 \
-        "yes y | env LORA_MODULES=$(printf '%q' "$LORA_NAME=$ADAPTER") bash $(printf '%q' "$REPO/lora_muse.sh") 2>&1 | tee -a $WORK/vllm.log; echo \$? > $WORK/vllm.exit; exec bash"
+        "yes y | env LORA_MODULES=$(printf '%q' "$LORA_NAME=$ADAPTER") GPU_MEM_UTIL=$GPU_MEM_UTIL bash $(printf '%q' "$REPO/lora_muse.sh") 2>&1 | tee -a $WORK/vllm.log; echo \$? > $WORK/vllm.exit; exec bash"
     echo "starting vLLM in tmux session 'vllm' (log: $WORK/vllm.log)."
     echo "First start installs vLLM and downloads the model (~33 GB): up to an hour."
     t0=$SECONDS
@@ -218,6 +253,7 @@ else
     done
     echo
 fi
+echo "GPU memory free next to vLLM: $(gpu_mib free) MiB"
 curl -s "$BASE_URL/v1/models" | grep -o '"id": *"[^"]*"' | sed 's/"id": */  model: /'
 
 step "5/7  Python for the bench"
@@ -254,18 +290,32 @@ if [ "$MUSE_DETECT" = "1" ]; then
     bench detect-score
 fi
 
-step "7/7  $STREAMS cameras at once, on the detector's boxes"
+if [ "$LIVE" = 1 ]; then
+    step "7/7  $STREAMS cameras at once: RT-DETRv2 live on every frame, then $LORA_NAME, one GPU"
+else
+    step "7/7  $STREAMS cameras at once, on the detector's boxes from file"
+fi
 stress() {   # skip a test whose report is already there
     local tag="$1"; shift
     if [ -f "$OUT/$tag.md" ]; then echo "done before: $OUT/$tag.md"; return; fi
-    bench stress --root "$ROOT" --base-url "$BASE_URL" --streams "$STREAMS" \
-        --duration "$DURATION" "$@"
+    "${STRESS_PY[@]}" cowbench.py --out "$OUT" stress --root "$ROOT" --base-url "$BASE_URL" \
+        --streams "$STREAMS" --duration "$DURATION" "$@"
 }
 task=classify; [ "$UNIT" = frame ] && task=frame
-stress "stress_${task}_${STREAMS}x_max" --task "$task" --model "$LORA_NAME" --answer-now --max-width "$WIDTH" \
-    "${BOX_ARGS[@]}"
-stress "stress_${task}_${STREAMS}x_${INTERVAL}s" --task "$task" --model "$LORA_NAME" --answer-now --max-width "$WIDTH" \
-    --interval "$INTERVAL" "${BOX_ARGS[@]}"
+if [ "$LIVE" = 1 ]; then
+    # The detector's venv: it has torch. The detector loads in this process,
+    # on the GPU next to vLLM, in the memory vLLM was told to leave free.
+    STRESS_PY=("$DET_PY"); live_tag=_live
+    CAM_ARGS=(--live-detector "$DET_DIR/best")
+    [ -n "$DET_THRESHOLD" ] && CAM_ARGS+=(--det-threshold "$DET_THRESHOLD")
+else
+    STRESS_PY=("$PY"); live_tag=""; CAM_ARGS=("${BOX_ARGS[@]}")
+fi
+stress "stress_${task}_${STREAMS}x_max${live_tag}" --task "$task" --model "$LORA_NAME" --answer-now \
+    --max-width "$WIDTH" "${CAM_ARGS[@]}"
+stress "stress_${task}_${STREAMS}x_${INTERVAL}s${live_tag}" --task "$task" --model "$LORA_NAME" --answer-now \
+    --max-width "$WIDTH" --interval "$INTERVAL" "${CAM_ARGS[@]}"
+STRESS_PY=("$PY")
 [ "$MUSE_DETECT" = "1" ] && stress "stress_detect_${STREAMS}x_max" --task detect --model muse-glimmer
 
 tarball="$WORK/cow_tests_$(basename "$OUT").tgz"
@@ -276,5 +326,5 @@ echo "  det_report.md                     how many cows RT-DETRv2 found"
 echo "  report.md                         bench with $LORA_NAME per $UNIT at $WIDTH px on its boxes;"
 echo "                                    missed cows count as errors, extras in detections_answered.jsonl"
 [ "$MUSE_DETECT" = "1" ] && echo "  detect_report.md                  the base model finding the cows by itself"
-echo "  stress_*.md                       $STREAMS cameras at once"
+echo "  stress_*.md                       $STREAMS cameras at once$( [ "$LIVE" = 1 ] && echo ', the detector live on every frame (_live)')"
 echo "Everything in one file: $tarball"

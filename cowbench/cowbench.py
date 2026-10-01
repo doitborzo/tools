@@ -652,6 +652,9 @@ def main(argv=None):
     sst.add_argument("--boxes", default=None,
                      help="detections.jsonl from detector.py: the detector's boxes, not the annotation's")
     sst.add_argument("--det-threshold", type=float, default=None)
+    sst.add_argument("--live-detector", default=None, metavar="DIR",
+                     help="the detector's best/ folder: run it on every frame inside the clock, "
+                          "next to the server, and ask about what it finds (needs torch)")
     sst.set_defaults(func=cmd_stress)
 
     args = p.parse_args(argv)

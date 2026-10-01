@@ -18,6 +18,9 @@ MAX_MODEL_LEN=131072
 # LoRA adapters as name=path, space-separated; cowbench/run_tests.sh sets it.
 LORA_MODULES="${LORA_MODULES:-pose638=/workspace/lora-runs/lora2pose_w896/adapters/step-00638}"
 MAX_LORA_RANK="${MAX_LORA_RANK:-16}"
+# Share of the GPU's memory vLLM takes. cowbench/run_tests.sh lowers it to
+# leave ~4 GB for the cow detector, which runs on the same card.
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"
 
 # "auto" resolves the torch build from the driver. It is right only when uv is
 # recent enough: uv 0.9.0 did not know CUDA 13 and quietly installed
@@ -329,5 +332,5 @@ exec vllm serve "$MODEL" \
     --enable-lora --max-lora-rank "$MAX_LORA_RANK" --max-loras 2 \
     --lora-modules $LORA_MODULES \
     --max-model-len "$MAX_MODEL_LEN" \
-    --gpu-memory-utilization 0.95 \
+    --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --port "$PORT"

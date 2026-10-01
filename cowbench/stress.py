@@ -16,6 +16,11 @@ S seconds: then what matters is whether frames finish inside S, or pile up.
 Images are rendered and encoded before the clock starts, so what is timed is
 the server, not JPEG encoding on this machine. The first --warmup seconds
 are run but not counted: CUDA graphs and caches settle there.
+
+--live-detector <detector/best> runs the farm's whole chain inside the clock:
+each camera frame goes through RT-DETRv2 (in this process, on the GPU the
+server shares) and the boxes it finds are drawn and sent to the model. Only
+decoding the keyframes from disk happens beforehand.
 """
 
 from __future__ import annotations
@@ -27,6 +32,8 @@ import os
 import sys
 import threading
 import time
+
+from PIL import Image
 
 import cbvd
 import detect as detect_mod
@@ -50,7 +57,13 @@ def run(args, client_mod, jsonl_read):
     root = args.root or plan_meta["root"]
     frames = detect_mod.frames_of(manifest)
     boxes_from = "annotation"
-    if getattr(args, "boxes", None):
+    live = None
+    if getattr(args, "live_detector", None):
+        import detector as detector_mod
+        live = detector_mod.Live(args.live_detector, args.det_threshold)
+        boxes_from = (f"detector ({live.name}, threshold {live.threshold}), run live on every frame "
+                      f"on {live.device}, its time included below")
+    elif getattr(args, "boxes", None):
         # The detector's boxes stand in for the annotated cows: what a farm sends.
         dets, det_meta = frame_mod.load_detections(args.boxes)
         thr = args.det_threshold if args.det_threshold is not None else det_meta.get("threshold", 0.5)
@@ -80,7 +93,9 @@ def run(args, client_mod, jsonl_read):
     for vid in dict.fromkeys(streams):
         for ts, cows in sorted(by_clip[vid]):
             path = cbvd.frame_path(root, cbvd.Box(vid, ts, 0, 0, 0, 0, "1", ()))
-            if args.task == "detect":
+            if live is not None:
+                prepared[(vid, ts)] = Image.open(path).convert("RGB")   # boxes come later
+            elif args.task == "detect":
                 img = render_mod.render(path, None, mode="plain", max_width=args.max_width)
                 prepared[(vid, ts)] = [(render_mod.to_data_url(img, args.jpeg_quality), img.size)]
             elif args.task == "frame":
@@ -93,7 +108,7 @@ def run(args, client_mod, jsonl_read):
                                                               max_width=args.max_width),
                                             args.jpeg_quality), None)
                     for c in cows]
-    n_img = sum(len(v) for v in prepared.values())
+    n_img = sum(1 if live is not None else len(v) for v in prepared.values())
     print(f"  {n_img} images prepared in {time.perf_counter() - t:.0f} s")
 
     local = threading.local()
@@ -133,10 +148,28 @@ def run(args, client_mod, jsonl_read):
             return {"seconds": time.perf_counter() - t0, "usage": {}, "ok": False,
                     "error": f"{type(exc).__name__}: {exc}"}
 
+    def detect_and_render(img):
+        """Live chain, one frame: detector -> boxes drawn -> encoded requests."""
+        cows = frame_mod.order(live(img))
+        t_det = time.perf_counter()
+        if args.task == "frame":
+            items = [(render_mod.to_data_url(frame_mod.render(img, cows, args.max_width),
+                                             args.jpeg_quality), cows)] if cows else []
+        else:
+            items = [(render_mod.to_data_url(render_mod.render(img, c["bbox"], mode="marked",
+                                                               max_width=args.max_width),
+                                             args.jpeg_quality), None) for c in cows]
+        return items, t_det, len(cows)
+
+    if live is not None:
+        if args.task == "detect":
+            sys.exit("--live-detector is for --task frame or classify")
+        live(next(iter(prepared.values())))   # CUDA warm-up, outside the clock
     info = client().server_info()
     frames_log = []
     lock = threading.Lock()
-    width = max(len(v) for v in prepared.values())
+    width = (max(len(c) for cs in by_clip.values() for _, c in cs) + 8 if live is not None
+             else max(len(v) for v in prepared.values()))
     start = time.perf_counter()
     count_from = start + args.warmup
     deadline = count_from + args.duration
@@ -154,7 +187,13 @@ def run(args, client_mod, jsonl_read):
                     time.sleep(wait)
                 t0 = time.perf_counter()
                 ts = keys[i % len(keys)]
-                answers = list(pool.map(ask, prepared[(vid, ts)]))
+                extra = {}
+                if live is not None:
+                    items, t_det, n_cows = detect_and_render(prepared[(vid, ts)])
+                    extra = {"detect_seconds": round(t_det - t0, 4), "cows_found": n_cows}
+                else:
+                    items = prepared[(vid, ts)]
+                answers = list(pool.map(ask, items))
                 t1 = time.perf_counter()
                 with lock:
                     frames_log.append({
@@ -167,6 +206,7 @@ def run(args, client_mod, jsonl_read):
                         "completion_tokens": sum(a["usage"].get("completion_tokens", 0)
                                                  for a in answers),
                         "errors": [a["error"] for a in answers if "error" in a][:3],
+                        **extra,
                     })
                 i += 1
 
@@ -216,6 +256,13 @@ def run(args, client_mod, jsonl_read):
         "prompt_tokens_per_s": sum(f["prompt_tokens"] for f in counted) / window,
         "completion_tokens_per_s": sum(f["completion_tokens"] for f in counted) / window,
     }
+    if live is not None:
+        det = [f["detect_seconds"] for f in counted]
+        summary["live_detector"] = {
+            "model": live.name, "threshold": live.threshold, "device": live.device,
+            "detect_ms": {q: (_pct(det, int(q[1:])) or 0) * 1000 for q in ("p50", "p90", "p99")},
+            "cows_per_frame": sum(f["cows_found"] for f in counted) / len(counted) if counted else None,
+        }
     if args.interval:
         late = [f["late_by"] for f in counted]
         summary["paced"] = {
@@ -226,7 +273,8 @@ def run(args, client_mod, jsonl_read):
             "keeps_up": bool(counted) and max(late) <= 0.5 * args.interval,
         }
 
-    tag = f"stress_{args.task}_{args.streams}x" + (f"_{args.interval:g}s" if args.interval else "_max")
+    tag = (f"stress_{args.task}_{args.streams}x" + (f"_{args.interval:g}s" if args.interval else "_max")
+           + ("_live" if live is not None else ""))
     with open(os.path.join(args.out, tag + "_frames.jsonl"), "w", encoding="utf-8") as fh:
         for f in frames_log:
             fh.write(json.dumps(f, ensure_ascii=False) + "\n")
@@ -270,6 +318,12 @@ def render_report(s) -> str:
         f"| Tokens per second, prompt / generated | {f(s['prompt_tokens_per_s'], 0)} / "
         f"{f(s['completion_tokens_per_s'], 0)} |",
     ]
+    if s.get("live_detector"):
+        d = s["live_detector"]
+        lines.append(f"| Detector per frame p50 / p90 / p99, ms (part of the frame latency) | "
+                     f"{f(d['detect_ms']['p50'], 0)} / {f(d['detect_ms']['p90'], 0)} / "
+                     f"{f(d['detect_ms']['p99'], 0)} on {d['device']}; "
+                     f"{f(d['cows_per_frame'])} cows found a frame |")
     if s.get("paced"):
         p = s["paced"]
         lines += [

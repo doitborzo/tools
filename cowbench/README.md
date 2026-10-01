@@ -249,3 +249,11 @@ evaluates the adapter on its boxes in `eval-lora-det/`. `run_tests.sh` runs
 the detector itself from `$WORK/lora-runs/detector/best` (in its own venv,
 `$WORK/det/.venv`, before vLLM takes the GPU) and uses its boxes for the bench
 and the stress tests; without the weights it takes ready boxes from `BOXES`.
+
+Detector and model share the GPU: `run_tests.sh` starts vLLM with
+`GPU_MEM_UTIL` set to leave `DET_RESERVE_MIB=4096` free (0.94 of an 80 GB
+card; `lora_muse.sh` reads `GPU_MEM_UTIL`, default 0.95), and the camera
+test runs `stress --live-detector <detector/best>`: every frame of every
+camera goes through RT-DETRv2 in the stress process, on that free memory,
+and the model is asked about what it found - the farm's chain, timed as a
+whole. The report gives the detector's own ms a frame beside the totals.

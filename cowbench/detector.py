@@ -228,6 +228,32 @@ def cmd_train(args):
     print(f"[det] done in {(time.time() - t0) / 60:.0f} min, best held-out F1 {best_f1:.3f} -> {best_dir}")
 
 
+# --------------------------------------------------------------------- live
+
+class Live:
+    """The trained detector, in process, one image per call: what stress.py
+    runs on every camera frame next to the vLLM server. Calls from many
+    camera threads take turns on the one model; a frame is ~10-30 ms on a GPU."""
+
+    def __init__(self, best_dir, threshold=None):
+        import threading
+        from transformers import RTDetrV2ForObjectDetection
+        with open(os.path.join(best_dir, "det_train_meta.json"), encoding="utf-8") as fh:
+            meta = json.load(fh)
+        self.processor = processor_for(best_dir, meta["size"])
+        self.model = RTDetrV2ForObjectDetection.from_pretrained(best_dir).to(device()).eval()
+        self.threshold = meta["threshold"] if threshold is None else threshold
+        self.name = meta["base_model"]
+        self.device = str(device())
+        self._lock = threading.Lock()
+
+    def __call__(self, img):
+        """PIL image -> [{"bbox": [x1, y1, x2, y2] (0-1), "det_score"}], above the threshold."""
+        with self._lock:
+            boxes = predict(self.model, self.processor, [img])[0]
+        return [{"bbox": b[:4], "det_score": b[4]} for b in boxes if b[4] >= self.threshold]
+
+
 # ------------------------------------------------------------------- detect
 
 def cmd_detect(args):
