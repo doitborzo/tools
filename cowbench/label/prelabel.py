@@ -265,10 +265,16 @@ def kept_tracks(export, boundary):
     return out
 
 
-def cvat_xml(frames, size, kept=()):
-    """CVAT for video 1.1: one <track> per cow with a keyframe box at every
-    keyframe it was seen on, and outside="1" at the first keyframe it was not
-    (CVAT interpolates the frames between)."""
+def cvat_xml(frames, size, kept=(), still_iou=0.8):
+    """CVAT for video 1.1: one <track> per cow, outside="1" at the first
+    keyframe it was not seen on, CVAT interpolating between.
+
+    A CVAT keyframe holds its own posture and activity, so a keyframe every
+    second would make a person set them every second. A box becomes a CVAT
+    keyframe only where the cow moved (IoU < still_iou with the last one
+    kept), its labels changed, or it is first or last of a run: a cow lying
+    still for a minute is two keyframes."""
+    import detect as detect_mod
     w, h = size
 
     def box(fr, b, outside):
@@ -290,13 +296,21 @@ def cvat_xml(frames, size, kept=()):
         lines.append(f'  <track id="{k}" label="{label}" source="manual">')
         lines += boxes
         lines.append("  </track>")
+    labels = lambda b: (b.get("posture"), b.get("activity"))
     for k, (_tid, seq) in enumerate(sorted(by_track.items()), len(kept)):
         lines.append(f'  <track id="{k}" label="cow" source="auto">')
+        last = None
         for i, (fr, b) in enumerate(seq):
-            lines += box(fr, b, 0)
             gone = nxt.get(fr)
-            if gone is not None and (i + 1 == len(seq) or seq[i + 1][0] != gone):
-                lines += box(gone, b, 1)
+            run_ends = i + 1 == len(seq) or seq[i + 1][0] != gone
+            if (last is None or run_ends or labels(b) != labels(last)
+                    or detect_mod.iou(b["bbox"], last["bbox"]) < still_iou):
+                lines += box(fr, b, 0)
+                last = b
+            if run_ends:
+                if gone is not None:
+                    lines += box(gone, b, 1)
+                last = None
         lines.append("  </track>")
     lines.append("</annotations>")
     return "\n".join(lines) + "\n"
@@ -319,6 +333,8 @@ def main(argv=None):
     p.add_argument("--queries", nargs="+", default=OWL_QUERIES, help="owlv2 text queries")
     p.add_argument("--track-iou", type=float, default=0.3)
     p.add_argument("--track-gap", type=int, default=2, help="keyframes a track waits for its cow")
+    p.add_argument("--still-iou", type=float, default=0.8,
+                   help="a box overlapping the track's last CVAT keyframe this much adds none")
     p.add_argument("--base-url", default=None, help="vLLM server: ask Muse for posture/activity")
     p.add_argument("--model", default="muse-glimmer")
     p.add_argument("--api-key", default="EMPTY")
@@ -387,7 +403,7 @@ def main(argv=None):
             kept = kept_tracks(args.keep, boundary)
             print(f"  kept {len(kept)} tracks of {args.keep} before frame {boundary} "
                   f"({args.keep_until:g} s)")
-        fh.write(cvat_xml(frames, size, kept))
+        fh.write(cvat_xml(frames, size, kept, args.still_iou))
     n_boxes = sum(len(f["boxes"]) for f in frames)
     print(f"{len(frames)} keyframes ({size[0]}x{size[1]}, every {step} frames of {fps:.2f} fps), "
           f"{n_boxes} boxes, {n_tracks} tracks -> {args.out}")
