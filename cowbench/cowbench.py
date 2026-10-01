@@ -214,8 +214,29 @@ def cmd_run(args):
     }
     if args.unit == "frame":
         meta["render_mode"] = "numbered (all cows of the frame)"
+    dets = None
+    if args.boxes:
+        dets, det_meta = frame_mod.load_detections(args.boxes)
+        if args.det_threshold is None:
+            args.det_threshold = det_meta.get("threshold", 0.5)
+        meta["boxes"] = {"source": "detector", "detections": os.path.abspath(args.boxes),
+                         "threshold": args.det_threshold, "detector": det_meta.get("base_model"),
+                         "detector_ms_per_frame": det_meta.get("ms_per_frame"), "match_iou": 0.5}
+    else:
+        meta["boxes"] = {"source": "annotation"}
+    # Resuming adds to the answers already there: they must be about the same boxes.
+    old_meta = os.path.join(args.out, "run_meta.json")
+    if done and os.path.exists(old_meta):
+        with open(old_meta, encoding="utf-8") as fh:
+            old = json.load(fh).get("boxes", {"source": "annotation"})
+        if (old.get("source"), old.get("detections")) != (meta["boxes"]["source"], meta["boxes"].get("detections")):
+            sys.exit(f"{args.out} already holds {len(done)} answers about boxes from the "
+                     f"{old.get('source')} ({old.get('detections', 'annotation')}); "
+                     f"use another --out for boxes from the {meta['boxes']['source']}")
     with open(os.path.join(args.out, "run_meta.json"), "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2, ensure_ascii=False)
+    if dets is not None:
+        return _run_detected(args, cli, root, manifest, done, results_path, dets)
     if args.unit == "frame":
         return _run_frames(args, cli, root, manifest, done, results_path)
 
@@ -288,8 +309,11 @@ def cmd_score(args):
         metrics["posture"]["error_rate"], metrics["baseline"]["posture"]["error_rate"]))
     print("activity error    : {:.1%}   (baseline {:.1%})".format(
         metrics["activity"]["error_rate"], metrics["baseline"]["activity"]["error_rate"]))
-    if metrics["n_failed"]:
-        print("failed requests   : {}".format(metrics["n_failed"]))
+    missed = sum(bool(r.get("missed_by_detector")) for r in results)
+    if missed:
+        print("missed by detector: {}   (counted as errors)".format(missed))
+    if metrics["n_failed"] - missed:
+        print("failed requests   : {}".format(metrics["n_failed"] - missed))
     print("-> {}".format(path))
 
 
@@ -388,6 +412,72 @@ def _run_frames(args, cli, root, manifest, done, results_path):
             list(pool.map(work, frames))
     finally:
         out_fh.close()
+        print()
+    print("-> {}".format(results_path))
+
+
+def _run_detected(args, cli, root, manifest, done, results_path, dets):
+    """--boxes: the model is asked about the detector's boxes, per frame
+    (--unit frame) or per box; its answers are matched to the annotated cows
+    by overlap. One record per annotated cow - a cow the detector missed is
+    an error - and the answers about detections that matched no annotated cow
+    go to detections_answered.jsonl."""
+    frames = [f for f in frame_mod.group(manifest) if any(c["id"] not in done for c in f["cows"])]
+    lock = threading.Lock()
+    counter = {"n": 0, "missed": 0, "extra": 0}
+    out_fh = open(results_path, "a", encoding="utf-8")
+    extra_fh = open(os.path.join(args.out, "detections_answered.jsonl"), "a", encoding="utf-8")
+
+    def ask_cow(c, path):
+        img = render_mod.render(path, c["bbox"], mode="marked", max_width=args.max_width)
+        out = cli.classify([render_mod.to_data_url(img, quality=args.jpeg_quality)])
+        return dict(c, posture=out.get("posture"), activity=out.get("activity"), raw=out.get("raw"),
+                    **({"parse_error": out["parse_error"]} if "parse_error" in out else {}))
+
+    def work(f):
+        det = dets.get((f["video_id"], f["timestamp"]), {"boxes": []})
+        cows = frame_mod.detected_cows(dict(det, video_id=f["video_id"], timestamp=f["timestamp"]),
+                                       args.det_threshold)
+        answered = []
+        try:
+            path = cbvd.frame_path(root, cbvd.Box(f["video_id"], f["timestamp"], 0, 0, 0, 0, "1", ()))
+            if cows and args.unit == "frame":
+                img = frame_mod.render(path, cows, args.max_width)
+                url = render_mod.to_data_url(img, quality=args.jpeg_quality)
+                if args.answer_now:
+                    out = cli.complete([url], frame_mod.prompt(cows), prefill=frame_mod.ANSWER_PREFILL,
+                                       max_tokens=24 * len(cows) + 64)
+                else:
+                    out = cli.complete([url], frame_mod.prompt(cows), schema=frame_mod.SCHEMA,
+                                       name="cows_in_frame")
+                answered = frame_mod.records(cows, out["raw"])
+            elif cows:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                    answered = list(pool.map(lambda c: ask_cow(c, path), cows))
+            recs, extras = frame_mod.to_gt(f["cows"], answered)
+        except Exception as exc:
+            recs = [dict(c, error="{}: {}".format(type(exc).__name__, exc)) for c in f["cows"]]
+            extras = []
+        with lock:
+            for rec in recs:
+                if rec["id"] not in done:
+                    out_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            for e in extras:
+                extra_fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+            out_fh.flush()
+            extra_fh.flush()
+            counter["n"] += 1
+            counter["missed"] += sum(bool(r.get("missed_by_detector")) for r in recs)
+            counter["extra"] += len(extras)
+            print("\r  {}/{} frames  ({} annotated cows missed by the detector, {} extra boxes)".format(
+                counter["n"], len(frames), counter["missed"], counter["extra"]), end="", flush=True)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+            list(pool.map(work, frames))
+    finally:
+        out_fh.close()
+        extra_fh.close()
         print()
     print("-> {}".format(results_path))
 
@@ -499,6 +589,11 @@ def main(argv=None):
     sr.add_argument("--timeout", type=float, default=300.0)
     sr.add_argument("--retries", type=int, default=3)
     sr.add_argument("--fresh", action="store_true", help="discard previous results")
+    sr.add_argument("--boxes", default=None,
+                    help="detections.jsonl from detector.py: ask about the detector's boxes, not "
+                         "the annotation's; the annotation only scores (missed cows count as errors)")
+    sr.add_argument("--det-threshold", type=float, default=None,
+                    help="detector score threshold (default: the one in det_meta.json)")
     sr.add_argument("--unit", choices=("cow", "frame"), default="cow",
                     help="cow: one question per cow; frame: one per keyframe, every cow on it "
                          "numbered (frame.py) - results are still one record per cow")
@@ -554,6 +649,9 @@ def main(argv=None):
                      help="seconds between frames per camera; 0 = as fast as possible")
     sst.add_argument("--answer-now", action="store_true",
                      help="classify as a LoRA from lora/train_lora.py was trained (see run)")
+    sst.add_argument("--boxes", default=None,
+                     help="detections.jsonl from detector.py: the detector's boxes, not the annotation's")
+    sst.add_argument("--det-threshold", type=float, default=None)
     sst.set_defaults(func=cmd_stress)
 
     args = p.parse_args(argv)

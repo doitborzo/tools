@@ -162,3 +162,58 @@ def records(cows, text, extra=None):
             rec["parse_error"] = f"cow {i} of {len(cows)} missing from the frame answer"
         out.append(rec)
     return out
+
+
+# ------------------------------------------------------ boxes from a detector
+# Tests take their boxes from the detector (detector.py, RT-DETRv2), never from
+# the annotation: the model answers about what the detector found, and the
+# annotation is used only to score. An annotated cow the detector missed is an
+# error; a detection that is no annotated cow is counted on its own.
+
+def detected_cows(det, threshold):
+    """A detections.jsonl row -> pseudo-cows to ask about, in reading order."""
+    cows = [{"id": "{}_{:05d}_det{}".format(det["video_id"], det["timestamp"], k),
+             "video_id": det["video_id"], "timestamp": det["timestamp"],
+             "bbox": b[:4], "det_score": b[4], "gt_posture": None, "gt_activity": None}
+            for k, b in enumerate(det["boxes"]) if b[4] >= threshold]
+    return order(cows)
+
+
+def to_gt(gt_cows, answered, iou=0.5):
+    """Answers about detected boxes -> one record per annotated cow, matched by
+    box overlap (greedy, highest IoU first). Returns (records, extras): extras
+    are the answered detections that matched no annotated cow."""
+    import detect as detect_mod   # here, not at the top: detect imports nothing of ours
+    pairs = detect_mod.match([a["bbox"] for a in answered], [g["bbox"] for g in gt_cows], iou)
+    by_gt = {j: (i, v) for i, j, v in pairs}
+    records = []
+    for j, g in enumerate(gt_cows):
+        if j in by_gt:
+            i, v = by_gt[j]
+            a = answered[i]
+            rec = dict(g, posture=a.get("posture"), activity=a.get("activity"),
+                       det_bbox=a["bbox"], det_score=a.get("det_score"), det_iou=round(v, 3))
+            for k in ("parse_error", "error", "frame_answer", "raw"):
+                if k in a:
+                    rec[k] = a[k]
+        else:
+            rec = dict(g, posture=None, activity=None, missed_by_detector=True,
+                       parse_error="not found by the detector")
+        records.append(rec)
+    used = {i for i, _, _ in pairs}
+    extras = [a for i, a in enumerate(answered) if i not in used]
+    return records, extras
+
+
+def load_detections(path):
+    """detections.jsonl -> ({(video_id, timestamp): row}, meta of the detector run)."""
+    import os
+    dets = {}
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                r = json.loads(line)
+                dets[(r["video_id"], r["timestamp"])] = r
+    meta_path = os.path.join(os.path.dirname(os.path.abspath(path)), "det_meta.json")
+    meta = json.load(open(meta_path, encoding="utf-8")) if os.path.exists(meta_path) else {}
+    return dets, meta

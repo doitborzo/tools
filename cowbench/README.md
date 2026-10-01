@@ -207,10 +207,10 @@ The per-cow question sends the whole frame once per cow; on one A100 that
 held 12 cameras to an update every ~77 s. `frame.py` asks once per keyframe:
 every cow outlined in lime and numbered (reading order), the same boxes listed
 in the text on the 0-1000 scale, and one answer
-`{"cows": [{"id": 1, "posture": ..., "activity": ...}, ...]}`. On a farm the
-boxes come from a detector (RT-DETRv2); here from the annotation. Results are
-still written one record per cow, so `score`, `report`, `compare` and `--vote`
-work unchanged.
+`{"cows": [{"id": 1, "posture": ..., "activity": ...}, ...]}`. Without
+`--boxes` the boxes are the annotation's; the tests take them from the
+detector (below). Results are still written one record per cow, so `score`,
+`report`, `compare` and `--vote` work unchanged.
 
     python cowbench.py --out out-val run --unit frame                      # base model, reasoning, json_schema
     python cowbench.py --out out-val run --unit frame --model <lora> --answer-now --max-width 1920
@@ -220,3 +220,31 @@ Training an adapter for it: `UNIT=frame` is `lora/run_lora.sh`'s default -
 one example per keyframe at 1920 px, all six keyframes of a clip, activity
 trained except rumination (`TRAIN_FIELDS=skip-ruminating`). `run_tests.sh`
 reads the unit and width from the adapter's `train_meta.json`.
+
+## Boxes from a detector (`detector.py`, `--boxes`)
+
+The tests never ask about the annotation's boxes. `detector.py` fine-tunes
+RT-DETRv2 (`PekingU/rtdetr_v2_r50vd`, Apache-2.0; r18/r34/r101 also work) on
+the boxes of CBVD-5 train - val clips excluded, 10% of train clips held out
+to pick the epoch and the score threshold (best F1) - and runs it on every val
+keyframe:
+
+    python detector.py train  --root /workspace/cbvd5 --out /workspace/lora-runs/detector
+    python detector.py detect --root /workspace/cbvd5 --out /workspace/lora-runs/detector
+    python detector.py score  --out /workspace/lora-runs/detector      # det_report.md
+
+`val_detections.jsonl` keeps every box down to score 0.05; the threshold is in
+`det_meta.json` beside it and is applied when the file is read
+(`--det-threshold` overrides it). `run`, `stress` and `lora/train_lora.py
+eval` take `--boxes <val_detections.jsonl>`: the model is asked about the
+detector's boxes, each answer is matched back to an annotated cow (IoU >= 0.5,
+greedy), and an annotated cow the detector missed is an error
+(`missed_by_detector`, its own line in `score` and the report). Detections
+that match no annotated cow are answered too and kept in
+`detections_answered.jsonl`. `--vote` does not fill in missed cows from
+their track.
+
+`lora/run_lora.sh` trains the detector after the adapter (`DETECTOR=1`) and
+evaluates the adapter on its boxes in `eval-lora-det/`; `run_tests.sh` uses
+`BOXES=$WORK/lora-runs/detector/val_detections.jsonl` for the bench and the
+stress tests.

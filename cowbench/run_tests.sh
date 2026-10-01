@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Everything after training, on a fresh pod, in one go:
 #
-#   dataset -> adapter check -> vLLM with the adapter -> bench with the adapter
-#   -> finding the cows without boxes -> 12 cameras at once -> one tar.gz
+#   dataset -> adapter + detections -> vLLM with the adapter -> bench with the adapter
+#   -> 12 cameras at once -> one tar.gz
 #
-# Usage (the repo checked out, the adapter uploaded - see ADAPTER below):
+# The cows are those RT-DETRv2 found (lora-runs/detector, made by run_lora.sh),
+# never the annotation's boxes: the model answers about what the detector
+# found, the annotation only scores, and a cow the detector missed is an error.
+#
+# Usage (the repo checked out, the adapter and the detections uploaded - see
+# ADAPTER and BOXES below):
 #   bash cowbench/run_tests.sh           start in a background tmux session "cowtests"
 #   bash cowbench/run_tests.sh log       follow the log (Ctrl-c stops watching only)
 #   bash cowbench/run_tests.sh attach    watch it live (detach: Ctrl-b, then d)
@@ -16,8 +21,13 @@
 #
 # Knobs, all optional:
 #   WORK=/workspace                 where the dataset, adapter and results live
-#   ADAPTER=$WORK/lora-runs/lora2pose_w896/adapters/step-00638
-#   LORA_NAME=pose638               the adapter's model name on the server
+#   ADAPTER=$WORK/lora-runs/lora4frame_w1920/adapter
+#   LORA_NAME=lora4frame            the adapter's model name on the server
+#   BOXES=$WORK/lora-runs/detector/val_detections.jsonl   the detector's boxes, with
+#                                   det_meta.json (threshold) and det_report.md beside it
+#   DET_THRESHOLD                   override the detector's score threshold
+#   MUSE_DETECT=0                   1: also let the base model find the cows by itself
+#                                   (the earlier test: 53% found) and stress that
 #   WIDTH, UNIT                     how the adapter is asked: by default as it was trained,
 #                                   read from the train_meta.json next to the adapter
 #                                   (else 896, cow). UNIT=frame: one question per keyframe
@@ -25,7 +35,7 @@
 #   STREAMS=12                      cameras in the stress tests
 #   INTERVAL=10                     seconds between frames per camera, paced test
 #   DURATION=300                    seconds measured per stress test
-#   OUT=<repo>/cowbench/runs/tests_<LORA_NAME>   results
+#   OUT=<repo>/cowbench/runs/tests_<LORA_NAME>_w<WIDTH>_det   results
 #   PORT=8000
 
 set -euo pipefail
@@ -34,15 +44,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "$HERE")"
 WORK="${WORK:-/workspace}"
 ROOT="$WORK/cbvd5"
-ADAPTER="${ADAPTER:-$WORK/lora-runs/lora2pose_w896/adapters/step-00638}"
-LORA_NAME="${LORA_NAME:-pose638}"
+ADAPTER="${ADAPTER:-$WORK/lora-runs/lora4frame_w1920/adapter}"
+LORA_NAME="${LORA_NAME:-lora4frame}"
+BOXES="${BOXES:-$WORK/lora-runs/detector/val_detections.jsonl}"
+DET_THRESHOLD="${DET_THRESHOLD:-}"
+MUSE_DETECT="${MUSE_DETECT:-0}"
 # The width and unit the adapter was trained at, from its run's train_meta.json
 # (adapter/ or adapters/step-N sit one or two levels below it).
 trained() {
     local meta
     for meta in "$(dirname "$ADAPTER")/train_meta.json" "$(dirname "$(dirname "$ADAPTER")")/train_meta.json"; do
         if [ -f "$meta" ]; then
-            sed -n "s/.*\"$1\": *\"\{0,1\}\([a-z0-9]*\)\"\{0,1\},*$/\1/p" "$meta" | head -1
+            grep -o "\"$1\": *\"\{0,1\}[a-z0-9]*" "$meta" | head -1 | sed 's/.*[" ]//' || true
             return
         fi
     done
@@ -53,7 +66,7 @@ STREAMS="${STREAMS:-12}"
 INTERVAL="${INTERVAL:-10}"
 DURATION="${DURATION:-300}"
 PORT="${PORT:-8000}"
-OUT="${OUT:-$HERE/runs/tests_${LORA_NAME}_w${WIDTH}}"
+OUT="${OUT:-$HERE/runs/tests_${LORA_NAME}_w${WIDTH}_det}"
 BASE_URL="http://127.0.0.1:$PORT"
 PLAN="$HERE/runs/2026-09-25_val-full_w1920_f1"   # the full-val sample every run used
 SESSION=cowtests
@@ -76,7 +89,7 @@ if [ -z "${COWTESTS_IN_TMUX:-}" ]; then
         echo "already running in tmux session '$SESSION':  bash $0 log"; exit 1
     fi
     knobs=""
-    for v in WORK ADAPTER LORA_NAME WIDTH UNIT STREAMS INTERVAL DURATION PORT OUT; do
+    for v in WORK ADAPTER LORA_NAME BOXES DET_THRESHOLD MUSE_DETECT WIDTH UNIT STREAMS INTERVAL DURATION PORT OUT; do
         knobs+="$v=$(printf '%q' "${!v}") "
     done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
@@ -95,7 +108,7 @@ trap 'rc=$?; echo "!! line $LINENO failed (exit $rc): $BASH_COMMAND"' ERR
 trap 'rc=$?; echo "#### $(date +%H:%M:%S)  run_tests.sh exited with code $rc"' EXIT
 step() { echo; echo "=== $*   [$(date '+%Y-%m-%d %H:%M:%S')]"; }
 
-step "1/7  Dataset"
+step "1/6  Dataset"
 if [ -f "$ROOT/annotations/ava_val_v2.1.csv" ] && [ -d "$ROOT/labelframes/labelframes" ]; then
     echo "found: $ROOT"
 else
@@ -110,15 +123,29 @@ else
 fi
 echo "keyframes: $(find "$ROOT/labelframes" -name '*.jpg' | wc -l)"
 
-step "2/7  Adapter"
+step "2/6  Adapter and the detector's boxes"
 if [ ! -f "$ADAPTER/adapter_config.json" ] || [ ! -f "$ADAPTER/adapter_model.safetensors" ]; then
     echo "!! no adapter in $ADAPTER (adapter_config.json + adapter_model.safetensors)."
-    echo "!! From a PC:  scp -P <port> -r <folder step-00638> root@<ip>:$(dirname "$ADAPTER")/"
+    echo "!! From a PC:  scp -P <port> -r <adapter folder> root@<ip>:$(dirname "$ADAPTER")/"
     exit 1
 fi
 ls -la "$ADAPTER"
+DET_DIR="$(dirname "$BOXES")"
+if [ ! -s "$BOXES" ] || [ ! -f "$DET_DIR/det_meta.json" ]; then
+    echo "!! no detections in $BOXES (+ det_meta.json beside it)."
+    echo "!! They come from run_lora.sh (step 9, RT-DETRv2), in lora-runs/detector on the"
+    echo "!! training pod. Only the small files are needed, not the weights:"
+    echo "!!   scp -P <port> detector/val_detections.jsonl detector/det_meta.json detector/det_report.md \\"
+    echo "!!       root@<ip>:$DET_DIR/"
+    exit 1
+fi
+mkdir -p "$OUT"
+cp "$DET_DIR/det_meta.json" "$OUT/"
+[ -f "$DET_DIR/det_report.md" ] && cp "$DET_DIR/det_report.md" "$OUT/" && cat "$DET_DIR/det_report.md"
+BOX_ARGS=(--boxes "$BOXES")
+[ -n "$DET_THRESHOLD" ] && BOX_ARGS+=(--det-threshold "$DET_THRESHOLD")
 
-step "3/7  vLLM with the adapter"
+step "3/6  vLLM with the adapter"
 server_has_adapter() { curl -sf "$BASE_URL/v1/models" 2>/dev/null | grep -q "\"$LORA_NAME\""; }
 if server_has_adapter; then
     echo "already serving $LORA_NAME on $BASE_URL"
@@ -149,7 +176,7 @@ else
 fi
 curl -s "$BASE_URL/v1/models" | grep -o '"id": *"[^"]*"' | sed 's/"id": */  model: /'
 
-step "4/7  Python for the bench"
+step "4/6  Python for the bench"
 PY=""
 for cand in "$WORK/serving/.venv/bin/python" python3; do
     if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "import requests, PIL" 2>/dev/null; then
@@ -165,22 +192,25 @@ cd "$HERE"
 bench() { "$PY" cowbench.py --out "$OUT" "$@"; }
 [ -f "$OUT/manifest.jsonl" ] || cp "$PLAN/manifest.jsonl" "$PLAN/plan_meta.json" "$OUT/"
 
-step "5/7  Bench with the adapter: the known answer, as a check of the server"
-# pose638 (lora2pose_w896, step 638) gave 23.3% exact-match error through vLLM
-# at 896 px; for another adapter, compare with its own eval-lora/. Far from it,
-# something in this setup differs and the tests below mean less.
-echo "asking $LORA_NAME per $UNIT at $WIDTH px"
+step "5/6  Bench with the adapter on the detector's boxes"
+# The same question run_lora.sh asked in eval-lora-det/ (transformers there,
+# vLLM here): the two should be close. Far apart, something in this setup
+# differs and the stress numbers below mean less.
+echo "asking $LORA_NAME per $UNIT at $WIDTH px about the cows in $BOXES"
 bench run --root "$ROOT" --base-url "$BASE_URL" --model "$LORA_NAME" --answer-now \
-    --max-width "$WIDTH" --unit "$UNIT" --concurrency "$( [ "$UNIT" = frame ] && echo 8 || echo 16 )"
+    --max-width "$WIDTH" --unit "$UNIT" --concurrency "$( [ "$UNIT" = frame ] && echo 8 || echo 16 )" \
+    "${BOX_ARGS[@]}"
 bench score
 bench score --vote
 bench report
 
-step "6/7  Finding the cows without boxes (base model, with reasoning)"
-bench detect --root "$ROOT" --base-url "$BASE_URL" --model muse-glimmer --concurrency 8
-bench detect-score
+if [ "$MUSE_DETECT" = "1" ]; then
+    step "5b  The base model finding the cows by itself (with reasoning)"
+    bench detect --root "$ROOT" --base-url "$BASE_URL" --model muse-glimmer --concurrency 8
+    bench detect-score
+fi
 
-step "7/7  $STREAMS cameras at once"
+step "6/6  $STREAMS cameras at once, on the detector's boxes"
 stress() {   # skip a test whose report is already there
     local tag="$1"; shift
     if [ -f "$OUT/$tag.md" ]; then echo "done before: $OUT/$tag.md"; return; fi
@@ -188,16 +218,19 @@ stress() {   # skip a test whose report is already there
         --duration "$DURATION" "$@"
 }
 task=classify; [ "$UNIT" = frame ] && task=frame
-stress "stress_${task}_${STREAMS}x_max" --task "$task" --model "$LORA_NAME" --answer-now --max-width "$WIDTH"
+stress "stress_${task}_${STREAMS}x_max" --task "$task" --model "$LORA_NAME" --answer-now --max-width "$WIDTH" \
+    "${BOX_ARGS[@]}"
 stress "stress_${task}_${STREAMS}x_${INTERVAL}s" --task "$task" --model "$LORA_NAME" --answer-now --max-width "$WIDTH" \
-    --interval "$INTERVAL"
-stress "stress_detect_${STREAMS}x_max" --task detect --model muse-glimmer
+    --interval "$INTERVAL" "${BOX_ARGS[@]}"
+[ "$MUSE_DETECT" = "1" ] && stress "stress_detect_${STREAMS}x_max" --task detect --model muse-glimmer
 
 tarball="$WORK/cow_tests_$(basename "$OUT").tgz"
 tar czf "$tarball" -C "$(dirname "$OUT")" "$(basename "$OUT")"
 echo
 echo "Done. Reports in $OUT:"
-echo "  report.md                         bench with $LORA_NAME per $UNIT at $WIDTH px"
-echo "  detect_report.md                  finding the cows without boxes"
+echo "  det_report.md                     how many cows RT-DETRv2 found"
+echo "  report.md                         bench with $LORA_NAME per $UNIT at $WIDTH px on its boxes;"
+echo "                                    missed cows count as errors, extras in detections_answered.jsonl"
+[ "$MUSE_DETECT" = "1" ] && echo "  detect_report.md                  the base model finding the cows by itself"
 echo "  stress_*.md                       $STREAMS cameras at once"
 echo "Everything in one file: $tarball"

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # LoRA fine-tuning of Muse Glimmer on CBVD-5, end to end, on one A100.
 #
-#   environment -> dataset -> model -> base-model control -> train -> eval -> compare
+#   environment -> dataset -> model -> base-model control -> train -> cow detector
+#   -> eval (annotated boxes, then the detector's) -> compare
 #
 # Every step is skipped when its output already exists, and training resumes
 # from its last checkpoint, so after a crash or a pod restart just run it again.
@@ -63,6 +64,12 @@
 #                          plus _n<TRAIN_LIMIT> - stable, so a rerun resumes it
 #   LOCAL_DATA=~/cbvd5-local  local-disk copy of the keyframes read during training
 #                          and eval, when $WORK is on another (network) volume; "off" to skip
+#   DETECTOR=1             train RT-DETRv2 (../detector.py) on the train boxes, run it on
+#                          val and evaluate the adapter on ITS boxes too (eval-lora-det/):
+#                          the test a farm sees, where a cow the detector misses is an
+#                          error. Shared by runs, in lora-runs/detector. 0 to skip
+#   DET_MODEL=PekingU/rtdetr_v2_r50vd  r18vd / r34vd / r50vd / r101vd, all Apache-2.0
+#   DET_SIZE=960 DET_EPOCHS=24 DET_BATCH=8   detector input side, epochs, batch
 #   TRIES=6                attempts at the whole run before giving up. Every step
 #                          resumes, so a failed run is restarted after 1, 2, 4, 8,
 #                          15 min; a run that got 20+ min in starts the count over
@@ -96,6 +103,11 @@ FRAMES_PER_CLIP="${FRAMES_PER_CLIP:-$(pick 0 3)}"
 EVAL_BASE="${EVAL_BASE:-1}"
 LOCAL_DATA="${LOCAL_DATA:-$HOME/cbvd5-local}"
 TRIES="${TRIES:-6}"
+DETECTOR="${DETECTOR:-1}"
+DET_MODEL="${DET_MODEL:-PekingU/rtdetr_v2_r50vd}"
+DET_SIZE="${DET_SIZE:-960}"
+DET_EPOCHS="${DET_EPOCHS:-24}"
+DET_BATCH="${DET_BATCH:-8}"
 PRECISION="${PRECISION:-auto}"
 # No date in the default name: a run restarted after midnight must find its
 # own checkpoints, not start a fresh directory. "lora2": held-out dev clips
@@ -127,6 +139,7 @@ VENV="$WORK/lora/.venv"
 DATA="$WORK/cbvd5"
 OUT="$WORK/lora-runs/$RUN_NAME"
 RUNS="$WORK/lora-runs"
+DET_OUT="$RUNS/detector"
 SESSION=lora
 LOG="$OUT/log.txt"
 STAGE_FILE="$RUNS/current.stage"
@@ -222,7 +235,7 @@ if [ -z "${LORA_IN_TMUX:-}" ]; then
         exit 1
     fi
     knobs=""
-    for v in WORK WIDTH EPOCHS TRAIN_LIMIT BATCH ACCUM LR RANK EVAL_BASE PRECISION RUN_NAME KEEP_ZIP HF_TOKEN CUDA_WANT TORCH_BACKEND LOCAL_DATA TRIES HOLDOUT DEV_EVERY FRAMES_PER_CLIP TRAIN_FIELDS EVAL_BATCH UNIT; do
+    for v in WORK WIDTH EPOCHS TRAIN_LIMIT BATCH ACCUM LR RANK EVAL_BASE PRECISION RUN_NAME KEEP_ZIP HF_TOKEN CUDA_WANT TORCH_BACKEND LOCAL_DATA TRIES HOLDOUT DEV_EVERY FRAMES_PER_CLIP TRAIN_FIELDS EVAL_BATCH UNIT DETECTOR DET_MODEL DET_SIZE DET_EPOCHS DET_BATCH; do
         [ -n "${!v:-}" ] && knobs+="$v=$(printf '%q' "${!v}") "
     done
     self="$(printf '%q' "$HERE/$(basename "${BASH_SOURCE[0]}")")"
@@ -300,7 +313,7 @@ step() {
     echo "$(date '+%H:%M:%S')  $RUN_NAME  $*" > "$STAGE_FILE"
 }
 
-step "1/9  System packages, GPU and disk"
+step "1/10  System packages, GPU and disk"
 ensure_system   # again: a run started inside an existing tmux skipped the check above
 nvidia-smi --query-gpu=name,memory.total,memory.used,driver_version --format=csv
 gpu_mib="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | tr -d ' ')"
@@ -324,7 +337,7 @@ if [ "$free_gb" -lt "$need_gb" ]; then
     echo "!! ${free_gb} GB free on $WORK, about ${need_gb} GB needed. Continuing, but expect a full disk."
 fi
 
-step "2/9  CUDA toolkit"
+step "2/10  CUDA toolkit"
 # torch wheels carry their own CUDA runtime, so training itself would run
 # without this. The toolkit (nvcc, headers, libs) is installed anyway so that
 # anything compiling kernels on first use - Triton, bitsandbytes, a
@@ -436,7 +449,7 @@ if [ -z "$TORCH_BACKEND" ]; then
 fi
 echo "torch build: $TORCH_BACKEND"
 
-step "3/9  Python environment"
+step "3/10  Python environment"
 if ! command -v uv >/dev/null 2>&1; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
@@ -541,12 +554,15 @@ PY
         exit 1
     fi
 fi
+# The detector's matching loss (Hungarian) needs scipy; a venv made before
+# the detector was added does not have it.
+python -c "import scipy" 2>/dev/null || uv pip install scipy
 if [ "$PRECISION" = "qlora" ] && ! python -c "import bitsandbytes" 2>/dev/null; then
     uv pip install bitsandbytes
 fi
 python -c "import torch, transformers, peft; print('torch', torch.__version__, '| transformers', transformers.__version__, '| peft', peft.__version__)"
 
-step "4/9  Dataset"
+step "4/10  Dataset"
 if [ ! -f "$DATA/annotations/ava_train_v2.1.csv" ] || [ ! -d "$DATA/labelframes" ]; then
     ZIP="$WORK/cbvd-5cow-behavior-video-dataset.zip"
     [ -f "$ZIP" ] && echo "checking $ZIP (reads all 12 GB, takes a few minutes)"
@@ -678,7 +694,7 @@ else
     fi
 fi
 
-step "5/9  Model"
+step "5/10  Model"
 if [ "$PRECISION" = "qlora" ]; then
     hf download "$MODEL_BF16"
     hf download "$MODEL" --include "*.json" "*.jinja"   # the processor and chat template
@@ -702,10 +718,10 @@ if [ "$UNIT" = cow ] && [ ! -s "$BASE_OUT/results.jsonl" ] && [ -s "$RUNS/lora_w
 fi
 cd "$BENCH"
 
-step "6/9  Training data check"
+step "6/10  Training data check"
 python lora/train_lora.py data "${COMMON[@]}" "${SPLIT[@]}"
 
-step "7/9  Control: the untouched model, same width, no reasoning"
+step "7/10  Control: the untouched model, same width, no reasoning"
 # The zero-shot runs in runs/ were made with reasoning on and at 1280/1920 px.
 # This arm changes only what the LoRA arm changes apart from the training -
 # width and no reasoning - so base-vs-LoRA isolates what the training bought.
@@ -715,7 +731,7 @@ if [ "$EVAL_BASE" = "1" ]; then
         || echo "!! base-model eval failed; continuing to training"
 fi
 
-step "8/9  Training"
+step "8/10  Training"
 if [ -f "$OUT/adapter/adapter_config.json" ] && [ -f "$OUT/train_meta.json" ]; then
     echo "adapter already trained: $OUT/adapter"
 else
@@ -725,11 +741,32 @@ else
         --alpha "$((RANK * 2))"
 fi
 
-step "9/9  Evaluation on all 2532 val cows"
+step "9/10  Cow detector: RT-DETRv2 on the train boxes, then every val keyframe"
+# After the LoRA, not before: a detector failure then costs a rerun of this
+# step only - the adapter is already saved and the rerun skips its training.
+DETS="$DET_OUT/val_detections.jsonl"
+if [ "$DETECTOR" = "1" ]; then
+    python detector.py train --root "$RUN_DATA" --out "$DET_OUT" --model "$DET_MODEL" \
+        --size "$DET_SIZE" --epochs "$DET_EPOCHS" --batch "$DET_BATCH"
+    python detector.py detect --root "$RUN_DATA" --out "$DET_OUT"
+    python detector.py score --out "$DET_OUT"
+else
+    echo "DETECTOR=0 - skipped"
+fi
+
+step "10/10  Evaluation on all 2532 val cows"
+# First on the annotated boxes - comparable with every earlier run - then on
+# the detector's: the model answers about what the detector found, the
+# annotation only scores, and an annotated cow the detector missed is an error.
 python lora/train_lora.py eval "${COMMON[@]}" --adapter "$OUT/adapter"
+if [ "$DETECTOR" = "1" ]; then
+    python lora/train_lora.py eval "${COMMON[@]}" --adapter "$OUT/adapter" \
+        --boxes "$DETS" --eval-out "$OUT/eval-lora-det"
+    cp "$DET_OUT/det_report.md" "$OUT/eval-lora-det/"
+fi
 
 ZS="$BENCH/runs/2026-09-25_val-full_w1920_f1"
-for arm in "$BASE_OUT" "$OUT/eval-lora"; do
+for arm in "$BASE_OUT" "$OUT/eval-lora" "$OUT/eval-lora-det"; do
     [ -s "$arm/results.jsonl" ] || continue
     python cowbench.py --out "$arm" score
     python cowbench.py --out "$arm" score --vote
@@ -743,6 +780,11 @@ if [ -s "$BASE_OUT/results.jsonl" ]; then
         --label-a "base ${WIDTH}px, no reasoning" --label-b "LoRA ${WIDTH}px" \
         --output "$OUT/eval-lora/compare_vs_base.md"
 fi
+if [ -s "$OUT/eval-lora-det/results.jsonl" ]; then
+    python cowbench.py compare --a "$OUT/eval-lora" --b "$OUT/eval-lora-det" \
+        --label-a "LoRA, annotated boxes" --label-b "LoRA, RT-DETRv2 boxes" \
+        --output "$OUT/eval-lora-det/compare_vs_annotated_boxes.md"
+fi
 
 echo
 echo "Done. Everything is in $OUT:"
@@ -751,4 +793,10 @@ echo "  dev_history.jsonl             dev error every $DEV_EVERY steps; adapters
 echo "  train_meta.json               what was trained, how long, loss, the best dev step"
 echo "  eval-lora/report.md           the bench report for the fine-tuned model"
 echo "  eval-lora/compare_*.md        paired comparisons against the zero-shot runs"
+if [ "$DETECTOR" = "1" ]; then
+echo "  eval-lora-det/report.md       the same on the detector's boxes - the farm's test"
+echo "  eval-lora-det/det_report.md   how many cows the detector found ($DET_OUT)"
+echo "  For the tests on the serving pod (cowbench/run_tests.sh) bring the detector's"
+echo "  $DETS and det_meta.json along with the adapter."
+fi
 echo "Copy it back into cowbench/runs/ to keep it with the rest."

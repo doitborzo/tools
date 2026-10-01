@@ -866,7 +866,18 @@ def cmd_eval(args):
     print(f"[eval] {len(manifest)} examples, {len(done)} done, {len(todo)} to go", flush=True)
     if not todo:
         return
-    if args.unit == "frame":
+    dets = None
+    if args.boxes:
+        # Ask about the detector's boxes; the annotation only scores.
+        dets, det_meta = frame_mod.load_detections(args.boxes)
+        thr = args.det_threshold if args.det_threshold is not None else det_meta.get("threshold", 0.5)
+        open_frames = [f for f in frame_mod.group(manifest)
+                       if any(c["id"] not in done for c in f["cows"])]
+        gt_of = {(f["video_id"], f["timestamp"]): f["cows"] for f in open_frames}
+        pseudo = {k: frame_mod.detected_cows(dict(dets.get(k, {"boxes": []}), video_id=k[0],
+                                                  timestamp=k[1]), thr) for k in gt_of}
+        ask = [c for k in gt_of for c in pseudo[k]]
+    elif args.unit == "frame":
         # The question lists every cow of the keyframe: ask with all of them,
         # write only the ones not answered yet.
         open_frames = {(r["video_id"], r["timestamp"]) for r in todo}
@@ -912,11 +923,46 @@ def cmd_eval(args):
         "annotations": os.path.join("annotations", "ava_val_v2.1.csv"),
         "videos": ", ".join(sorted({r["video_id"] for r in manifest}, key=int)),
         "excluded": excluded,
+        "boxes": ({"source": "detector", "detections": os.path.abspath(args.boxes), "threshold": thr,
+                   "detector": det_meta.get("base_model"), "match_iou": 0.5}
+                  if dets is not None else {"source": "annotation"}),
     }
     with open(os.path.join(args.eval_out, "run_meta.json"), "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2, ensure_ascii=False)
 
     t0 = time.time()
+    if dets is not None:
+        # Answers about detections arrive in batches that need not end on a
+        # frame; a frame is matched to its annotated cows once all its
+        # detections are answered.
+        finished = [0]
+
+        def frames_done(pending, recs, fh, xfh):
+            for r in recs:
+                pending[(r["video_id"], r["timestamp"])].append(r)
+            for k in [k for k, got in pending.items() if len(got) == len(pseudo[k])]:
+                finished[0] += 1
+                gts, extras = frame_mod.to_gt(gt_of[k], pending.pop(k))
+                for g in gts:
+                    if g["id"] not in done:
+                        fh.write(json.dumps(g, ensure_ascii=False) + "\n")
+                for e in extras:
+                    xfh.write(json.dumps(e, ensure_ascii=False) + "\n")
+            fh.flush()
+            xfh.flush()
+
+        pending = collections.defaultdict(list)
+        with open(results_path, "a", encoding="utf-8") as fh, \
+                open(os.path.join(args.eval_out, "detections_answered.jsonl"), "a", encoding="utf-8") as xfh:
+            for k in gt_of:
+                if not pseudo[k]:
+                    pending[k] = []        # nothing found: every cow there is missed
+            frames_done(pending, [], fh, xfh)
+            for recs in answer_rows(model, processor, chat, ask, args, args.eval_batch):
+                frames_done(pending, recs, fh, xfh)
+                print(f"\r  {finished[0]}/{len(gt_of)} frames", end="", flush=True)
+        print(f"\n[eval] detector boxes -> {results_path}", flush=True)
+        return
     with open(results_path, "a", encoding="utf-8") as fh:
         n = 0
         for recs in answer_rows(model, processor, chat, ask, args, args.eval_batch):
@@ -972,6 +1018,10 @@ def main(argv=None):
     p.add_argument("--dev-batch", type=int, default=8)
     p.add_argument("--frames-per-clip", type=int, default=3,
                    help="training keyframes kept per clip, spread over it; 0 = all six")
+    p.add_argument("--boxes", default=None,
+                   help="eval: val_detections.jsonl from ../detector.py - ask about the detector's "
+                        "boxes; the annotation only scores, a missed cow is an error")
+    p.add_argument("--det-threshold", type=float, default=None)
     p.add_argument("--unit", choices=("cow", "frame"), default="cow",
                    help="cow: one outlined cow per question; frame: every cow of the keyframe, "
                         "numbered, in one question (see ../frame.py)")

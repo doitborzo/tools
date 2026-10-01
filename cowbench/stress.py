@@ -48,6 +48,17 @@ def run(args, client_mod, jsonl_read):
         plan_meta = json.load(fh)
     root = args.root or plan_meta["root"]
     frames = detect_mod.frames_of(manifest)
+    boxes_from = "annotation"
+    if getattr(args, "boxes", None):
+        # The detector's boxes stand in for the annotated cows: what a farm sends.
+        dets, det_meta = frame_mod.load_detections(args.boxes)
+        thr = args.det_threshold if args.det_threshold is not None else det_meta.get("threshold", 0.5)
+        frames = {k: [{"bbox": c["bbox"]} for c in frame_mod.detected_cows(
+                          dict(dets.get(k, {"boxes": []}), video_id=k[0], timestamp=k[1]), thr)]
+                  for k in frames}
+        frames = {k: v for k, v in frames.items() if v}
+        boxes_from = f"detector ({det_meta.get('base_model')}, threshold {thr}, " \
+                     f"{det_meta.get('ms_per_frame')} ms a frame, not included below)"
 
     # The busiest clips: a stress test should not be flattered by empty stalls.
     by_clip = {}
@@ -189,7 +200,7 @@ def run(args, client_mod, jsonl_read):
         "model": args.model, "vllm_version": info.get("vllm_version"), "server": info,
         "task": args.task, "answer_now": args.answer_now, "streams": args.streams,
         "clips": streams, "interval": args.interval, "duration": args.duration,
-        "warmup": args.warmup, "max_width": args.max_width,
+        "warmup": args.warmup, "max_width": args.max_width, "boxes": boxes_from,
         "frames": len(counted), "requests": len(req),
         "failed_requests": sum(f["failed"] for f in counted),
         "frames_per_s_total": len(counted) / window,
@@ -233,7 +244,7 @@ def render_report(s) -> str:
     mode = ("as fast as possible (next frame as soon as the last is answered)"
             if not s["interval"] else f"paced, one frame per {s['interval']:g} s per camera")
     per_frame = {"classify": "one request per annotated cow",
-                 "frame": "one request per frame about every annotated cow on it",
+                 "frame": "one request per frame about every cow on it",
                  "detect": "one request per frame, finding the cows"}[s["task"]]
     lines = [
         f"# {s['streams']} cameras at once", "",
@@ -241,7 +252,7 @@ def render_report(s) -> str:
         f"Task `{s['task']}` ({per_frame}"
         + (", answer prefilled, no reasoning" if s["answer_now"] else "") + f"), "
         f"max width {s['max_width']} px. {mode}. Measured {s['duration']:g} s after "
-        f"{s['warmup']:g} s warm-up.", "",
+        f"{s['warmup']:g} s warm-up. Cow boxes from the {s.get('boxes', 'annotation')}.", "",
         "| | |", "|---|---|",
         f"| Frames answered | {s['frames']} ({s['requests']} requests"
         + (f", **{s['failed_requests']} failed**" if s["failed_requests"] else "") + ") |",

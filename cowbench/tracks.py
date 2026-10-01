@@ -86,6 +86,11 @@ def vote(results, threshold: float = 0.5, min_length: int = 3):
     tracks = build(results, threshold, min_length)
     replacement = {}
     for track in tracks:
+        # A cow the detector missed has no answer to give and gets none: on a
+        # farm the tracker links detections, and a missed cow is not one.
+        track = [r for r in track if not r.get("missed_by_detector")]
+        if not track:
+            continue
         postures = collections.Counter(r.get("posture") for r in track)
         activities = collections.Counter(r.get("activity") for r in track)
         top_p = postures.most_common(2)
