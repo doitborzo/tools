@@ -18,8 +18,10 @@
 #   WORK=/workspace                 where the dataset, adapter and results live
 #   ADAPTER=$WORK/lora-runs/lora2pose_w896/adapters/step-00638
 #   LORA_NAME=pose638               the adapter's model name on the server
-#   WIDTH=896                       frame width for the adapter's questions: the width
-#                                   it was trained at (lora2pose: 896, lora3norum: 1920)
+#   WIDTH, UNIT                     how the adapter is asked: by default as it was trained,
+#                                   read from the train_meta.json next to the adapter
+#                                   (else 896, cow). UNIT=frame: one question per keyframe
+#                                   about every cow on it (frame.py), stress task "frame"
 #   STREAMS=12                      cameras in the stress tests
 #   INTERVAL=10                     seconds between frames per camera, paced test
 #   DURATION=300                    seconds measured per stress test
@@ -34,7 +36,19 @@ WORK="${WORK:-/workspace}"
 ROOT="$WORK/cbvd5"
 ADAPTER="${ADAPTER:-$WORK/lora-runs/lora2pose_w896/adapters/step-00638}"
 LORA_NAME="${LORA_NAME:-pose638}"
-WIDTH="${WIDTH:-896}"
+# The width and unit the adapter was trained at, from its run's train_meta.json
+# (adapter/ or adapters/step-N sit one or two levels below it).
+trained() {
+    local meta
+    for meta in "$(dirname "$ADAPTER")/train_meta.json" "$(dirname "$(dirname "$ADAPTER")")/train_meta.json"; do
+        if [ -f "$meta" ]; then
+            sed -n "s/.*\"$1\": *\"\{0,1\}\([a-z0-9]*\)\"\{0,1\},*$/\1/p" "$meta" | head -1
+            return
+        fi
+    done
+}
+WIDTH="${WIDTH:-$(trained width)}"; WIDTH="${WIDTH:-896}"
+UNIT="${UNIT:-$(trained unit)}"; UNIT="${UNIT:-cow}"
 STREAMS="${STREAMS:-12}"
 INTERVAL="${INTERVAL:-10}"
 DURATION="${DURATION:-300}"
@@ -62,7 +76,7 @@ if [ -z "${COWTESTS_IN_TMUX:-}" ]; then
         echo "already running in tmux session '$SESSION':  bash $0 log"; exit 1
     fi
     knobs=""
-    for v in WORK ADAPTER LORA_NAME WIDTH STREAMS INTERVAL DURATION PORT OUT; do
+    for v in WORK ADAPTER LORA_NAME WIDTH UNIT STREAMS INTERVAL DURATION PORT OUT; do
         knobs+="$v=$(printf '%q' "${!v}") "
     done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
@@ -155,8 +169,9 @@ step "5/7  Bench with the adapter: the known answer, as a check of the server"
 # pose638 (lora2pose_w896, step 638) gave 23.3% exact-match error through vLLM
 # at 896 px; for another adapter, compare with its own eval-lora/. Far from it,
 # something in this setup differs and the tests below mean less.
+echo "asking $LORA_NAME per $UNIT at $WIDTH px"
 bench run --root "$ROOT" --base-url "$BASE_URL" --model "$LORA_NAME" --answer-now \
-    --max-width "$WIDTH" --concurrency 16
+    --max-width "$WIDTH" --unit "$UNIT" --concurrency "$( [ "$UNIT" = frame ] && echo 8 || echo 16 )"
 bench score
 bench score --vote
 bench report
@@ -172,8 +187,9 @@ stress() {   # skip a test whose report is already there
     bench stress --root "$ROOT" --base-url "$BASE_URL" --streams "$STREAMS" \
         --duration "$DURATION" "$@"
 }
-stress "stress_classify_${STREAMS}x_max" --model "$LORA_NAME" --answer-now --max-width "$WIDTH"
-stress "stress_classify_${STREAMS}x_${INTERVAL}s" --model "$LORA_NAME" --answer-now --max-width "$WIDTH" \
+task=classify; [ "$UNIT" = frame ] && task=frame
+stress "stress_${task}_${STREAMS}x_max" --task "$task" --model "$LORA_NAME" --answer-now --max-width "$WIDTH"
+stress "stress_${task}_${STREAMS}x_${INTERVAL}s" --task "$task" --model "$LORA_NAME" --answer-now --max-width "$WIDTH" \
     --interval "$INTERVAL"
 stress "stress_detect_${STREAMS}x_max" --task detect --model muse-glimmer
 
@@ -181,7 +197,7 @@ tarball="$WORK/cow_tests_$(basename "$OUT").tgz"
 tar czf "$tarball" -C "$(dirname "$OUT")" "$(basename "$OUT")"
 echo
 echo "Done. Reports in $OUT:"
-echo "  report.md                         bench with $LORA_NAME at $WIDTH px"
+echo "  report.md                         bench with $LORA_NAME per $UNIT at $WIDTH px"
 echo "  detect_report.md                  finding the cows without boxes"
 echo "  stress_*.md                       $STREAMS cameras at once"
 echo "Everything in one file: $tarball"

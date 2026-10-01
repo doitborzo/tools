@@ -13,6 +13,13 @@ Stages, each resumable and each its own process:
     train  load, sanity-check, train the adapter (resumes from checkpoints)
     eval   answer the val manifest with or without the adapter
 
+Two units of question, --unit:
+
+    cow    one cow outlined, one answer - the bench's own question
+    frame  every cow of the keyframe outlined and numbered, one answer listing
+           them all (../frame.py): the frame is encoded once instead of once
+           per cow. Results are still written per cow.
+
 Weights. The published checkpoint is FP8 block-quantized (compressed-tensors),
 and an A100 has no FP8 matmul. The FP8 weights are expanded to BF16 on load
 (weight * per-128x128-block scale) - no 60 GB BF16 download, and the adapter
@@ -46,6 +53,7 @@ sys.path.insert(0, BENCH)
 
 import cbvd  # noqa: E402
 import client as client_mod  # noqa: E402
+import frame as frame_mod  # noqa: E402
 import render as render_mod  # noqa: E402
 
 FP8_REPO = "RedHatAI/Muse-Glimmer-30B-FP8-block"
@@ -207,12 +215,24 @@ def make_image(root, row, width, quality):
     return Image.open(buf).convert("RGB")
 
 
+def make_frame_image(root, fr, width, quality):
+    """The frame unit's image: every cow of the keyframe outlined and numbered
+    (frame.render), then the same JPEG round trip."""
+    from PIL import Image
+    box = cbvd.Box(fr["video_id"], fr["timestamp"], 0, 0, 0, 0, "1", ())
+    img = frame_mod.render(read_frame(root, box), fr["cows"], width)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    buf.seek(0)
+    return Image.open(buf).convert("RGB")
+
+
 # ------------------------------------------------------------------ prompting
 
-def messages():
+def messages(text=None):
     # Image first, then text: the order the bench's client sends them in.
-    return [{"role": "user", "content": [{"type": "image"},
-                                         {"type": "text", "text": client_mod.build_prompt(1, 0.0)}]}]
+    text = client_mod.build_prompt(1, 0.0) if text is None else text
+    return [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": text}]}]
 
 
 class Chat:
@@ -241,6 +261,39 @@ class Chat:
         at = tail.index(probe)
         self.answer_open = tail[:at]                     # " to=user<|message|>"
         self.answer_close = tail[at + len(probe):]       # "<|eot|>"
+        self._prefixes = {}
+
+    def prefix_for(self, text):
+        """The generation prompt for another question text (the frame unit's
+        prompt lists the frame's boxes, so it differs per frame)."""
+        if text not in self._prefixes:
+            if len(self._prefixes) > 4096:
+                self._prefixes.clear()
+            self._prefixes[text] = self.processor.apply_chat_template(
+                messages(text), tokenize=False, add_generation_prompt=True)
+        return self._prefixes[text]
+
+    def wrap(self, body):
+        return self.answer_open + body + self.answer_close
+
+    def flags(self, body, masked):
+        """One flag per token of wrap(body): False where the token overlaps a
+        masked (start, end) character span of body."""
+        ids = self.tok(self.wrap(body), add_special_tokens=False, return_offsets_mapping=True)
+        off = len(self.answer_open)
+        spans = [(s + off, e + off) for s, e in masked]
+        return [not any(a < e and b > s for s, e in spans) for a, b in ids["offset_mapping"]]
+
+    def frame_flags(self, cows, fields):
+        """loss_flags for the frame unit: the same three policies, per cow."""
+        spans = frame_mod.activity_spans(cows)
+        if fields == "both":
+            masked = []
+        elif fields == "posture":
+            masked = [(s, e) for s, e, _ in spans]
+        else:
+            masked = [(s, e) for s, e, a in spans if a == "ruminating"]
+        return self.flags(frame_mod.answer_json(cows), masked)
 
     def suffix(self, posture, activity):
         return self.answer_open + answer_json(posture, activity) + self.answer_close
@@ -294,19 +347,30 @@ def encode(processor, texts, images):
 
 
 class Collator:
-    def __init__(self, processor, chat, root, width, quality, fields="both"):
+    """A batch of cows (unit "cow") or of keyframes (unit "frame")."""
+
+    def __init__(self, processor, chat, root, width, quality, fields="both", unit="cow"):
         self.processor, self.chat = processor, chat
         self.root, self.width, self.quality = root, width, quality
-        self.fields = fields
+        self.fields, self.unit = fields, unit
+
+    def suffix(self, item):
+        if self.unit == "frame":
+            return self.chat.wrap(frame_mod.answer_json(item["cows"]))
+        return self.chat.suffix(item["gt_posture"], item["gt_activity"])
 
     def __call__(self, rows):
         import torch
         texts, images, flags = [], [], []
         for r in rows:
-            suffix = self.chat.suffix(r["gt_posture"], r["gt_activity"])
-            texts.append(self.chat.prefix + suffix)
-            images.append(make_image(self.root, r, self.width, self.quality))
-            flags.append(self.chat.loss_flags(r["gt_posture"], r["gt_activity"], self.fields))
+            if self.unit == "frame":
+                texts.append(self.chat.prefix_for(frame_mod.prompt(r["cows"])) + self.suffix(r))
+                images.append(make_frame_image(self.root, r, self.width, self.quality))
+                flags.append(self.chat.frame_flags(r["cows"], self.fields))
+            else:
+                texts.append(self.chat.prefix + self.suffix(r))
+                images.append(make_image(self.root, r, self.width, self.quality))
+                flags.append(self.chat.loss_flags(r["gt_posture"], r["gt_activity"], self.fields))
         enc = encode(self.processor, texts, images)
         # Left padding puts every answer at the very end of its row, so the
         # answer is always the last n tokens and the loss only needs the logits
@@ -464,13 +528,33 @@ def answer_loss(model, batch):
 
 
 def answer_rows(model, processor, chat, rows, args, batch):
-    """Greedy answers, `batch` cows at a time; yields the records per batch.
-    Generation starts where the final answer begins - no reasoning - which
-    is what the adapter is trained to do."""
+    """Greedy answers, `batch` cows (or, unit "frame", keyframes) at a time;
+    yields the per-cow records of each batch. Generation starts where the
+    final answer begins - no reasoning - which is what the adapter is trained
+    to do. For frames, `rows` must hold every cow of each keyframe: the
+    question lists them all."""
     import torch
     tok = processor.tokenizer
     prefix = chat.prefix + chat.answer_open
     stop = [tok.convert_tokens_to_ids(t) for t in re.findall(r"<\|[a-z_]+\|>", chat.answer_close)]
+    if getattr(args, "unit", "cow") == "frame":
+        frames = frame_mod.group(rows)
+        with torch.no_grad():
+            for i in range(0, len(frames), batch):
+                chunk = frames[i:i + batch]
+                images = [make_frame_image(args.root, f, args.width, args.jpeg_quality) for f in chunk]
+                texts = [chat.prefix_for(frame_mod.prompt(f["cows"])) + chat.answer_open for f in chunk]
+                enc = encode(processor, texts, images)
+                enc = {k: (v.to(model.device) if hasattr(v, "to") else v) for k, v in enc.items()}
+                # ~16 tokens a cow, with room to spare
+                most = max(len(f["cows"]) for f in chunk)
+                out = model.generate(**enc, max_new_tokens=24 * most + 32, do_sample=False,
+                                     use_cache=True, eos_token_id=stop or None,
+                                     pad_token_id=tok.pad_token_id)
+                answers = tok.batch_decode(out[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
+                yield [rec for f, text in zip(chunk, answers)
+                       for rec in frame_mod.records(f["cows"], text)]
+        return
     with torch.no_grad():
         for i in range(0, len(rows), batch):
             chunk = rows[i:i + batch]
@@ -526,6 +610,16 @@ def cmd_data(args):
         raise SystemExit("missing keyframes:\n  " + "\n  ".join(sorted(missing)[:10]))
     sample_dir = os.path.join(args.out, "samples")
     os.makedirs(sample_dir, exist_ok=True)
+    if args.unit == "frame":
+        frames = frame_mod.group(rows)
+        print(f"unit frame: {len(frames)} keyframes, "
+              f"{sum(len(f['cows']) for f in frames) / max(len(frames), 1):.1f} cows each, "
+              f"up to {max(len(f['cows']) for f in frames)}")
+        for f in random.Random(args.seed).sample(frames, min(3, len(frames))):
+            stem = os.path.join(sample_dir, f"frame_{f['video_id']}_{f['timestamp']:05d}")
+            make_frame_image(args.root, f, args.width, args.jpeg_quality).save(stem + ".jpg")
+            with open(stem + ".txt", "w", encoding="utf-8") as fh:
+                fh.write(frame_mod.prompt(f["cows"]) + "\n\n" + frame_mod.answer_json(f["cows"]) + "\n")
     for r in random.Random(args.seed).sample(rows, 4):
         make_image(args.root, r, args.width, args.jpeg_quality).save(
             os.path.join(sample_dir, f"{r['id']}_{r['gt_posture']}_{r['gt_activity']}.jpg"))
@@ -562,37 +656,43 @@ def cmd_train(args):
     chat = Chat(processor)
     print(f"[chat] answer wrapped as {chat.answer_open!r} ... {chat.answer_close!r}", flush=True)
     collate = Collator(processor, chat, args.root, args.width, args.jpeg_quality,
-                       args.train_fields)
+                       args.train_fields, args.unit)
+    # What the Trainer iterates over: cows, or whole keyframes.
+    items = frame_mod.group(rows) if args.unit == "frame" else rows
 
     # --- sanity, before any hour is spent -----------------------------
-    probe = collate(rows[:2])
+    probe = collate(items[:2])
     ids, mask = probe["input_ids"], probe["answer_mask"]
-    for i, r in enumerate(rows[:2]):
-        want = chat.suffix_ids(chat.suffix(r["gt_posture"], r["gt_activity"]))
+    for i, r in enumerate(items[:2]):
+        want = chat.suffix_ids(collate.suffix(r))
         got = ids[i][-len(want):].tolist()
         if got != want:
             raise SystemExit("answer tokens do not line up with the sequence end - the loss "
                              f"would train on the wrong tokens.\nwant {want}\ngot  {got}")
     seq_len = int(ids.shape[1])
     trained = chat.tok.decode(ids[0][mask[0]].tolist())
-    print(f"[data] {len(rows)} examples, {seq_len} tokens each, answer "
+    print(f"[data] {len(items)} {args.unit} examples ({len(rows)} cows), {seq_len} tokens, answer "
           f"{int(probe['answer_len'].max())} tokens; fields={args.train_fields}, "
           f"loss on: {trained!r}", flush=True)
 
     val = read_jsonl(args.manifest)
-    pick = random.Random(0).sample(val, min(16, len(val)))
+    if args.unit == "frame":
+        pick, step_ = random.Random(0).sample(frame_mod.group(val), 4), 2
+    else:
+        pick, step_ = random.Random(0).sample(val, min(16, len(val))), 4
     model.eval()
     zs = []
     with torch.no_grad():
-        for i in range(0, len(pick), 4):
+        for i in range(0, len(pick), step_):
             b = {k: (v.to(model.device) if hasattr(v, "to") else v)
-                 for k, v in collate(pick[i:i + 4]).items()}
+                 for k, v in collate(pick[i:i + step_]).items()}
             zs.append(float(answer_loss(model, b)))
     zero_shot = sum(zs) / len(zs)
     # A healthy base model knows JSON and knows these words. A loss far above
     # this bound means the weights did not load right - a missed scale, a
     # wrong layer mapping - and training would only paper over it.
-    print(f"[sanity] zero-shot answer loss on 16 val cows: {zero_shot:.3f} nats/token", flush=True)
+    print(f"[sanity] zero-shot answer loss on {len(pick)} val {args.unit}s: {zero_shot:.3f} nats/token",
+          flush=True)
     if zero_shot > args.max_zero_shot_loss:
         raise SystemExit(f"zero-shot loss {zero_shot:.2f} > {args.max_zero_shot_loss}: "
                          "the weights look broken. Not training.")
@@ -675,7 +775,7 @@ def cmd_train(args):
         seed=args.seed,
         optim="adamw_torch_fused",
     )
-    trainer = AnswerOnlyTrainer(model=model, args=targs, train_dataset=rows, data_collator=collate,
+    trainer = AnswerOnlyTrainer(model=model, args=targs, train_dataset=items, data_collator=collate,
                                 callbacks=[DevCallback()])
     # The loss is already a per-token mean; let Trainer do the plain
     # 1/accumulation scaling rather than look for token counts in `labels`.
@@ -712,9 +812,10 @@ def cmd_train(args):
     meta = {
         "date": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         **minfo, **info,
-        "trained_on": len(rows), "train_limit": args.train_limit,
+        "unit": args.unit, "trained_on": len(rows), "train_examples": len(items),
+        "train_limit": args.train_limit,
         "width": args.width, "jpeg_quality": args.jpeg_quality, "tokens_per_example": seq_len,
-        "prompt_sha": client_mod.prompt_sha(1, 0.0),
+        "prompt_sha": frame_mod.PROMPT_SHA if args.unit == "frame" else client_mod.prompt_sha(1, 0.0),
         "lora": {"rank": args.rank, "alpha": args.alpha, "dropout": args.dropout,
                  "modules": n_targets, "trainable_params": trainable},
         "optim": {"lr": args.lr, "epochs": args.epochs, "batch": args.batch, "accum": args.accum,
@@ -765,6 +866,13 @@ def cmd_eval(args):
     print(f"[eval] {len(manifest)} examples, {len(done)} done, {len(todo)} to go", flush=True)
     if not todo:
         return
+    if args.unit == "frame":
+        # The question lists every cow of the keyframe: ask with all of them,
+        # write only the ones not answered yet.
+        open_frames = {(r["video_id"], r["timestamp"]) for r in todo}
+        ask = [r for r in manifest if (r["video_id"], r["timestamp"]) in open_frames]
+    else:
+        ask = todo
 
     model, processor, minfo = load_model(args)
     adapter = None if args.adapter in (None, "", "none") else args.adapter
@@ -796,10 +904,11 @@ def cmd_eval(args):
         "engine": "transformers generate, greedy",
         "reasoning": "off: generation starts at the final answer",
         "temperature": 0.0, "seed": 0,
-        "render_mode": "marked", "frames": 1, "span": 0.0, "min_width": 0,
+        "render_mode": "numbered (all cows of the frame)" if args.unit == "frame" else "marked",
+        "unit": args.unit, "frames": 1, "span": 0.0, "min_width": 0,
         "max_width": args.width, "jpeg_quality": args.jpeg_quality,
-        "prompt_sha": client_mod.prompt_sha(1, 0.0),
-        "prompt": client_mod.build_prompt(1, 0.0),
+        "prompt_sha": frame_mod.PROMPT_SHA if args.unit == "frame" else client_mod.prompt_sha(1, 0.0),
+        "prompt": (frame_mod._PROMPT if args.unit == "frame" else client_mod.build_prompt(1, 0.0)),
         "annotations": os.path.join("annotations", "ava_val_v2.1.csv"),
         "videos": ", ".join(sorted({r["video_id"] for r in manifest}, key=int)),
         "excluded": excluded,
@@ -810,7 +919,8 @@ def cmd_eval(args):
     t0 = time.time()
     with open(results_path, "a", encoding="utf-8") as fh:
         n = 0
-        for recs in answer_rows(model, processor, chat, todo, args, args.eval_batch):
+        for recs in answer_rows(model, processor, chat, ask, args, args.eval_batch):
+            recs = [r for r in recs if r["id"] not in done]
             for rec in recs:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             fh.flush()
@@ -862,6 +972,9 @@ def main(argv=None):
     p.add_argument("--dev-batch", type=int, default=8)
     p.add_argument("--frames-per-clip", type=int, default=3,
                    help="training keyframes kept per clip, spread over it; 0 = all six")
+    p.add_argument("--unit", choices=("cow", "frame"), default="cow",
+                   help="cow: one outlined cow per question; frame: every cow of the keyframe, "
+                        "numbered, in one question (see ../frame.py)")
     p.add_argument("--train-fields", choices=("both", "posture", "skip-ruminating"), default="both",
                    help="posture: no loss on the activity value; skip-ruminating: none on the "
                         "activity value of ruminating cows (see Chat.loss_flags)")

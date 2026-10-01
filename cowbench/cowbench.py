@@ -39,6 +39,7 @@ import cbvd
 import client as client_mod
 import compare as compare_mod
 import detect as detect_mod
+import frame as frame_mod
 import render as render_mod
 import report as report_mod
 import scoring
@@ -192,22 +193,31 @@ def cmd_run(args):
         "server": info,
         "temperature": args.temperature,
         "seed": 0,
-        "max_tokens": 64 if args.answer_now else args.max_tokens,
-        "reasoning": ("off: the answer is prefilled with " + client_mod.ANSWER_PREFILL
+        "unit": args.unit,
+        "max_tokens": ("per frame" if args.unit == "frame" else 64) if args.answer_now
+                      else args.max_tokens,
+        "reasoning": ("off: the answer is prefilled with "
+                      + (frame_mod.ANSWER_PREFILL if args.unit == "frame" else client_mod.ANSWER_PREFILL)
                       if args.answer_now else "on"),
         "render_mode": args.mode,
         "min_width": args.min_width,
         "frames": args.frames,
         "span": args.span if args.frames > 1 else 0.0,
         "max_width": args.max_width,
-        "prompt_sha": client_mod.prompt_sha(args.frames, args.span),
-        "prompt": client_mod.build_prompt(args.frames, args.span),
+        "prompt_sha": (frame_mod.PROMPT_SHA if args.unit == "frame"
+                       else client_mod.prompt_sha(args.frames, args.span)),
+        "prompt": (frame_mod._PROMPT if args.unit == "frame"
+                   else client_mod.build_prompt(args.frames, args.span)),
         "annotations": plan_meta["annotations"],
         "videos": ", ".join(plan_meta["videos"]),
         "excluded": plan_meta.get("excluded", []),
     }
+    if args.unit == "frame":
+        meta["render_mode"] = "numbered (all cows of the frame)"
     with open(os.path.join(args.out, "run_meta.json"), "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2, ensure_ascii=False)
+    if args.unit == "frame":
+        return _run_frames(args, cli, root, manifest, done, results_path)
 
     modes = ["marked", "crop"] if args.mode == "both" else [args.mode]
     lock = threading.Lock()
@@ -340,6 +350,48 @@ def cmd_compare(args):
 
 # ---------------------------------------------------------------------- cli
 
+def _run_frames(args, cli, root, manifest, done, results_path):
+    """--unit frame: one question per keyframe listing every cow on it
+    (frame.py); one record per cow written, as the per-cow run writes them."""
+    frames = [f for f in frame_mod.group(manifest) if any(c["id"] not in done for c in f["cows"])]
+    lock = threading.Lock()
+    counter = {"n": 0}
+    out_fh = open(results_path, "a", encoding="utf-8")
+
+    def work(f):
+        cows = f["cows"]
+        try:
+            box = cbvd.Box(f["video_id"], f["timestamp"], 0, 0, 0, 0, "1", ())
+            img = frame_mod.render(cbvd.frame_path(root, box), cows, args.max_width)
+            url = render_mod.to_data_url(img, quality=args.jpeg_quality)
+            text = frame_mod.prompt(cows)
+            if args.answer_now:
+                out = cli.complete([url], text, prefill=frame_mod.ANSWER_PREFILL,
+                                   max_tokens=24 * len(cows) + 64)
+            else:
+                out = cli.complete([url], text, schema=frame_mod.SCHEMA, name="cows_in_frame")
+            extra = {"frame_seconds": out["seconds"], "frame_usage": out["usage"],
+                     "finish_reason": out["finish_reason"]}
+            recs = frame_mod.records(cows, out["raw"], extra)
+        except Exception as exc:
+            recs = [dict(c, error="{}: {}".format(type(exc).__name__, exc)) for c in cows]
+        with lock:
+            for rec in recs:
+                if rec["id"] not in done:
+                    out_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            out_fh.flush()
+            counter["n"] += 1
+            print("\r  {}/{} frames".format(counter["n"], len(frames)), end="", flush=True)
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+            list(pool.map(work, frames))
+    finally:
+        out_fh.close()
+        print()
+    print("-> {}".format(results_path))
+
+
 # ------------------------------------------------------- detect and stress
 
 def cmd_detect(args):
@@ -447,6 +499,9 @@ def main(argv=None):
     sr.add_argument("--timeout", type=float, default=300.0)
     sr.add_argument("--retries", type=int, default=3)
     sr.add_argument("--fresh", action="store_true", help="discard previous results")
+    sr.add_argument("--unit", choices=("cow", "frame"), default="cow",
+                    help="cow: one question per cow; frame: one per keyframe, every cow on it "
+                         "numbered (frame.py) - results are still one record per cow")
     sr.add_argument("--answer-now", action="store_true",
                     help="no reasoning, no json_schema: start the answer for the model, as a "
                          "LoRA from lora/train_lora.py was trained (use with --max-width 896)")
@@ -489,8 +544,9 @@ def main(argv=None):
 
     sst = sub.add_parser("stress", help="N cameras at once: throughput and latency")
     _server_args(sst, 4096)
-    sst.add_argument("--task", choices=("classify", "detect"), default="classify",
-                     help="classify: one request per annotated cow; detect: one per frame")
+    sst.add_argument("--task", choices=("classify", "frame", "detect"), default="classify",
+                     help="classify: one request per annotated cow; frame: one per frame about "
+                          "every cow on it; detect: one per frame, finding the cows")
     sst.add_argument("--streams", type=int, default=12, help="cameras, one val clip each")
     sst.add_argument("--duration", type=float, default=300, help="seconds measured")
     sst.add_argument("--warmup", type=float, default=30, help="seconds run first, not counted")

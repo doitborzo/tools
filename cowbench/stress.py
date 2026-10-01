@@ -6,6 +6,7 @@ about it is answered:
 
     classify  one request per annotated cow, the cows of a frame in parallel -
               the bench's own per-cow question (with a LoRA: --answer-now)
+    frame     one request per frame about every annotated cow on it (frame.py)
     detect    one request per frame, detect.py's "find every cow"
 
 --interval 0 sends the next frame as soon as the last is done: the most the
@@ -28,6 +29,7 @@ import time
 
 import cbvd
 import detect as detect_mod
+import frame as frame_mod
 import render as render_mod
 
 
@@ -67,6 +69,10 @@ def run(args, client_mod, jsonl_read):
             if args.task == "detect":
                 img = render_mod.render(path, None, mode="plain", max_width=args.max_width)
                 prepared[(vid, ts)] = [(render_mod.to_data_url(img, args.jpeg_quality), img.size)]
+            elif args.task == "frame":
+                ordered = frame_mod.order(cows)
+                img = frame_mod.render(path, ordered, args.max_width)
+                prepared[(vid, ts)] = [(render_mod.to_data_url(img, args.jpeg_quality), ordered)]
             else:
                 prepared[(vid, ts)] = [
                     (render_mod.to_data_url(render_mod.render(path, c["bbox"], mode="marked",
@@ -93,6 +99,18 @@ def run(args, client_mod, jsonl_read):
             if args.task == "detect":
                 out = client().ask([url], detect_mod.PROMPT.format(w=size[0], h=size[1]),
                                    detect_mod.SCHEMA, "cows_in_frame")
+            elif args.task == "frame":
+                cows = size
+                if args.answer_now:
+                    out = client().complete([url], frame_mod.prompt(cows),
+                                            prefill=frame_mod.ANSWER_PREFILL,
+                                            max_tokens=24 * len(cows) + 64)
+                else:
+                    out = client().complete([url], frame_mod.prompt(cows), schema=frame_mod.SCHEMA,
+                                            name="cows_in_frame")
+                got = frame_mod.parse(out["raw"], len(cows))
+                return {"seconds": time.perf_counter() - t0, "usage": out.get("usage") or {},
+                        "ok": len(got) == len(cows)}
             else:
                 out = client().classify([url])
             return {"seconds": time.perf_counter() - t0, "usage": out.get("usage") or {},
@@ -214,7 +232,9 @@ def render_report(s) -> str:
     f = lambda v, d=1: "—" if v is None else f"{v:.{d}f}"
     mode = ("as fast as possible (next frame as soon as the last is answered)"
             if not s["interval"] else f"paced, one frame per {s['interval']:g} s per camera")
-    per_frame = "one request per annotated cow" if s["task"] == "classify" else "one request per frame"
+    per_frame = {"classify": "one request per annotated cow",
+                 "frame": "one request per frame about every annotated cow on it",
+                 "detect": "one request per frame, finding the cows"}[s["task"]]
     lines = [
         f"# {s['streams']} cameras at once", "",
         f"Model `{s['model']}` on vLLM {s.get('vllm_version') or '?'}, {s['run_date']}. "

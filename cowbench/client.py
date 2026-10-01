@@ -195,6 +195,36 @@ class MuseClient:
             out["parse_error"] = f"{type(exc).__name__}: {exc}"
         return out
 
+    def complete(self, data_urls, text, prefill=None, schema=None, name="answer",
+                 max_tokens=None) -> dict:
+        """images + text, answered either with the assistant turn started as
+        `prefill` (no reasoning, no schema - how a LoRA from lora/train_lora.py
+        answers) or under `schema` (reasoning on). "raw" is the full answer,
+        prefill included. Used by the frame unit (frame.py)."""
+        content = [{"type": "image_url", "image_url": {"url": u}} for u in data_urls]
+        content.append({"type": "text", "text": text})
+        payload = {"model": self.model, "messages": [{"role": "user", "content": content}],
+                   "temperature": self.temperature, "max_tokens": max_tokens or self.max_tokens,
+                   "seed": 0}
+        if prefill is not None:
+            payload["messages"].append({"role": "assistant", "content": prefill})
+            payload["continue_final_message"] = True
+            payload["add_generation_prompt"] = False
+        elif schema is not None:
+            payload["response_format"] = {"type": "json_schema", "json_schema": {
+                "name": name, "schema": schema, "strict": True}}
+        t0 = time.perf_counter()
+        body = self._post(payload)
+        message = body["choices"][0]["message"]
+        text_out = message.get("content") or ""
+        reasoning = message.get("reasoning") or message.get("reasoning_content")
+        if prefill is not None:
+            # As in _once: a reasoning parser may file a prefilled answer under reasoning.
+            text_out, reasoning = prefill + (text_out or reasoning or ""), None
+        return {"raw": text_out, "reasoning": reasoning,
+                "finish_reason": body["choices"][0].get("finish_reason"),
+                "usage": body.get("usage"), "seconds": round(time.perf_counter() - t0, 3)}
+
     def _once(self, data_urls, n_frames, span, max_tokens) -> dict:
         content = [{"type": "image_url", "image_url": {"url": u}} for u in data_urls]
         content.append({"type": "text", "text": build_prompt(n_frames, span)})

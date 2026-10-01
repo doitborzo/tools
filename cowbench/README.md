@@ -200,3 +200,23 @@ every camera at one frame per S seconds and says whether the server keeps up.
 
     python cowbench.py --out out-val stress --streams 12 --duration 300
     python cowbench.py --out out-val stress --streams 12 --interval 10 --model pose638 --answer-now --max-width 896
+
+## Every cow of a frame in one question (`--unit frame`)
+
+The per-cow question sends the whole frame once per cow; on one A100 that
+held 12 cameras to an update every ~77 s. `frame.py` asks once per keyframe:
+every cow outlined in lime and numbered (reading order), the same boxes listed
+in the text on the 0-1000 scale, and one answer
+`{"cows": [{"id": 1, "posture": ..., "activity": ...}, ...]}`. On a farm the
+boxes come from a detector (RT-DETRv2); here from the annotation. Results are
+still written one record per cow, so `score`, `report`, `compare` and `--vote`
+work unchanged.
+
+    python cowbench.py --out out-val run --unit frame                      # base model, reasoning, json_schema
+    python cowbench.py --out out-val run --unit frame --model <lora> --answer-now --max-width 1920
+    python cowbench.py --out out-val stress --task frame --model <lora> --answer-now --max-width 1920
+
+Training an adapter for it: `UNIT=frame` is `lora/run_lora.sh`'s default -
+one example per keyframe at 1920 px, all six keyframes of a clip, activity
+trained except rumination (`TRAIN_FIELDS=skip-ruminating`). `run_tests.sh`
+reads the unit and width from the adapter's `train_meta.json`.
