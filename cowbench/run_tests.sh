@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # Everything after training, on a fresh pod, in one go:
 #
-#   dataset -> adapter + detections -> vLLM with the adapter -> bench with the adapter
-#   -> 12 cameras at once -> one tar.gz
+#   dataset -> adapter -> RT-DETRv2 on every val keyframe -> vLLM with the adapter
+#   -> bench with the adapter -> 12 cameras at once -> one tar.gz
 #
-# The cows are those RT-DETRv2 found (lora-runs/detector, made by run_lora.sh),
-# never the annotation's boxes: the model answers about what the detector
-# found, the annotation only scores, and a cow the detector missed is an error.
+# The cows are those RT-DETRv2 finds, never the annotation's boxes: the model
+# answers about what the detector found, the annotation only scores, and a cow
+# the detector missed is an error. The detector is run here, from the weights
+# run_lora.sh trained (lora-runs/detector/best), in its own venv, before vLLM
+# takes the GPU.
 #
-# Usage (the repo checked out, the adapter and the detections uploaded - see
-# ADAPTER and BOXES below):
+# Usage (the repo checked out; from the training pod, the adapter folder and
+# the detector's best/ folder - see ADAPTER and DET_DIR below):
 #   bash cowbench/run_tests.sh           start in a background tmux session "cowtests"
 #   bash cowbench/run_tests.sh log       follow the log (Ctrl-c stops watching only)
 #   bash cowbench/run_tests.sh attach    watch it live (detach: Ctrl-b, then d)
@@ -23,8 +25,11 @@
 #   WORK=/workspace                 where the dataset, adapter and results live
 #   ADAPTER=$WORK/lora-runs/lora4frame_w1920/adapter
 #   LORA_NAME=lora4frame            the adapter's model name on the server
-#   BOXES=$WORK/lora-runs/detector/val_detections.jsonl   the detector's boxes, with
-#                                   det_meta.json (threshold) and det_report.md beside it
+#   DET_DIR=$WORK/lora-runs/detector   the detector: best/ holds its weights; the boxes
+#                                   it finds go to val_detections.jsonl beside it
+#                                   (with det_meta.json: the threshold; det_report.md)
+#   BOXES=$DET_DIR/val_detections.jsonl   boxes made elsewhere: used as they are when
+#                                   there are no weights to make them from
 #   DET_THRESHOLD                   override the detector's score threshold
 #   MUSE_DETECT=0                   1: also let the base model find the cows by itself
 #                                   (the earlier test: 53% found) and stress that
@@ -46,7 +51,8 @@ WORK="${WORK:-/workspace}"
 ROOT="$WORK/cbvd5"
 ADAPTER="${ADAPTER:-$WORK/lora-runs/lora4frame_w1920/adapter}"
 LORA_NAME="${LORA_NAME:-lora4frame}"
-BOXES="${BOXES:-$WORK/lora-runs/detector/val_detections.jsonl}"
+DET_DIR="${DET_DIR:-$WORK/lora-runs/detector}"
+BOXES="${BOXES:-$DET_DIR/val_detections.jsonl}"
 DET_THRESHOLD="${DET_THRESHOLD:-}"
 MUSE_DETECT="${MUSE_DETECT:-0}"
 # The width and unit the adapter was trained at, from its run's train_meta.json
@@ -89,7 +95,7 @@ if [ -z "${COWTESTS_IN_TMUX:-}" ]; then
         echo "already running in tmux session '$SESSION':  bash $0 log"; exit 1
     fi
     knobs=""
-    for v in WORK ADAPTER LORA_NAME BOXES DET_THRESHOLD MUSE_DETECT WIDTH UNIT STREAMS INTERVAL DURATION PORT OUT; do
+    for v in WORK ADAPTER LORA_NAME DET_DIR BOXES DET_THRESHOLD MUSE_DETECT WIDTH UNIT STREAMS INTERVAL DURATION PORT OUT; do
         knobs+="$v=$(printf '%q' "${!v}") "
     done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
@@ -108,7 +114,7 @@ trap 'rc=$?; echo "!! line $LINENO failed (exit $rc): $BASH_COMMAND"' ERR
 trap 'rc=$?; echo "#### $(date +%H:%M:%S)  run_tests.sh exited with code $rc"' EXIT
 step() { echo; echo "=== $*   [$(date '+%Y-%m-%d %H:%M:%S')]"; }
 
-step "1/6  Dataset"
+step "1/7  Dataset"
 if [ -f "$ROOT/annotations/ava_val_v2.1.csv" ] && [ -d "$ROOT/labelframes/labelframes" ]; then
     echo "found: $ROOT"
 else
@@ -123,29 +129,67 @@ else
 fi
 echo "keyframes: $(find "$ROOT/labelframes" -name '*.jpg' | wc -l)"
 
-step "2/6  Adapter and the detector's boxes"
+step "2/7  Adapter"
 if [ ! -f "$ADAPTER/adapter_config.json" ] || [ ! -f "$ADAPTER/adapter_model.safetensors" ]; then
     echo "!! no adapter in $ADAPTER (adapter_config.json + adapter_model.safetensors)."
     echo "!! From a PC:  scp -P <port> -r <adapter folder> root@<ip>:$(dirname "$ADAPTER")/"
     exit 1
 fi
 ls -la "$ADAPTER"
-DET_DIR="$(dirname "$BOXES")"
-if [ ! -s "$BOXES" ] || [ ! -f "$DET_DIR/det_meta.json" ]; then
-    echo "!! no detections in $BOXES (+ det_meta.json beside it)."
-    echo "!! They come from run_lora.sh (step 9, RT-DETRv2), in lora-runs/detector on the"
-    echo "!! training pod. Only the small files are needed, not the weights:"
-    echo "!!   scp -P <port> detector/val_detections.jsonl detector/det_meta.json detector/det_report.md \\"
-    echo "!!       root@<ip>:$DET_DIR/"
+
+step "3/7  Cow detector (RT-DETRv2) on every val keyframe"
+# Its own venv: torch + transformers + scipy, ~4 GB, kept on $WORK. Not the
+# vLLM venv - vLLM pins its own transformers - and not yet there on a fresh pod.
+DET_VENV="$WORK/det/.venv"
+DET_PY="$DET_VENV/bin/python"
+det_env_ok() {
+    [ -x "$DET_PY" ] && "$DET_PY" -c "import torch, scipy, PIL, requests
+from transformers import RTDetrV2ForObjectDetection" 2>/dev/null
+}
+make_det_env() {
+    det_env_ok && return
+    echo "setting up the detector's Python in $DET_VENV (first time: a few minutes)"
+    if ! command -v uv >/dev/null 2>&1; then curl -LsSf https://astral.sh/uv/install.sh | sh; fi
+    export PATH="$HOME/.local/bin:$PATH"
+    uv self update >/dev/null 2>&1 || true
+    # A venv whose Python went with a pod restart (it lives under ~/.local)
+    # cannot be repaired in place; it is small enough to rebuild.
+    [ -x "$DET_PY" ] || rm -rf "$DET_VENV"
+    [ -d "$DET_VENV" ] || uv venv --python 3.12 --seed --managed-python "$DET_VENV"
+    uv pip install --python "$DET_PY" torch --torch-backend=auto
+    uv pip install --python "$DET_PY" "transformers>=5.15" scipy pillow requests safetensors
+    det_env_ok || { echo "!! the detector's venv does not import torch / transformers RT-DETRv2"; exit 1; }
+}
+if [ -f "$DET_DIR/best/det_train_meta.json" ]; then
+    make_det_env
+    # Before vLLM, which takes 95% of the card. When a server is already up,
+    # the detector goes to the GPU only if ~4 GB are still free, else to the CPU
+    # (a few minutes for 292 keyframes; its ms a frame is then a CPU number).
+    det_gpu=()
+    free_mib="$( { nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null || true; } | head -1 | tr -dc '0-9')"
+    if [ "${free_mib:-0}" -lt 4000 ]; then
+        echo "GPU busy (${free_mib:-?} MiB free) - running the detector on the CPU"
+        det_gpu=(env CUDA_VISIBLE_DEVICES=)
+    fi
+    "${det_gpu[@]}" "$DET_PY" "$HERE/detector.py" detect --root "$ROOT" --out "$DET_DIR"
+    "${det_gpu[@]}" "$DET_PY" "$HERE/detector.py" score --out "$DET_DIR"
+    BOXES="$DET_DIR/val_detections.jsonl"
+elif [ -s "$BOXES" ] && [ -f "$(dirname "$BOXES")/det_meta.json" ]; then
+    echo "no detector weights in $DET_DIR/best - using the boxes in $BOXES as they are"
+else
+    echo "!! no detector in $DET_DIR/best (and no ready boxes in $BOXES)."
+    echo "!! run_lora.sh trains it (step 9) into lora-runs/detector/best on the training pod."
+    echo "!! From a PC:  scp -P <port> -r <detector/best folder> root@<ip>:$DET_DIR/"
     exit 1
 fi
 mkdir -p "$OUT"
-cp "$DET_DIR/det_meta.json" "$OUT/"
-[ -f "$DET_DIR/det_report.md" ] && cp "$DET_DIR/det_report.md" "$OUT/" && cat "$DET_DIR/det_report.md"
+BOX_DIR="$(dirname "$BOXES")"
+cp "$BOX_DIR/det_meta.json" "$OUT/"
+if [ -f "$BOX_DIR/det_report.md" ]; then cp "$BOX_DIR/det_report.md" "$OUT/"; cat "$BOX_DIR/det_report.md"; fi
 BOX_ARGS=(--boxes "$BOXES")
 [ -n "$DET_THRESHOLD" ] && BOX_ARGS+=(--det-threshold "$DET_THRESHOLD")
 
-step "3/6  vLLM with the adapter"
+step "4/7  vLLM with the adapter"
 server_has_adapter() { curl -sf "$BASE_URL/v1/models" 2>/dev/null | grep -q "\"$LORA_NAME\""; }
 if server_has_adapter; then
     echo "already serving $LORA_NAME on $BASE_URL"
@@ -176,7 +220,7 @@ else
 fi
 curl -s "$BASE_URL/v1/models" | grep -o '"id": *"[^"]*"' | sed 's/"id": */  model: /'
 
-step "4/6  Python for the bench"
+step "5/7  Python for the bench"
 PY=""
 for cand in "$WORK/serving/.venv/bin/python" python3; do
     if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "import requests, PIL" 2>/dev/null; then
@@ -192,7 +236,7 @@ cd "$HERE"
 bench() { "$PY" cowbench.py --out "$OUT" "$@"; }
 [ -f "$OUT/manifest.jsonl" ] || cp "$PLAN/manifest.jsonl" "$PLAN/plan_meta.json" "$OUT/"
 
-step "5/6  Bench with the adapter on the detector's boxes"
+step "6/7  Bench with the adapter on the detector's boxes"
 # The same question run_lora.sh asked in eval-lora-det/ (transformers there,
 # vLLM here): the two should be close. Far apart, something in this setup
 # differs and the stress numbers below mean less.
@@ -205,12 +249,12 @@ bench score --vote
 bench report
 
 if [ "$MUSE_DETECT" = "1" ]; then
-    step "5b  The base model finding the cows by itself (with reasoning)"
+    step "6b  The base model finding the cows by itself (with reasoning)"
     bench detect --root "$ROOT" --base-url "$BASE_URL" --model muse-glimmer --concurrency 8
     bench detect-score
 fi
 
-step "6/6  $STREAMS cameras at once, on the detector's boxes"
+step "7/7  $STREAMS cameras at once, on the detector's boxes"
 stress() {   # skip a test whose report is already there
     local tag="$1"; shift
     if [ -f "$OUT/$tag.md" ]; then echo "done before: $OUT/$tag.md"; return; fi

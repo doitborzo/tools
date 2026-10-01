@@ -796,7 +796,7 @@ echo "  eval-lora/compare_*.md        paired comparisons against the zero-shot r
 if [ "$DETECTOR" = "1" ]; then
 echo "  eval-lora-det/report.md       the same on the detector's boxes - the farm's test"
 echo "  eval-lora-det/det_report.md   how many cows the detector found ($DET_OUT)"
-echo "  For the tests on the serving pod (cowbench/run_tests.sh) bring the detector's"
-echo "  $DETS and det_meta.json along with the adapter."
+echo "  For the tests on another pod (cowbench/run_tests.sh) bring $OUT/adapter"
+echo "  and $DET_OUT/best (the detector's weights, ~170 MB); run_tests.sh runs the detector itself."
 fi
 echo "Copy it back into cowbench/runs/ to keep it with the rest."

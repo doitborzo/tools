@@ -245,6 +245,7 @@ that match no annotated cow are answered too and kept in
 their track.
 
 `lora/run_lora.sh` trains the detector after the adapter (`DETECTOR=1`) and
-evaluates the adapter on its boxes in `eval-lora-det/`; `run_tests.sh` uses
-`BOXES=$WORK/lora-runs/detector/val_detections.jsonl` for the bench and the
-stress tests.
+evaluates the adapter on its boxes in `eval-lora-det/`. `run_tests.sh` runs
+the detector itself from `$WORK/lora-runs/detector/best` (in its own venv,
+`$WORK/det/.venv`, before vLLM takes the GPU) and uses its boxes for the bench
+and the stress tests; without the weights it takes ready boxes from `BOXES`.

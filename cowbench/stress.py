@@ -24,6 +24,7 @@ import concurrent.futures
 import datetime
 import json
 import os
+import sys
 import threading
 import time
 
@@ -65,6 +66,8 @@ def run(args, client_mod, jsonl_read):
     for (vid, ts), cows in frames.items():
         by_clip.setdefault(vid, []).append((ts, cows))
     clips = sorted(by_clip, key=lambda v: (-sum(len(c) for _, c in by_clip[v]), int(v)))
+    if not clips:
+        sys.exit(f"no cows to ask about: the boxes from the {boxes_from} hold none above the threshold")
     streams = [clips[i % len(clips)] for i in range(args.streams)]
     print(f"{args.streams} streams, task={args.task}, "
           f"{'as fast as possible' if not args.interval else f'one frame per {args.interval:g} s each'}, "
