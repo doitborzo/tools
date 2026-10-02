@@ -241,6 +241,7 @@ def run(args, client_mod, jsonl_read):
     summary = {
         "run_date": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "model": args.model, "vllm_version": info.get("vllm_version"), "server": info,
+        "base_model": info.get("base_model_root") or info.get("model_root"), "gpu": _gpu(),
         "task": args.task, "answer_now": args.answer_now, "streams": args.streams,
         "clips": streams, "interval": args.interval, "duration": args.duration,
         "warmup": args.warmup, "max_width": args.max_width, "boxes": boxes_from,
@@ -290,6 +291,16 @@ def run(args, client_mod, jsonl_read):
     print(f"-> {os.path.join(args.out, tag + '.md')}")
 
 
+def _gpu():
+    import subprocess
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=20).stdout.strip().splitlines()
+        return out[0] if out else None
+    except Exception:
+        return None
+
+
 def render_report(s) -> str:
     f = lambda v, d=1: "—" if v is None else f"{v:.{d}f}"
     mode = ("as fast as possible (next frame as soon as the last is answered)"
@@ -299,7 +310,10 @@ def render_report(s) -> str:
                  "detect": "one request per frame, finding the cows"}[s["task"]]
     lines = [
         f"# {s['streams']} cameras at once", "",
-        f"Model `{s['model']}` on vLLM {s.get('vllm_version') or '?'}, {s['run_date']}. "
+        f"Model `{s['model']}`"
+        + (f" on `{s['base_model']}`" if s.get("base_model") and s.get("base_model") != s["model"] else "")
+        + f", vLLM {s.get('vllm_version') or '?'}" + (f", {s['gpu']}" if s.get("gpu") else "")
+        + f", {s['run_date']}. "
         f"Task `{s['task']}` ({per_frame}"
         + (", answer prefilled, no reasoning" if s["answer_now"] else "") + f"), "
         f"max width {s['max_width']} px. {mode}. Measured {s['duration']:g} s after "

@@ -10,9 +10,22 @@
 
 set -euo pipefail
 
-MODEL="RedHatAI/Muse-Glimmer-30B-FP8-block"
+# Which checkpoint: QUANT picks one, MODEL=<repo or path> overrides it.
+#   fp8           RedHatAI/Muse-Glimmer-30B-FP8-block   W8A8 FP8 (the one the adapters were checked on)
+#   nvfp4         RedHatAI/Muse-Glimmer-30B-NVFP4       W4A4 NVFP4, compressed-tensors, vision tower in BF16
+#   nvfp4-nvidia  nvidia/Muse-Glimmer-30B-NVFP4         mixed NVFP4 W4A16 / FP8 per layer (ModelOpt AutoQuantize)
+# NVFP4 runs natively only on Blackwell (sm_100 B200/B300, sm_120 RTX PRO 6000,
+# sm_121 DGX Spark); elsewhere vLLM falls back to weight-only kernels, slower.
+QUANT="${QUANT:-fp8}"
+case "$QUANT" in
+    fp8)          DEFAULT_MODEL="RedHatAI/Muse-Glimmer-30B-FP8-block" ;;
+    nvfp4)        DEFAULT_MODEL="RedHatAI/Muse-Glimmer-30B-NVFP4" ;;
+    nvfp4-nvidia) DEFAULT_MODEL="nvidia/Muse-Glimmer-30B-NVFP4" ;;
+    *) echo "QUANT must be fp8, nvfp4 or nvfp4-nvidia (or set MODEL=...)"; exit 2 ;;
+esac
+MODEL="${MODEL:-$DEFAULT_MODEL}"
 SERVED_NAME="muse-glimmer"
-PORT=8000
+PORT="${PORT:-8000}"
 GPUS="0"
 MAX_MODEL_LEN=131072
 # LoRA adapters as name=path, space-separated; cowbench/run_tests.sh sets it.
@@ -285,6 +298,12 @@ PY
     fi
 fi
 python -c "import vllm, torch; print('vllm', vllm.__version__, '| torch', torch.__version__, '| arch', torch.cuda.get_arch_list())"
+gpu_cc="$(python -c "import torch; print('%d%d' % torch.cuda.get_device_capability())" 2>/dev/null || echo 0)"
+echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1) (sm_$gpu_cc)  model: $MODEL"
+if [ "${QUANT#nvfp4}" != "$QUANT" ] && [ "$gpu_cc" -lt 100 ]; then
+    echo "!! $MODEL is NVFP4 and this GPU (sm_$gpu_cc) has no FP4 tensor cores: vLLM will"
+    echo "!! run it with weight-only fallback kernels - it works, but it is no speed test."
+fi
 
 echo "=============================================================="
 echo " 5/6  Model"
