@@ -176,7 +176,7 @@ step "3/7  Cow detector (RT-DETRv2) on every val keyframe"
 DET_VENV="$WORK/det/.venv"
 DET_PY="$DET_VENV/bin/python"
 det_env_ok() {
-    [ -x "$DET_PY" ] && "$DET_PY" -c "import torch, scipy, PIL, requests
+    [ -x "$DET_PY" ] && "$DET_PY" -c "import torch, torchvision, scipy, PIL, requests
 from transformers import RTDetrV2ForObjectDetection" 2>/dev/null
 }
 make_det_env() {
@@ -189,7 +189,8 @@ make_det_env() {
     # cannot be repaired in place; it is small enough to rebuild.
     [ -x "$DET_PY" ] || rm -rf "$DET_VENV"
     [ -d "$DET_VENV" ] || uv venv --python 3.12 --seed --managed-python "$DET_VENV"
-    uv pip install --python "$DET_PY" torch --torch-backend=auto
+    # torchvision: transformers' fast RT-DETR image processor needs it.
+    uv pip install --python "$DET_PY" torch torchvision --torch-backend=auto
     uv pip install --python "$DET_PY" "transformers>=5.15" scipy pillow requests safetensors
     det_env_ok || { echo "!! the detector's venv does not import torch / transformers RT-DETRv2"; exit 1; }
 }
@@ -232,7 +233,7 @@ gpu_total="$(gpu_mib total)"
 if [ -z "$GPU_MEM_UTIL" ]; then
     GPU_MEM_UTIL=0.95
     [ -n "$gpu_total" ] && GPU_MEM_UTIL="$(awk -v t="$gpu_total" -v r="$DET_RESERVE_MIB" \
-        'BEGIN { u = int(100 * (t - r - 512) / t) / 100; if (u > 0.95) u = 0.95; printf "%.2f", u }')"
+        'BEGIN { u = int(100 * (t - r - 1536) / t) / 100; if (u > 0.95) u = 0.95; printf "%.2f", u }')"
 fi
 echo "vLLM gets ${GPU_MEM_UTIL} of ${gpu_total:-?} MiB"
 server_has_adapter() { curl -sf "$BASE_URL/v1/models" 2>/dev/null | grep -q "\"$LORA_NAME\""; }
@@ -242,6 +243,27 @@ serves_model() { curl -sf "$BASE_URL/v1/models" 2>/dev/null | grep -qE "\"root\"
 room_for_detector() {   # true too without nvidia-smi: nothing to measure there
     local free; free="$(gpu_mib free)"
     [ "$LIVE" != 1 ] || [ -z "$free" ] || [ "$free" -ge "$DET_RESERVE_MIB" ]
+}
+start_vllm() {
+    rm -f "$WORK/vllm.exit"
+    # lora_muse.sh may ask "Continue anyway?" about open files; that concerns
+    # data-parallel, which one GPU does not use, so the answer is yes.
+    tmux new-session -d -s vllm -x 200 -y 50 \
+        "yes y | env LORA_MODULES=$(printf '%q' "$LORA_NAME=$ADAPTER") GPU_MEM_UTIL=$GPU_MEM_UTIL QUANT=$QUANT MODEL=$(printf '%q' "$MODEL") bash $(printf '%q' "$REPO/lora_muse.sh") 2>&1 | tee -a $WORK/vllm.log; echo \$? > $WORK/vllm.exit; exec bash"
+    echo "starting vLLM in tmux session 'vllm' (log: $WORK/vllm.log)."
+    echo "First start installs vLLM and downloads $MODEL (20-35 GB): up to an hour."
+    t0=$SECONDS
+    until server_has_adapter && serves_model; do
+        if [ -f "$WORK/vllm.exit" ]; then
+            echo; echo "!! vLLM stopped. Last lines of $WORK/vllm.log:"; tail -30 "$WORK/vllm.log"; exit 1
+        fi
+        if [ $((SECONDS - t0)) -gt 5400 ]; then
+            echo; echo "!! vLLM not up after 90 min - see: tmux attach -t vllm"; exit 1
+        fi
+        printf '\r  waiting %4d s   %s' $((SECONDS - t0)) "$(tail -c 300 "$WORK/vllm.log" 2>/dev/null | tr '\r\n' '  ' | tail -c 90)"
+        sleep 20
+    done
+    echo
 }
 if server_has_adapter && serves_model && room_for_detector; then
     echo "already serving $LORA_NAME on $MODEL at $BASE_URL, $(gpu_mib free) MiB free for the detector"
@@ -265,27 +287,21 @@ else
         tmux kill-session -t vllm
         sleep 10   # the GPU memory is released when the process is gone
     fi
-    rm -f "$WORK/vllm.exit"
-    # lora_muse.sh may ask "Continue anyway?" about open files; that concerns
-    # data-parallel, which one GPU does not use, so the answer is yes.
-    tmux new-session -d -s vllm -x 200 -y 50 \
-        "yes y | env LORA_MODULES=$(printf '%q' "$LORA_NAME=$ADAPTER") GPU_MEM_UTIL=$GPU_MEM_UTIL QUANT=$QUANT MODEL=$(printf '%q' "$MODEL") bash $(printf '%q' "$REPO/lora_muse.sh") 2>&1 | tee -a $WORK/vllm.log; echo \$? > $WORK/vllm.exit; exec bash"
-    echo "starting vLLM in tmux session 'vllm' (log: $WORK/vllm.log)."
-    echo "First start installs vLLM and downloads $MODEL (20-35 GB): up to an hour."
-    t0=$SECONDS
-    until server_has_adapter && serves_model; do
-        if [ -f "$WORK/vllm.exit" ]; then
-            echo; echo "!! vLLM stopped. Last lines of $WORK/vllm.log:"; tail -30 "$WORK/vllm.log"; exit 1
-        fi
-        if [ $((SECONDS - t0)) -gt 5400 ]; then
-            echo; echo "!! vLLM not up after 90 min - see: tmux attach -t vllm"; exit 1
-        fi
-        printf '\r  waiting %4d s   %s' $((SECONDS - t0)) "$(tail -c 300 "$WORK/vllm.log" 2>/dev/null | tr '\r\n' '  ' | tail -c 90)"
-        sleep 20
-    done
-    echo
+    start_vllm
 fi
-echo "GPU memory free next to vLLM: $(gpu_mib free) MiB"
+# vLLM can take more than its share (CUDA context, graphs): on an RTX PRO 6000
+# at 0.95 the detector then found no room at all. Measure, and give vLLM less.
+for retry in 1 2; do
+    if room_for_detector || ! tmux has-session -t vllm 2>/dev/null; then break; fi
+    free="$(gpu_mib free)"
+    GPU_MEM_UTIL="$(awk -v u="$GPU_MEM_UTIL" -v t="$gpu_total" -v f="$free" -v r="$DET_RESERVE_MIB" \
+        'BEGIN { d = (r - f + 1024) / t; d = int(d * 100 + 0.999) / 100; printf "%.2f", u - d }')"
+    echo "only $free MiB free next to vLLM, $DET_RESERVE_MIB needed - restarting it at $GPU_MEM_UTIL"
+    tmux kill-session -t vllm
+    sleep 10
+    start_vllm
+done
+echo "GPU memory free next to vLLM: $(gpu_mib free) MiB (vLLM at $GPU_MEM_UTIL)"
 curl -s "$BASE_URL/v1/models" | grep -o '"id": *"[^"]*"' | sed 's/"id": */  model: /'
 
 step "5/7  Python for the bench"
