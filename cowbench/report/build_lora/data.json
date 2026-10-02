@@ -1,0 +1,38 @@
+{
+  "_source": "summary.md of the five runs (cowbench/summary.py), the lora4frame reports and stress reports; val = ava_val, 2532 cows, 292 keyframes, 50 clips",
+  "configs": [
+    {"key": "base_cow896",   "name": "Базова модель, по корові, 896 px, без міркувань", "short": "База, по корові, 896 px",
+     "exact": 0.356, "posture": 0.164, "activity": 0.249, "nr_exact": 0.241, "nr_activity": 0.115, "vote": 0.329},
+    {"key": "zeroshot1920",  "name": "Базова модель, по корові, 1920 px, з міркуваннями", "short": "База, по корові, 1920 px, міркування",
+     "exact": 0.293, "posture": 0.074, "activity": 0.254, "nr_exact": null, "nr_activity": null, "vote": null},
+    {"key": "base_frame1920","name": "Базова модель, весь кадр, 1920 px, без міркувань", "short": "База, весь кадр, 1920 px",
+     "exact": 0.325, "posture": 0.131, "activity": 0.244, "nr_exact": null, "nr_activity": null, "vote": 0.317},
+    {"key": "lora1", "name": "1. lora_w896", "short": "1. lora_w896",
+     "exact": 0.440, "posture": 0.019, "activity": 0.425, "nr_exact": 0.347, "nr_activity": 0.329, "vote": 0.431},
+    {"key": "lora2", "name": "2. lora2_w896", "short": "2. lora2_w896",
+     "exact": 0.459, "posture": 0.018, "activity": 0.444, "nr_exact": 0.370, "nr_activity": 0.353, "vote": 0.464},
+    {"key": "lora3", "name": "3. lora2pose_w896", "short": "3. lora2pose_w896",
+     "exact": 0.263, "posture": 0.038, "activity": 0.233, "nr_exact": 0.131, "nr_activity": 0.096, "vote": 0.251},
+    {"key": "lora4", "name": "4. lora3norum_w1920", "short": "4. lora3norum_w1920",
+     "exact": 0.219, "posture": 0.013, "activity": 0.207, "nr_exact": 0.080, "nr_activity": 0.065, "vote": 0.207},
+    {"key": "lora5", "name": "5. lora4frame_w1920", "short": "5. lora4frame_w1920",
+     "exact": 0.250, "posture": 0.020, "activity": 0.233, "nr_exact": 0.116, "nr_activity": 0.096, "vote": 0.241,
+     "nr_note": "computed by hand from the confusion matrix in eval-lora/report.md (the summary of this run predates the column)"}
+  ],
+  "pipeline": [
+    {"name": "Рамки з розмітки (transformers)", "exact": 0.250, "posture": 0.020, "activity": 0.233, "missed": 0},
+    {"name": "Рамки RT-DETRv2 (transformers)", "exact": 0.454, "posture": 0.263, "activity": 0.449, "missed": 647},
+    {"name": "Рамки RT-DETRv2 через vLLM (run_tests)", "exact": 0.453, "posture": 0.263, "activity": 0.448, "missed": 647},
+    {"name": "Лише знайдені корови (1885, розрахунок)", "exact": 0.266, "posture": 0.010, "activity": 0.260, "missed": null}
+  ],
+  "detector": {"model": "PekingU/rtdetr_v2_r50vd", "size": 960, "threshold": 0.4,
+    "iou05": {"found": 1885, "extra": 593, "missed": 647, "recall": 0.744, "precision": 0.761},
+    "iou03": {"found": 2122, "extra": 356, "missed": 410, "recall": 0.838, "precision": 0.856},
+    "by_size": [0.510, 0.720, 0.791, 0.956], "ms_per_frame": 294.2},
+  "stress": [
+    {"mode": "Якнайшвидше", "fps": 1.13, "p50": 8.8, "p90": 19.7, "p99": 35.0, "det_ms": 97, "cows": 13.2, "keeps": null},
+    {"mode": "Кадр раз на 10 с з кожної камери", "fps": 1.16, "p50": 8.7, "p90": 11.8, "p99": 12.7, "det_ms": 375, "cows": 13.9,
+     "keeps": false, "over": 80, "frames": 349, "late_max": 53.0}
+  ],
+  "earlier": {"per_cow_update_s": 77, "lora4_at_896_exact": 0.304, "pose638_vllm": [0.233, 0.022, 0.215]}
+}
