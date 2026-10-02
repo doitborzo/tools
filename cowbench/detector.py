@@ -240,11 +240,26 @@ class Live:
         from transformers import RTDetrV2ForObjectDetection
         with open(os.path.join(best_dir, "det_train_meta.json"), encoding="utf-8") as fh:
             meta = json.load(fh)
+        import torch
         self.processor = processor_for(best_dir, meta["size"])
-        self.model = RTDetrV2ForObjectDetection.from_pretrained(best_dir).to(device()).eval()
+        model = RTDetrV2ForObjectDetection.from_pretrained(best_dir)
+        dev = device()
+        try:
+            model = model.to(dev)
+        except Exception as e:   # OutOfMemoryError, or AcceleratorError on newer torch
+            # The GPU is shared with vLLM; with no room left, the camera test
+            # still runs - on the CPU, which the report then says.
+            if dev.type != "cuda" or "out of memory" not in str(e).lower():
+                raise
+            print(f"!! no GPU memory left for the detector ({e.__class__.__name__}) - running it on the CPU",
+                  flush=True)
+            torch.cuda.empty_cache()
+            dev = torch.device("cpu")
+            model = model.to(dev)
+        self.model = model.eval()
         self.threshold = meta["threshold"] if threshold is None else threshold
         self.name = meta["base_model"]
-        self.device = str(device())
+        self.device = str(dev)
         self._lock = threading.Lock()
 
     def __call__(self, img):
