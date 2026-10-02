@@ -187,7 +187,9 @@ def cmd_run(args):
     meta = {
         "run_date": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "model": args.model,
-        "model_repo": info.get("model_root") or args.model_repo or args.model,
+        "model_repo": info.get("base_model_root") or info.get("model_root") or args.model_repo or args.model,
+        "adapter": info.get("adapter_root"),
+        "gpu": local_gpu(),
         "quantization": args.quantization,
         "vllm_version": info.get("vllm_version"),
         "server": info,
@@ -286,6 +288,17 @@ def cmd_run(args):
         out_fh.close()
         print()
     print("-> {}".format(results_path))
+
+
+def local_gpu():
+    """The GPU of this machine (the server's, when run on the pod), for the record."""
+    import subprocess
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=20).stdout.strip().splitlines()
+        return out[0] if out else None
+    except Exception:
+        return None
 
 
 # -------------------------------------------------------------------- score

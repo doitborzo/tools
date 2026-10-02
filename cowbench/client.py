@@ -122,6 +122,13 @@ class MuseClient:
                 info["served_model_id"] = entry.get("id")
                 info["model_root"] = entry.get("root")
                 info["max_model_len"] = entry.get("max_model_len")
+                # A LoRA's root is the adapter's path; the checkpoint it runs
+                # on is its parent's root.
+                parent = next((m for m in models.get("data", [])
+                               if entry.get("parent") and m.get("id") == entry.get("parent")), None)
+                if parent and parent is not entry:
+                    info["adapter_root"] = entry.get("root")
+                    info["base_model_root"] = parent.get("root")
         except Exception as exc:  # the run is still valid without provenance
             info["models_endpoint_error"] = str(exc)
         try:

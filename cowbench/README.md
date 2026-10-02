@@ -263,3 +263,21 @@ whole. The report gives the detector's own ms a frame beside the totals.
 `label/` pre-labels an unannotated video (OWLv2 or the trained RT-DETRv2,
 tracks, optionally Muse), hands it to CVAT for a person to correct, and turns
 CVAT's export into CBVD-5's format: see [label/README.md](label/README.md).
+
+## Other checkpoints and GPUs: FP8 vs NVFP4
+
+`../lora_muse.sh` serves `QUANT=fp8` (RedHatAI FP8-block, the default),
+`nvfp4` (RedHatAI W4A4 NVFP4, compressed-tensors) or `nvfp4-nvidia` (NVIDIA's
+mixed NVFP4 W4A16 / FP8), or `MODEL=<repo>`. `run_tests.sh` takes the same
+`QUANT`, restarts its vLLM when it serves another checkpoint, and names its
+results `tests_<lora>_w<width>_det_<quant>_<gpu>`.
+
+    bash cowbench/run_quant_compare.sh            # QUANTS="nvfp4 fp8" by default
+
+runs the whole test (bench on the detector's boxes, 12 cameras with the
+detector live) on each checkpoint in turn and writes `runs/quant_<gpu>_<date>/`:
+one folder per checkpoint, `summary.md` (errors and camera throughput side by
+side) and `compare_<a>_vs_<b>.md` (paired, cow by cow). NVFP4 is native on
+Blackwell only (B200/B300 sm_100, RTX PRO 6000 sm_120). The adapter was
+trained on BF16 weights, so on a 4-bit base the paired comparison is what
+says whether it still holds.

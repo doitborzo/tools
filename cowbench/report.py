@@ -18,6 +18,10 @@ DATASET_PAPER = "https://www.nature.com/articles/s41598-024-65953-x"
 QUANTIZATION = {
     "RedHatAI/Muse-Glimmer-30B-FP8-block":
         "FP8 block-wise (W8A8, compressed-tensors); KV cache: auto (bf16)",
+    "RedHatAI/Muse-Glimmer-30B-NVFP4":
+        "NVFP4 (W4A4, group 16, compressed-tensors), vision tower BF16; KV cache: auto (bf16)",
+    "nvidia/Muse-Glimmer-30B-NVFP4":
+        "mixed NVFP4 W4A16 / FP8 W8A8 per layer (ModelOpt AutoQuantize); KV cache: auto (bf16)",
 }
 
 
@@ -76,6 +80,8 @@ def render(meta: dict, metrics: dict, results=None) -> str:
     add("|---|---|")
     add(f"| Model | `{model_repo}` |")
     add(f"| Served as | `{meta.get('model')}` |")
+    if meta.get("gpu"):
+        add(f"| GPU | {meta['gpu']} |")
     add(f"| Quantization | {quant} |")
     add(f"| Test date | {meta.get('run_date')} |")
     add(f"| Dataset | [{DATASET_NAME}]({DATASET_URL}) — [paper]({DATASET_PAPER}) |")
@@ -110,6 +116,8 @@ def render(meta: dict, metrics: dict, results=None) -> str:
                   else f"reasoning {meta['reasoning']}, no json_schema")
         add(f"| Sampling | temperature={meta.get('temperature')}, seed={meta.get('seed')}, "
             f"max_tokens={meta.get('max_tokens')}, {output} |")
+        if meta.get("adapter"):
+            add(f"| Adapter | `{meta['adapter']}` |")
     frames = meta.get("frames") or 1
     temporal = ("annotated keyframe only (single still)" if frames <= 1
                 else f"{frames} frames over {meta.get('span')}s from the clip")

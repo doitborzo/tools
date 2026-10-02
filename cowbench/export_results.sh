@@ -6,6 +6,7 @@
 #   lora-runs/base_w*/    the untouched model's eval (the control)
 #   lora-runs/detector/   RT-DETRv2 weights (best/, ~170 MB), detections, report
 #   cowbench/runs/tests_* run_tests.sh results (bench + stress reports)
+#   cowbench/runs/quant_* run_quant_compare.sh results, one folder per checkpoint
 #   summary.md            every eval's error rates in one table
 #
 # Left out, as too big to be worth copying: the trainer's resume checkpoints
@@ -49,7 +50,8 @@ def add(path):
                  m["exact_match"]["error_rate"], m["posture"]["error_rate"], m["activity"]["error_rate"],
                  m.get("n_missed_by_detector", 0)))
 for pat in (os.path.join(runs, "*", "metrics*.json"), os.path.join(runs, "*", "*", "metrics*.json"),
-            os.path.join(bench_runs, "tests_*", "metrics*.json")):
+            os.path.join(bench_runs, "tests_*", "metrics*.json"),
+            os.path.join(bench_runs, "quant_*", "*", "metrics*.json")):
     for p in sorted(glob.glob(pat)):
         add(p)
 print("# Results\n")
@@ -63,7 +65,8 @@ if os.path.exists(det):
     i5 = d.get("iou0.5", {})
     print(f"\nDetector: recall {i5.get('recall', 0):.1%}, precision {i5.get('precision', 0):.1%} "
           f"at IoU 0.5; {d.get('ms_per_frame')} ms a frame.")
-stress = sorted(glob.glob(os.path.join(bench_runs, "tests_*", "stress_*.json")))
+stress = sorted(glob.glob(os.path.join(bench_runs, "tests_*", "stress_*.json"))
+                + glob.glob(os.path.join(bench_runs, "quant_*", "*", "stress_*.json")))
 if stress:
     print("\n| stress test | frames/s all cameras | frame latency p50 / p90, s | keeps up |")
     print("|---|---|---|---|")
@@ -85,7 +88,7 @@ parts=(-C "$WORK" lora-runs -C "$STAGE" summary.md)
 tests=()
 if [ -d "$HERE/runs" ]; then
     while IFS= read -r d; do tests+=("$(basename "$d")"); done \
-        < <(find "$HERE/runs" -maxdepth 1 -type d -name 'tests_*' | sort)
+        < <(find "$HERE/runs" -maxdepth 1 -type d \( -name 'tests_*' -o -name 'quant_*' \) | sort)
 fi
 [ "${#tests[@]}" -gt 0 ] && parts+=(-C "$HERE/runs" "${tests[@]}")
 

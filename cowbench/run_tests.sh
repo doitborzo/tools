@@ -25,6 +25,10 @@
 #
 # Knobs, all optional:
 #   WORK=/workspace                 where the dataset, adapter and results live
+#   QUANT=fp8                       the checkpoint vLLM serves (../lora_muse.sh): fp8,
+#                                   nvfp4 (RedHatAI W4A4) or nvfp4-nvidia (mixed W4A16/FP8);
+#                                   MODEL=<repo> for any other. A running vLLM serving
+#                                   another checkpoint is restarted
 #   ADAPTER=$WORK/lora-runs/lora4frame_w1920/adapter
 #   LORA_NAME=lora4frame            the adapter's model name on the server
 #   DET_DIR=$WORK/lora-runs/detector   the detector: best/ holds its weights; the boxes
@@ -47,7 +51,7 @@
 #   STREAMS=12                      cameras in the stress tests
 #   INTERVAL=10                     seconds between frames per camera, paced test
 #   DURATION=300                    seconds measured per stress test
-#   OUT=<repo>/cowbench/runs/tests_<LORA_NAME>_w<WIDTH>_det   results
+#   OUT=<repo>/cowbench/runs/tests_<LORA_NAME>_w<WIDTH>_det_<QUANT>_<gpu>   results
 #   PORT=8000
 
 set -euo pipefail
@@ -56,6 +60,25 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "$HERE")"
 WORK="${WORK:-/workspace}"
 ROOT="$WORK/cbvd5"
+QUANT="${QUANT:-fp8}"
+case "$QUANT" in   # as in ../lora_muse.sh
+    fp8)          MODEL="${MODEL:-RedHatAI/Muse-Glimmer-30B-FP8-block}" ;;
+    nvfp4)        MODEL="${MODEL:-RedHatAI/Muse-Glimmer-30B-NVFP4}" ;;
+    nvfp4-nvidia) MODEL="${MODEL:-nvidia/Muse-Glimmer-30B-NVFP4}" ;;
+    *) echo "QUANT must be fp8, nvfp4 or nvfp4-nvidia"; exit 2 ;;
+esac
+# A short name of this machine's GPU for the results folder.
+gpu_tag() {
+    local name
+    name="$( { nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || true; } | head -1)"
+    case "$name" in
+        *"RTX PRO 6000"*) echo rtxpro6000 ;;
+        *A100*) echo a100 ;; *H100*) echo h100 ;; *H200*) echo h200 ;;
+        *B200*) echo b200 ;; *B300*) echo b300 ;; *L40S*) echo l40s ;;
+        "") echo nogpu ;;
+        *) echo "$name" | tr 'A-Z' 'a-z' | sed 's/nvidia//; s/[^a-z0-9]//g' | cut -c1-16 ;;
+    esac
+}
 ADAPTER="${ADAPTER:-$WORK/lora-runs/lora4frame_w1920/adapter}"
 LORA_NAME="${LORA_NAME:-lora4frame}"
 DET_DIR="${DET_DIR:-$WORK/lora-runs/detector}"
@@ -82,7 +105,7 @@ STREAMS="${STREAMS:-12}"
 INTERVAL="${INTERVAL:-10}"
 DURATION="${DURATION:-300}"
 PORT="${PORT:-8000}"
-OUT="${OUT:-$HERE/runs/tests_${LORA_NAME}_w${WIDTH}_det}"
+OUT="${OUT:-$HERE/runs/tests_${LORA_NAME}_w${WIDTH}_det_${QUANT}_$(gpu_tag)}"
 BASE_URL="http://127.0.0.1:$PORT"
 PLAN="$HERE/runs/2026-09-25_val-full_w1920_f1"   # the full-val sample every run used
 SESSION=cowtests
@@ -105,7 +128,7 @@ if [ -z "${COWTESTS_IN_TMUX:-}" ]; then
         echo "already running in tmux session '$SESSION':  bash $0 log"; exit 1
     fi
     knobs=""
-    for v in WORK ADAPTER LORA_NAME DET_DIR BOXES DET_THRESHOLD MUSE_DETECT DET_RESERVE_MIB GPU_MEM_UTIL LIVE WIDTH UNIT STREAMS INTERVAL DURATION PORT OUT; do
+    for v in WORK QUANT MODEL ADAPTER LORA_NAME DET_DIR BOXES DET_THRESHOLD MUSE_DETECT DET_RESERVE_MIB GPU_MEM_UTIL LIVE WIDTH UNIT STREAMS INTERVAL DURATION PORT OUT; do
         knobs+="$v=$(printf '%q' "${!v}") "
     done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
@@ -213,19 +236,28 @@ if [ -z "$GPU_MEM_UTIL" ]; then
 fi
 echo "vLLM gets ${GPU_MEM_UTIL} of ${gpu_total:-?} MiB"
 server_has_adapter() { curl -sf "$BASE_URL/v1/models" 2>/dev/null | grep -q "\"$LORA_NAME\""; }
+# The adapter alone is not enough: the same adapter on another checkpoint is
+# another test. vLLM reports the checkpoint as the base model's "root".
+serves_model() { curl -sf "$BASE_URL/v1/models" 2>/dev/null | grep -qE "\"root\": *\"$MODEL\""; }
 room_for_detector() {   # true too without nvidia-smi: nothing to measure there
     local free; free="$(gpu_mib free)"
     [ "$LIVE" != 1 ] || [ -z "$free" ] || [ "$free" -ge "$DET_RESERVE_MIB" ]
 }
-if server_has_adapter && room_for_detector; then
-    echo "already serving $LORA_NAME on $BASE_URL, $(gpu_mib free) MiB free for the detector"
-elif server_has_adapter && ! tmux has-session -t vllm 2>/dev/null; then
+if server_has_adapter && serves_model && room_for_detector; then
+    echo "already serving $LORA_NAME on $MODEL at $BASE_URL, $(gpu_mib free) MiB free for the detector"
+elif server_has_adapter && ! serves_model && ! tmux has-session -t vllm 2>/dev/null; then
+    echo "!! $BASE_URL serves $LORA_NAME on another checkpoint than $MODEL, from a vLLM this"
+    echo "!! script did not start. Stop it and rerun - this script then starts its own."
+    exit 1
+elif server_has_adapter && serves_model && ! tmux has-session -t vllm 2>/dev/null; then
     echo "!! $LORA_NAME is served by a vLLM this script did not start, and only $(gpu_mib free) MiB"
     echo "!! are free: the live detector may not fit. Restart that server with"
     echo "!! GPU_MEM_UTIL=$GPU_MEM_UTIL, or stop it and rerun - this script then starts its own."
 else
     if tmux has-session -t vllm 2>/dev/null; then
-        if server_has_adapter; then
+        if server_has_adapter && ! serves_model; then
+            echo "the tmux session 'vllm' serves another checkpoint, not $MODEL - restarting it"
+        elif server_has_adapter; then
             echo "the tmux session 'vllm' leaves only $(gpu_mib free) MiB for the detector - restarting it"
         else
             echo "a tmux session 'vllm' exists but does not serve $LORA_NAME - restarting it"
@@ -237,11 +269,11 @@ else
     # lora_muse.sh may ask "Continue anyway?" about open files; that concerns
     # data-parallel, which one GPU does not use, so the answer is yes.
     tmux new-session -d -s vllm -x 200 -y 50 \
-        "yes y | env LORA_MODULES=$(printf '%q' "$LORA_NAME=$ADAPTER") GPU_MEM_UTIL=$GPU_MEM_UTIL bash $(printf '%q' "$REPO/lora_muse.sh") 2>&1 | tee -a $WORK/vllm.log; echo \$? > $WORK/vllm.exit; exec bash"
+        "yes y | env LORA_MODULES=$(printf '%q' "$LORA_NAME=$ADAPTER") GPU_MEM_UTIL=$GPU_MEM_UTIL QUANT=$QUANT MODEL=$(printf '%q' "$MODEL") bash $(printf '%q' "$REPO/lora_muse.sh") 2>&1 | tee -a $WORK/vllm.log; echo \$? > $WORK/vllm.exit; exec bash"
     echo "starting vLLM in tmux session 'vllm' (log: $WORK/vllm.log)."
-    echo "First start installs vLLM and downloads the model (~33 GB): up to an hour."
+    echo "First start installs vLLM and downloads $MODEL (20-35 GB): up to an hour."
     t0=$SECONDS
-    until server_has_adapter; do
+    until server_has_adapter && serves_model; do
         if [ -f "$WORK/vllm.exit" ]; then
             echo; echo "!! vLLM stopped. Last lines of $WORK/vllm.log:"; tail -30 "$WORK/vllm.log"; exit 1
         fi
