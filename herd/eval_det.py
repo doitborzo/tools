@@ -103,10 +103,12 @@ def main(argv=None):
     p.add_argument("--root", default="/workspace/cbvd5")
     p.add_argument("--iou", type=float, default=0.5)
     p.add_argument("--out", default=None, help="default <run>/eval-val-det")
+    p.add_argument("--tiles", type=int, default=None,
+                   help="1: whole frame + square tiles (far cows ~1.8x wider); default: as the detector was trained")
+    p.add_argument("--sweep-from", type=float, default=0.15, help="lowest threshold of the sweep")
     args = p.parse_args(argv)
 
     import torch
-    from PIL import Image
     import detector as det_mod
     from model import FrameEncoder, HerdModel, box_pos
     from cbvd_bursts import cbvd_frame
@@ -117,20 +119,24 @@ def main(argv=None):
     feat = ck.get("features", {})
     size, margin = feat.get("crop", 224), feat.get("margin", 0.1)
     enc = FrameEncoder(feat.get("encoder", "facebook/dinov2-small"), feat.get("grid", 2)).to(dev).eval()
-    det = det_mod.Live(args.detector, args.threshold)
+    meta = json.load(open(os.path.join(args.detector, "det_train_meta.json"), encoding="utf-8"))
+    threshold = meta["threshold"] if args.threshold is None else args.threshold
+    sweep = sorted({round(t, 2) for t in np.arange(args.sweep_from, 0.651, 0.05)} | {round(threshold, 2)})
+    # one pass at the lowest cut-off of the sweep: every box classified once, then cut per threshold
+    det = det_mod.Live(args.detector, min(sweep), tiles=args.tiles)
     out_dir = args.out or os.path.join(args.run, "eval-val-det")
     os.makedirs(out_dir, exist_ok=True)
 
     frames = val_keyframes(args.root)
     print(f"[eval-det] {len(frames)} val keyframes, {sum(len(v) for v in frames.values())} annotated cows; "
-          f"detector {det.name} on {det.device}, threshold {det.threshold}", flush=True)
-    records, found, extras, det_ms = [], {}, 0, []
-    for n, ((clip, ts), gts) in enumerate(frames.items(), 1):
+          f"detector {det.name} on {det.device}, threshold {threshold}{', tiles' if det.tiles else ''}", flush=True)
+    seen, det_ms = {}, []                                # (clip, ts) -> [(box, score, posture, activity)]
+    for n, (clip, ts) in enumerate(frames, 1):
         img = cbvd_frame(args.root, clip, ts)
         t = time.perf_counter()
-        boxes = [c["bbox"] for c in det(img)]
+        dets = det(img)
         det_ms.append((time.perf_counter() - t) * 1000)
-        found[(clip, ts)] = boxes
+        boxes = [c["bbox"] for c in dets]
         answers = []
         if boxes:
             arr = np.asarray(img)
@@ -139,22 +145,38 @@ def main(argv=None):
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev.type == "cuda"):
                     f = enc(x).float()
                 o = model.frame(f, torch.tensor([box_pos(b) for b in boxes], device=dev).float())
-            answers = [(POSTURES[int(a)], ACTIVITIES[int(b)]) for a, b in
-                       zip(o["posture"].argmax(-1).tolist(), o["activity"].argmax(-1).tolist())]
-        pairs = detect_mod.match(boxes, [g["bbox"] for g in gts], args.iou)
-        by_gt = {j: (i, v) for i, j, v in pairs}
-        for j, g in enumerate(gts):
-            if j in by_gt:
-                i, v = by_gt[j]
-                records.append(dict(g, posture=answers[i][0], activity=answers[i][1], det_bbox=boxes[i],
-                                    det_iou=round(v, 3)))
-            else:
-                records.append(dict(g, posture=None, activity=None, missed_by_detector=True,
-                                    parse_error="not found by the detector"))
-        extras += len(boxes) - len(pairs)
-        print(f"\r  {n}/{len(frames)} frames, {sum(1 for r in records if r.get('missed_by_detector'))} cows missed, "
-              f"{extras} extra boxes", end="", flush=True)
+            answers = list(zip(o["posture"].argmax(-1).tolist(), o["activity"].argmax(-1).tolist()))
+        seen[(clip, ts)] = [(c["bbox"], c["det_score"], POSTURES[p_], ACTIVITIES[a_])
+                            for c, (p_, a_) in zip(dets, answers)]
+        print(f"\r  {n}/{len(frames)} frames", end="", flush=True)
     print(flush=True)
+
+    def at(thr):
+        """records (one per annotated cow) and found boxes at a score cut-off"""
+        records, found = [], {}
+        for key, gts in frames.items():
+            mine = [d for d in seen[key] if d[1] >= thr]
+            found[key] = [d[0] for d in mine]
+            pairs = detect_mod.match(found[key], [g["bbox"] for g in gts], args.iou)
+            by_gt = {j: (i, v) for i, j, v in pairs}
+            for j, g in enumerate(gts):
+                if j in by_gt:
+                    i, v = by_gt[j]
+                    records.append(dict(g, posture=mine[i][2], activity=mine[i][3], det_bbox=mine[i][0],
+                                        det_score=mine[i][1], det_iou=round(v, 3)))
+                else:
+                    records.append(dict(g, posture=None, activity=None, missed_by_detector=True,
+                                        parse_error="not found by the detector"))
+        return records, found
+
+    table = []
+    for thr in sweep:
+        recs, fnd = at(thr)
+        q = detector_quality(frames, fnd)["iou0.5"]
+        table.append({"threshold": thr, **errors(recs), "recall": q["recall"], "precision": q["precision"],
+                      "extra": q["extra"]})
+    best = min(table, key=lambda r: (r["exact_error"], -r["threshold"]))
+    records, found = at(threshold)
 
     with open(os.path.join(out_dir, "results.jsonl"), "w", encoding="utf-8") as fh:
         for r in records:
@@ -165,7 +187,7 @@ def main(argv=None):
         "render_mode": "224 px crop of the detected cow", "unit": "cow", "frames": 1, "max_width": 224,
         "annotations": "annotations/ava_val_v2.1.csv",
         "boxes": {"source": "detector", "detections": f"live: {os.path.abspath(args.detector)}",
-                  "threshold": det.threshold, "detector": det.name, "match_iou": args.iou,
+                  "threshold": threshold, "tiles": det.tiles, "detector": det.name, "match_iou": args.iou,
                   "detector_ms_per_frame": round(float(np.median(det_ms)), 1) if det_ms else None},
         "prompt_sha": "herd", "videos": "", "excluded": []})
     quality = detector_quality(frames, found)
@@ -175,9 +197,12 @@ def main(argv=None):
     if os.path.exists(anno_path):
         with open(anno_path, encoding="utf-8") as fh:
             on_anno = errors([json.loads(line) for line in fh if line.strip()])
-    res = {"detector": os.path.abspath(args.detector), "threshold": det.threshold, "iou": args.iou,
-           "detector_quality": quality, "on_detector_boxes": errors(records), "on_annotated_boxes": on_anno}
-    write_json(os.path.join(args.run, "eval_det.json"), res)
+    res = {"detector": os.path.abspath(args.detector), "threshold": threshold, "tiles": det.tiles, "iou": args.iou,
+           "detector_quality": quality, "on_detector_boxes": errors(records), "on_annotated_boxes": on_anno,
+           "threshold_sweep": table, "best_threshold": best["threshold"]}
+    write_json(os.path.join(out_dir, "eval_det.json"), res)
+    if args.out is None:                       # the run's own detector figures, next to eval_val.json
+        write_json(os.path.join(args.run, "eval_det.json"), res)
 
     q5, e = quality["iou0.5"], res["on_detector_boxes"]
     pct = lambda v: "-" if v is None else f"{v:.1%}"
@@ -187,6 +212,12 @@ def main(argv=None):
     print(f"[eval-det] on detector boxes: exact error {pct(e['exact_error'])} (posture {pct(e['posture_error'])}, "
           f"activity {pct(e['activity_error'])}); on the cows it found {pct(e['exact_error_found_cows'])}"
           + (f"; on annotated boxes {pct(on_anno['exact_error'])}" if on_anno else ""))
+    print("[eval-det] threshold sweep (the whole 1 fps path: missed cows are errors):")
+    print("   threshold  exact error  on found  recall  precision  extra boxes")
+    for r in table:
+        print(f"   {r['threshold']:9.2f}  {r['exact_error']:11.1%}  {r['exact_error_found_cows'] or 0:8.1%}  "
+              f"{r['recall']:6.1%}  {r['precision']:9.1%}  {r['extra']:11d}"
+              + ("   <- lowest error" if r is best else "") + ("   <- in use" if r["threshold"] == round(threshold, 2) else ""))
     print(f"[eval-det] cowbench format: python cowbench/cowbench.py --out {out_dir} score")
     return 0
 

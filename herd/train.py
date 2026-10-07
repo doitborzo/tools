@@ -45,7 +45,7 @@ FPS = 25.0
 class Split:
     """All bursts and keyframes of one split, in memory (fp16)."""
 
-    def __init__(self, folder, clips=None):
+    def __init__(self, folder, clips=None, extra_keys=False):
         rows = read_jsonl(os.path.join(folder, "index.jsonl"))
         self.meta = json.load(open(os.path.join(folder, "meta.json"), encoding="utf-8"))
         keep = (lambda c: True) if clips is None else (lambda c: c in clips)
@@ -89,6 +89,27 @@ class Split:
                                             if (b["clip"], u) in box_of] or [[0.5, 0.5, 0.2, 0.2]], 0)
                                    for b in self.bursts], np.float32).reshape(-1, 4)
         self.clips = sorted({r["clip"] for r in self.bursts + self.keys}, key=int)
+        self.n_extra_keys = 0
+        if extra_keys:
+            self._add_extra_keys(folder, keep)
+
+    def _add_extra_keys(self, folder, keep):
+        """Keyframe crops from the detector's boxes and jittered boxes (cbvd_bursts.py
+        keys): the frame heads learn the boxes the barn will give them, not only
+        the annotation's. Training only - dev and val stay on annotated boxes,
+        and eval-det scores the detector's."""
+        from model import box_pos
+        rows = read_jsonl(os.path.join(folder, "keys_aug.jsonl"))
+        path = os.path.join(folder, "keys_aug.npz")
+        if not rows or not os.path.exists(path):
+            sys.exit(f"--det-keys 1 needs {path}: herd.py keys --split train")
+        feats = np.load(path)["feats"]
+        idx = [i for i, r in enumerate(rows) if keep(r["clip"])]
+        self.keys += [rows[i] for i in idx]
+        self.key_feats = np.concatenate([self.key_feats, feats[idx]])
+        self.key_pos = np.concatenate([self.key_pos, np.array([box_pos(rows[i]["bbox"]) for i in idx],
+                                                              np.float32).reshape(-1, 4)])
+        self.n_extra_keys = len(idx)
 
 
 def clips_of(folder):
@@ -387,10 +408,13 @@ def cmd_train(args):
     tr_dir = os.path.join(args.features, "train")
     all_clips = clips_of(tr_dir)
     dev_clips = set(random.Random(args.seed).sample(all_clips, max(1, int(len(all_clips) * args.holdout))))
-    train = Split(tr_dir, set(all_clips) - dev_clips)
+    train = Split(tr_dir, set(all_clips) - dev_clips, extra_keys=bool(args.det_keys))
     dev = Split(tr_dir, dev_clips)
-    print(f"[train] {len(train.bursts)} bursts / {len(train.keys)} keyframe cows in {len(train.clips)} clips; "
+    print(f"[train] {len(train.bursts)} bursts / {len(train.keys) - train.n_extra_keys} keyframe cows in "
+          f"{len(train.clips)} clips; "
           f"dev {len(dev.bursts)} / {len(dev.keys)} in {len(dev.clips)} clips", flush=True)
+    if train.n_extra_keys:
+        print(f"[train] + {train.n_extra_keys} keyframe crops from detector and jittered boxes (frame heads)", flush=True)
     if args.motion and not train.motion_dim:
         sys.exit("--motion 1 needs the motion features: herd.py motion --split train (and val)")
     model = HerdModel(train.dim, use_pos=bool(args.pos), d=args.d, layers=args.layers, heads=args.heads,
@@ -532,6 +556,8 @@ def main(argv=None):
     p.add_argument("--holdout", type=float, default=0.1)
     p.add_argument("--patience", type=int, default=6, help="stop after this many epochs without a better dev score")
     p.add_argument("--pos", type=int, default=0, help="1: give the heads where the cow is in the frame")
+    p.add_argument("--det-keys", type=int, default=0,
+                   help="1: the frame heads also learn on detector / jittered boxes; needs herd.py keys --split train")
     p.add_argument("--motion", type=int, default=0,
                    help="1: the burst's rhythm (motion.py) to rumination and activity; needs herd.py motion")
     p.add_argument("--seed", type=int, default=0)

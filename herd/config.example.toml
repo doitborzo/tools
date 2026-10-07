@@ -13,14 +13,18 @@ burst_every_s = 60              # a 7 s burst per camera every minute (staggered
 burst_seconds = 7.0
 burst_fps = 25.0
 burst_detect_fps = 5.0          # detector runs on 5 of the 25 frames a second; boxes are interpolated
-frame_width = 1280              # frames are kept this wide in the ring buffer (memory)
+frame_width = 1920              # Full HD kept as it comes (wider frames are scaled to it); ~1.5 GB
+                                # of RAM per camera for its 10 s ring buffer at 25 fps
 
 [model]
 checkpoint = "/workspace/herd/run1/model.pt"     # abstain.json next to it is picked up
 
 [detector]
 weights = "/workspace/lora-runs/detector/best"   # RT-DETRv2 (cowbench/detector.py)
-# threshold = 0.4                                # default: the one chosen at training
+# threshold = 0.4                                # default: the one chosen at training;
+#                                                  herd.py eval-det prints the one with the lowest error
+# tiles = true                                   # whole frame + square tiles: far cows ~1.8x wider, ~3x
+#                                                  the detector's work; default: as it was trained
 
 [tracker]
 iou = 0.3

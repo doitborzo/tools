@@ -59,6 +59,12 @@ python herd/herd.py eval-det --run /workspace/herd/run1 # the same on RT-DETRv2'
 python cowbench/cowbench.py --out /workspace/herd/run1/eval-val-det score
 ```
 
+`eval-det` also sweeps the detector's cut-off and prints the error of the
+whole path at each (lower finds more far cows, adds boxes that are no cow):
+put the lowest-error one in the barn config (`[detector] threshold`).
+`--tiles 1` tries the whole frame plus two square tiles (far cows ~1.8x wider,
+~3x the detector's work) on the detector as it is.
+
 Two error figures, as for the LoRA runs: `eval-val` scores the heads on the
 annotated boxes (how good they are when the cow is found); `eval-val-det` on
 the detector's boxes, a cow it misses counted wrong - the error the barn sees.
@@ -77,6 +83,22 @@ What CBVD-5 can and cannot show:
   teaches "same cow over seconds, other cows apart", not across days or in a top
   view - the barn's own footage is needed for that (and the side-view CBVD-5 is
   not a top view).
+
+## Detector and the once-a-second heads on its boxes
+
+On CBVD-5 val the detector misses about one cow in four (half of the far,
+small ones) and draws loose boxes; the heads err more on its boxes (26.6%)
+than on the annotation's (21.4%). Two remedies:
+
+```bash
+bash herd/run_pod.sh detector    # a new RT-DETRv2 for Full HD: 1088 input (a 1080x1080 tile at ~native
+                                 # size), zoom crops in training, whole frame + tiles, chosen by F2
+RUN=run6 POS=1 bash herd/run_pod.sh   # step 6: keyframe crops from that detector's boxes (+ jittered
+                                      # annotated boxes) -> the frame heads learn on them (--det-keys)
+```
+
+Cameras are kept at Full HD (`frame_width = 1920`): a far cow's crop has 1.5x
+the pixels it had at 1280.
 
 ## One GPU, 5 cameras, in real time
 
@@ -129,7 +151,7 @@ time on tracks no cow could be given.
 | `motion.py` | the rhythm of a burst's crops: what rumination (chewing) looks like |
 | `cbvd_bursts.py` | CBVD-5 -> bursts + keyframes -> Stage A vectors |
 | `train.py` | Stage A training, re-ID / posture / rumination scoring, cowbench export |
-| `eval_det.py` | the 1 fps heads on the detector's boxes: detector error included |
+| `eval_det.py` | the 1 fps heads on the detector's boxes: detector error included, cut-off sweep |
 | `abstain.py` | the NaN model |
 | `gallery.py` | prototypes, matching, enrolment, change-over, retirement |
 | `pipeline.py` | cameras -> 1 fps + bursts -> store |

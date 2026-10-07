@@ -33,9 +33,9 @@ STATES = ("lying", "standing", "feeding", "drinking", "ruminating", "idle")
 DEFAULTS = {
     "farm": {"timezone_offset_hours": 0, "migration_weekday": 1, "migration_hour": 10, "nightly_hour": 2},
     "sampling": {"fps": 1.0, "burst_every_s": 60, "burst_seconds": 7.0, "burst_fps": 25.0,
-                 "burst_detect_fps": 5.0, "frame_width": 1280},
+                 "burst_detect_fps": 5.0, "frame_width": 1920},   # Full HD: far cows keep their pixels
     "model": {"checkpoint": "", "encoder": "facebook/dinov2-small", "crop": 224, "grid": 2},
-    "detector": {"weights": "", "threshold": None},
+    "detector": {"weights": "", "threshold": None, "tiles": None},   # None: as the detector was trained
     "tracker": {"iou": 0.3, "max_age_s": 5},
     "identity": {"prototypes_per_cow": 6, "history_days": 7, "max_error": 0.01,
                  "new_cow_similarity": 0.55, "new_cow_min_bursts": 20, "retire_after_hours": 48},
