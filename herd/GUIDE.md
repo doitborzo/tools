@@ -259,10 +259,6 @@ bash herd/run_pod.sh stop
 
 One table of every run: `python cowbench/summary.py /workspace/herd /workspace/lora-runs`.
 
-Everything worth keeping in one archive to copy to a PC (results, reports, logs, stress tests;
-not the features, venv or weights): `bash herd/export_results.sh` (`DET_WEIGHTS=1` adds the
-detectors' weights).
-
 ---
 
 ## 6. Reading the results, and what has been achieved
