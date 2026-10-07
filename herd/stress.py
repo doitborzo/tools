@@ -184,6 +184,53 @@ def build(args):
     return cfg, models, shared, store
 
 
+def detector_check(args, cfg, models):
+    """The live detector, at its live threshold, on every annotated val keyframe
+    taken from the video and scaled to the cameras' width as the barn gets it:
+    recall / precision, cows missed, extra boxes, by cow size, ms a frame."""
+    import cv2
+    from eval_det import detector_quality, val_keyframes
+    import cbvd
+    frames = val_keyframes(args.root)
+    by_clip = collections.defaultdict(list)
+    for clip, ts in frames:
+        by_clip[clip].append(ts)
+    width = cfg["sampling"]["frame_width"]
+    found, ms = {}, []
+    for clip, tss in by_clip.items():
+        try:
+            cap = cv2.VideoCapture(cbvd.video_path(args.root, clip))
+        except FileNotFoundError:
+            continue
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        want = {int(round(ts * fps)): ts for ts in tss}
+        i = 0
+        while want and i <= max(want):
+            ok, f = cap.read()
+            if not ok:
+                break
+            if i in want:
+                img = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+                h, w = img.shape[:2]
+                if w > width:
+                    img = cv2.resize(img, (width, int(h * width / w)), interpolation=cv2.INTER_AREA)
+                t = time.perf_counter()
+                found[(clip, want[i])] = models.detect(img, urgent=True, kind="check")
+                ms.append((time.perf_counter() - t) * 1000)
+            i += 1
+        cap.release()
+    frames = {k: v for k, v in frames.items() if k in found}
+    q = detector_quality(frames, found)
+    q["ms_per_frame"] = dist(ms, (50, 90))
+    q["threshold"] = getattr(models.detector, "threshold", None)
+    q["frame_width"] = width
+    q5 = q["iou0.5"]
+    print(f"[stress] detector on {q['frames']} val keyframes: recall {q5['recall']:.1%}, precision "
+          f"{q5['precision']:.1%} at IoU 0.5; {q5['missed']} of {q['cows']} cows missed, {q5['extra']} extra boxes",
+          flush=True)
+    return q
+
+
 def burst_alone(args, cfg, models, shared, store, clips):
     """Bursts one by one, then 1 fps ticks one by one: the cost of each, uncontended."""
     import pipeline
@@ -377,10 +424,26 @@ def fmt(d, k="p50", unit="", dd=2):
 
 
 def markdown(res):
-    a, L = res.get("alone"), res.get("live")
+    a, L, D = res.get("alone"), res.get("live"), res.get("detector_check")
     out = [f"# herd: one GPU, {L['cameras'] if L else '-'} cameras", "",
            f"- model: `{res['model']}`", f"- detector: `{res['detector']}` on {res['detector_device']}",
            f"- GPU: {res.get('gpu_name') or '-'}", ""]
+    if D:
+        q5, q3 = D["iou0.5"], D["iou0.3"]
+        out += ["## Detector", "",
+                f"The live detector at its live threshold ({D['threshold']}) on {D['frames']} annotated CBVD-5 val "
+                f"keyframes ({D['cows']} cows), taken from the videos at {D['frame_width']} px wide as the cameras "
+                "give them. A missed cow gets no posture, activity or identity that second; an extra box is a "
+                "cow that is not there.", "",
+                "| | IoU 0.5 | IoU 0.3 |", "|---|---|---|",
+                f"| recall (cows found) | {q5['recall']:.1%} | {q3['recall']:.1%} |",
+                f"| precision (boxes that are cows) | {q5['precision']:.1%} | {q3['precision']:.1%} |",
+                f"| cows missed | {q5['missed']} of {D['cows']} | {q3['missed']} of {D['cows']} |",
+                f"| extra boxes | {q5['extra']} | {q3['extra']} |",
+                f"| ms a frame p50 / p90 | {fmt(D['ms_per_frame'], dd=1)} / {fmt(D['ms_per_frame'], 'p90', dd=1)} | |", ""]
+        if D.get("recall_by_size"):
+            out += ["Recall at IoU 0.5 by cow size (quartiles of box area): "
+                    + ", ".join(f"{k} {v:.1%}" for k, v in D["recall_by_size"].items()) + ".", ""]
     if a:
         out += ["## Burst alone", "",
                 f"{a['bursts']} bursts of {res['burst_seconds']:g} s at 25 fps, one at a time, nothing else running.", "",
@@ -452,6 +515,7 @@ def main(argv=None):
     p.add_argument("--burst-seconds", type=float, default=None, help="s (default 7)")
     p.add_argument("--alone", type=int, default=5, help="bursts in the burst-alone test (0: skip)")
     p.add_argument("--no-live", action="store_true", help="only the burst-alone test")
+    p.add_argument("--no-detector-check", action="store_true", help="skip the detector on the val keyframes")
     p.add_argument("--max-lag", type=float, default=2.0, help="s: tick lag p99 allowed")
     p.add_argument("--out", default="/workspace/herd/stress")
     p.add_argument("--keep", action="store_true", help="keep the store and gallery of an earlier test")
@@ -468,6 +532,8 @@ def main(argv=None):
            "motion": bool(models.motion_dim), "rumination_threshold": models.rum_thr}
     if models.dev.type == "cuda":
         res["gpu_name"] = models.torch.cuda.get_device_name()
+    if not args.no_detector_check:
+        res["detector_check"] = detector_check(args, cfg, models)
     if args.alone:
         res["alone"] = burst_alone(args, cfg, models, shared, store, clips)
     if not args.no_live:

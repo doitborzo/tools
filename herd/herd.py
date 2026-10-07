@@ -6,6 +6,7 @@ Training (on CBVD-5 today, on the barn's own footage later):
     herd.py motion   --split train|val      the rhythm of every burst (chewing), CPU only
     herd.py train                           temporal transformer + all heads on those vectors
     herd.py eval                            val scores + cowbench-format results
+    herd.py eval-det --run R                the same on the detector's boxes: detector misses count
     herd.py abstain                         the NaN model and its cut-off
 
 Running:
@@ -64,6 +65,9 @@ def main():
     if cmd in ("train", "eval"):
         import train
         return train.main([cmd] + argv)
+    if cmd == "eval-det":
+        import eval_det
+        return eval_det.main(argv)
     if cmd == "abstain":
         import abstain
         return abstain.main(argv)
