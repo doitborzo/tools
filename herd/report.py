@@ -9,7 +9,8 @@ at once (a mask edge) count once.
 Times per cow and day (farm local time):
   lying, standing                   seconds of the 1 fps path
   feeding, drinking                 seconds of the 1 fps path
-  ruminating                        the share of her bursts that say ruminating,
+  ruminating                        the share of her bursts that say ruminating (and
+                                    that she is neither feeding nor drinking),
                                     times her observed minutes (bursts sample
                                     rumination once a minute)
   idle ("did nothing")              the rest: neither feeding, drinking nor ruminating
@@ -38,6 +39,15 @@ from store import Store
 
 FIELDS = ("observed_min", "lying_min", "standing_min", "feeding_min", "drinking_min", "ruminating_min",
           "idle_min", "lying_share", "rumination_share", "lameness_score", "lameness_bursts", "bursts")
+
+
+def rumination_threshold(cfg):
+    """The cut-off calibrated at training (heads.json next to the model), else 0.5."""
+    path = os.path.join(os.path.dirname(os.path.abspath(cfg["model"]["checkpoint"] or ".")), "heads.json")
+    try:
+        return float(json.load(open(path, encoding="utf-8"))["rumination_threshold"])
+    except (OSError, KeyError, ValueError):
+        return 0.5
 
 
 def day_expr(cfg):
@@ -87,7 +97,8 @@ def daily(store, cfg, since=None, until=None):
         ON s.track = m.track {w + (' AND' if w else 'WHERE')} m.cow IS NULL GROUP BY d""")
     bw = w.replace("s.ts", "b.ts")
     bursts = store.query(f"""
-        SELECT m.cow, {day.replace('ts', 'b.ts')} AS d, COUNT(*), SUM(b.rumination_p >= 0.5),
+        SELECT m.cow, {day.replace('ts', 'b.ts')} AS d, COUNT(*),
+               SUM(b.rumination_p >= {rumination_threshold(cfg)} AND b.activity = 'none'),
                AVG(b.lameness), SUM(b.lameness IS NOT NULL)
         FROM bursts b JOIN temp.trackmap m ON b.track = m.track {bw} GROUP BY m.cow, d""")
     out = {}

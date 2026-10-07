@@ -213,7 +213,19 @@ def frame_predictions(model, split, batch=1024):
     return torch.cat(out).numpy() if out else np.zeros((0, 2), int)
 
 
-def evaluate(model, split, crop_s):
+def best_threshold(p, y):
+    """The rumination cut-off with the best F1 (rumination is rare: 0.5 is not it)."""
+    best = (0.0, 0.5)
+    for t in np.linspace(0.05, 0.95, 91):
+        pr = p >= t
+        tp, fpos, fn = int((pr & (y == 1)).sum()), int((pr & (y == 0)).sum()), int((~pr & (y == 1)).sum())
+        f1 = 2 * tp / max(1, 2 * tp + fpos + fn)
+        if f1 > best[0]:
+            best = (f1, float(t))
+    return best
+
+
+def evaluate(model, split, crop_s, rum_thr=0.5):
     rows, q = reid(model, split, crop_s)
     m = {}
     for scope in ("clip", "all"):
@@ -226,21 +238,26 @@ def evaluate(model, split, crop_s):
     m["frame_posture_error"] = float(np.mean(fp[ok, 0] != kp[ok])) if ok.any() else None
     m["frame_activity_error"] = float(np.mean(fp[:, 1] != ka)) if len(ka) else None
     br = np.array([b["rumination"] for b in split.bursts])
-    pr = q["rumination"] >= 0.5
+    pr = q["rumination"] >= rum_thr
     if len(br):
         tp, fn, fpos = int((pr & (br == 1)).sum()), int((~pr & (br == 1)).sum()), int((pr & (br == 0)).sum())
+        m["rumination_threshold"] = float(rum_thr)
         m["rumination_recall"] = tp / max(1, tp + fn)
         m["rumination_precision"] = tp / max(1, tp + fpos)
+        m["rumination_f1"] = 2 * tp / max(1, 2 * tp + fpos + fn)
+        m["rumination_best_f1"], m["rumination_best_threshold"] = best_threshold(q["rumination"], br)
         bp = np.array([b["posture"] for b in split.bursts])
         okp = bp >= 0
         m["burst_posture_error"] = float(np.mean(q["posture"].argmax(1)[okp] != bp[okp])) if okp.any() else None
     return m, rows, q, fp
 
 
-def write_cowbench(split, fp, q, out_dir, root=None):
+def write_cowbench(split, fp, q, out_dir, rum_thr=0.5):
     """val keyframes as cowbench results: posture and activity from the
-    once-a-second heads, 'ruminating' where the cow's burst says so. Then
-    cowbench.py score / report / compare work on herd as on any run."""
+    once-a-second heads; 'ruminating' where the cow's burst says so and the
+    frame head says she is neither feeding nor drinking (CBVD-5's rumination
+    is chewing cud away from feed and water). Then cowbench.py score / report
+    / compare work on herd as on any run."""
     os.makedirs(out_dir, exist_ok=True)
     rum = {}
     for b, p in zip(split.bursts, q["rumination"]):
@@ -248,7 +265,9 @@ def write_cowbench(split, fp, q, out_dir, root=None):
             rum[uid] = float(p)
     with open(os.path.join(out_dir, "results.jsonl"), "w", encoding="utf-8") as fh:
         for k, (pp, pa) in zip(split.keys, fp):
-            act = "ruminating" if rum.get(k["uid"], 0) >= 0.5 else ACTIVITIES[pa]
+            act = ACTIVITIES[pa]
+            if act == "none" and rum.get(k["uid"], 0) >= rum_thr:
+                act = "ruminating"
             gt_act = "ruminating" if k["rumination"] else ACTIVITIES[k["activity"]]
             fh.write(json.dumps({"id": k["uid"], "video_id": k["clip"], "timestamp": k["timestamp"],
                                  "bbox": k.get("bbox", [0, 0, 1, 1]),
@@ -283,7 +302,8 @@ def cmd_train(args):
     steps = args.epochs * max(1, len(train.bursts) // args.P)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, args.lr, total_steps=steps, pct_start=0.05)
     pos = np.mean([b["rumination"] for b in train.bursts]) if train.bursts else 0.5
-    rum_w = torch.tensor((1 - pos) / max(pos, 1e-3), device=device())
+    # sqrt of the class ratio: the full ratio made the head call everything rumination
+    rum_w = torch.tensor(math.sqrt((1 - pos) / max(pos, 1e-3)), device=device())
     sampler = pk_sampler(train, args.P, rng)
     os.makedirs(args.out, exist_ok=True)
     hist = open(os.path.join(args.out, "history.jsonl"), "a", encoding="utf-8")
@@ -324,8 +344,10 @@ def cmd_train(args):
                          ("frame_posture", l_fp), ("frame_activity", l_fa), ("total", loss)):
                 losses[k].append(float(v.detach()))
         m, _, _, _ = evaluate(model, dev, args.crop_s)
+        # recall alone rewarded calling everything rumination (run1 kept epoch 3 of 40 for it)
         score = np.mean([v for v in (m.get("reid_top1_clip"), 1 - (m.get("frame_posture_error") or 0),
-                                     m.get("rumination_recall")) if v is not None])
+                                     1 - (m.get("frame_activity_error") or 0), m.get("rumination_best_f1"))
+                         if v is not None])
         rec = {"epoch": epoch + 1, "step": step, "minutes": round((time.time() - t0) / 60, 1),
                **{f"loss_{k}": round(float(np.mean(v)), 4) for k, v in losses.items()},
                **{f"dev_{k}": (round(v, 4) if isinstance(v, float) else v) for k, v in m.items()},
@@ -334,12 +356,14 @@ def cmd_train(args):
         hist.flush()
         print(f"[train] epoch {epoch + 1}/{args.epochs}  loss {rec['loss_total']:.3f}  dev re-ID in clip "
               f"{m.get('reid_top1_clip') or 0:.1%}, frame posture err {m.get('frame_posture_error') or 0:.1%}, "
-              f"rumination recall {m.get('rumination_recall') or 0:.1%}", flush=True)
+              f"frame activity err {m.get('frame_activity_error') or 0:.1%}, rumination F1 "
+              f"{m.get('rumination_best_f1') or 0:.1%} at {m.get('rumination_best_threshold') or 0:.2f}", flush=True)
         if score > best:
             best = score
             model.save(os.path.join(args.out, "model.pt"), {"crop_s": args.crop_s, "epoch": epoch + 1,
                                                              "features": train.meta, "dev": m,
-                                                             "dev_clips": sorted(dev_clips, key=int)})
+                                                             "dev_clips": sorted(dev_clips, key=int),
+                                                             "rum_threshold": m.get("rumination_best_threshold", 0.5)})
     hist.close()
     print(f"[train] best dev score {best:.3f} -> {os.path.join(args.out, 'model.pt')}", flush=True)
     cmd_eval(args)
@@ -349,14 +373,21 @@ def cmd_eval(args):
     from model import HerdModel
     model, ck = HerdModel.load(os.path.join(args.out, "model.pt"), map_location=device())
     model.to(device())
+    thr = ck.get("rum_threshold")
+    if thr is None:      # a checkpoint from before the cut-off was calibrated: do it now, on its dev clips
+        dev = Split(os.path.join(args.features, "train"), set(ck["dev_clips"]))
+        thr = evaluate(model, dev, ck["crop_s"])[0].get("rumination_best_threshold", 0.5)
+    # the rumination cut-off travels with the model: pipeline and reports read it
+    write_json(os.path.join(args.out, "heads.json"), {"rumination_threshold": thr})
     val = Split(os.path.join(args.features, "val"))
-    m, rows, q, fp = evaluate(model, val, ck["crop_s"])
+    m, rows, q, fp = evaluate(model, val, ck["crop_s"], thr)
     write_json(os.path.join(args.out, "eval_val.json"), {"epoch": ck["epoch"], **m})
     with open(os.path.join(args.out, "reid_val.jsonl"), "w", encoding="utf-8") as fh:
         for r in rows:
             fh.write(json.dumps(r) + "\n")
-    write_cowbench(val, fp, q, os.path.join(args.out, "eval-val"))
-    print("[eval] val: " + ", ".join(f"{k} {v:.1%}" if isinstance(v, float) else f"{k} {v}" for k, v in m.items()))
+    write_cowbench(val, fp, q, os.path.join(args.out, "eval-val"), thr)
+    print("[eval] val: " + ", ".join(f"{k} {v:.2f}" if "threshold" in k else
+                                     (f"{k} {v:.1%}" if isinstance(v, float) else f"{k} {v}") for k, v in m.items()))
     print(f"[eval] cowbench format: python cowbench/cowbench.py --out {os.path.join(args.out, 'eval-val')} score")
 
 
