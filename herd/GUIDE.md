@@ -232,6 +232,8 @@ Knobs (`NAME=value bash herd/run_pod.sh`):
 ```bash
 bash herd/run_pod.sh detector    # a new Full HD detector, R101 (hours), then eval-det of the newest run
 DET_MODEL=PekingU/rtdetr_v2_r50vd bash herd/run_pod.sh detector   # the same with R50, to compare
+DET_SIZE=960 DET_ZOOM=0 DET_TILES=0 DET_SELECT=f1 DET_TAG=r101_960 bash herd/run_pod.sh detector
+                                 # R101 with the first detector's settings: only the backbone differs
 bash herd/run_pod.sh stress      # 5 cameras in real time on one GPU (~7 min)
 CAMERAS=20 RUN=run7 bash herd/run_pod.sh stress
 bash herd/run_pod.sh stop

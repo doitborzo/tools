@@ -18,7 +18,9 @@
 #                                 then eval-det of the newest run with it. DET_EPOCHS=24 DET_BATCH=8
 #                                 DET_MODEL=PekingU/rtdetr_v2_r101vd (default; ~76M parameters, the
 #                                 deepest backbone) - PekingU/rtdetr_v2_r50vd is the one the LoRA runs and
-#                                 the first herd runs used (~42M); DET_TAG=fhd_r101 (fhd_r50 for r50vd)
+#                                 the first herd runs used (~42M); DET_TAG=fhd_r101 (fhd_r50 for r50vd).
+#                                 The first detector's own settings, only the backbone swapped:
+#                                 DET_SIZE=960 DET_ZOOM=0 DET_TILES=0 DET_SELECT=f1 DET_TAG=r101_960
 #
 # Every step resumes: features are written clip by clip, so a rerun after a
 # crash continues where it stopped. Knobs:
@@ -115,7 +117,7 @@ case "${1:-}" in
         LAST="$(basename "$(dirname "$(ls -t "$WORK"/herd/*/model.pt 2>/dev/null | head -1)")" 2>/dev/null || true)"
         q() { printf '%q ' "$@"; }
         train="$(q "$VENV/bin/python" "$REPO/cowbench/detector.py" train --root "$DATA" --out "$DOUT" \
-                   --model "$DET_MODEL" --size "${DET_SIZE:-1088}" --zoom "${DET_ZOOM:-0.5}" --tiles 1 --select f2 \
+                   --model "$DET_MODEL" --size "${DET_SIZE:-1088}" --zoom "${DET_ZOOM:-0.5}" --tiles "${DET_TILES:-1}" --select "${DET_SELECT:-f2}" \
                    --epochs "${DET_EPOCHS:-24}" --batch "${DET_BATCH:-8}")"
         evald=""
         if [ -n "$LAST" ] && [ -f "$WORK/herd/$LAST/model.pt" ]; then
