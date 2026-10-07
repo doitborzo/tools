@@ -281,11 +281,13 @@ def evaluate(model, split, crop_s, rum_thr=0.5):
 
 
 def write_cowbench(split, fp, q, out_dir, rum_thr=0.5):
-    """val keyframes as cowbench results: posture and activity from the
-    once-a-second heads; 'ruminating' where the cow's burst says so and the
-    frame head says she is neither feeding nor drinking (CBVD-5's rumination
-    is chewing cud away from feed and water). Then cowbench.py score / report
-    / compare work on herd as on any run."""
+    """val keyframes as cowbench results, the once-a-second path only: posture
+    and activity (feeding / drinking / none) from the frame heads. Rumination
+    stays with the bursts - it is scored there (eval_val.json) and reported
+    as minutes from bursts - and is not mixed into these per-frame answers: a
+    cow annotated ruminating is "none" here (neither feeding nor drinking),
+    flagged gt_rumination, with her burst's rumination_p alongside. Then
+    cowbench.py score / report / compare work on herd as on any run."""
     os.makedirs(out_dir, exist_ok=True)
     rum = {}
     for b, p in zip(split.bursts, q["rumination"]):
@@ -293,17 +295,16 @@ def write_cowbench(split, fp, q, out_dir, rum_thr=0.5):
             rum[uid] = float(p)
     with open(os.path.join(out_dir, "results.jsonl"), "w", encoding="utf-8") as fh:
         for k, (pp, pa) in zip(split.keys, fp):
-            act = ACTIVITIES[pa]
-            if act == "none" and rum.get(k["uid"], 0) >= rum_thr:
-                act = "ruminating"
-            gt_act = "ruminating" if k["rumination"] else ACTIVITIES[k["activity"]]
+            p = rum.get(k["uid"])
             fh.write(json.dumps({"id": k["uid"], "video_id": k["clip"], "timestamp": k["timestamp"],
                                  "bbox": k.get("bbox", [0, 0, 1, 1]),
                                  "gt_posture": POSTURES[k["posture"]] if k["posture"] >= 0 else None,
-                                 "gt_activity": gt_act, "posture": POSTURES[pp], "activity": act,
-                                 "rumination_p": rum.get(k["uid"])}) + "\n")
+                                 "gt_activity": ACTIVITIES[k["activity"]], "posture": POSTURES[pp],
+                                 "activity": ACTIVITIES[pa], "gt_rumination": bool(k["rumination"]),
+                                 "rumination_p": p,
+                                 "rumination": None if p is None else bool(p >= rum_thr)}) + "\n")
     write_json(os.path.join(out_dir, "run_meta.json"), {
-        "model": "herd: DINOv2-S frame heads (1 fps) + temporal transformer (rumination, 7 s burst)",
+        "model": "herd: DINOv2-S frame heads (1 fps); rumination scored on bursts, not here",
         "engine": "herd, PyTorch", "reasoning": "n/a", "temperature": 0.0, "seed": 0,
         "render_mode": "224 px crop of the cow", "unit": "cow", "frames": 1, "max_width": 224,
         "annotations": "annotations/ava_val_v2.1.csv", "boxes": {"source": "annotation"},

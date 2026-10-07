@@ -72,7 +72,7 @@ def label(path, roots):
 
 def no_rumination(results):
     """(exact error, activity error, n) without the cows annotated ruminating."""
-    rows = [r for r in results if r.get("gt_activity") != "ruminating"]
+    rows = [r for r in results if r.get("gt_activity") != "ruminating" and not r.get("gt_rumination")]
     if not rows:
         return None
     exact = sum(1 for r in rows if r.get("posture") != r.get("gt_posture") or r.get("activity") != r.get("gt_activity"))

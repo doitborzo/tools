@@ -55,7 +55,10 @@ python cowbench/cowbench.py --out /workspace/herd/run1/eval-val score   # same 2
 
 What CBVD-5 can and cannot show:
 
-- posture / activity: the same val keyframes as the LoRA runs, comparable directly;
+- posture / activity: the same val keyframes as the LoRA runs, from the once-a-second
+  heads only (feeding / drinking / none; a ruminating cow counts as "none" there).
+  Rumination stays on the bursts: scored in eval_val.json, reported as minutes from
+  bursts, never mixed into the per-frame answers;
 - rumination: 7 s of motion per cow, the first time it is learnable at all here;
 - identity: CBVD-5 has no cow ids, so a cow within one clip is one identity. That
   teaches "same cow over seconds, other cows apart", not across days or in a top
