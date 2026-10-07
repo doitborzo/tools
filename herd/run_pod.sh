@@ -51,6 +51,17 @@ SESSION=herd
 DATASET_URL="https://www.kaggle.com/api/v1/datasets/download/fandaoerji/cbvd-5cow-behavior-video-dataset"
 export HF_HOME="$WORK/hf-cache"
 
+# The trained RT-DETRv2: DET if set, else where the LoRA runs put it, else the
+# newest best/ anywhere under WORK; nothing printed and status 1 if none.
+find_det() {
+    local d="${DET:-$WORK/lora-runs/detector/best}"
+    if [ ! -f "$d/det_train_meta.json" ]; then
+        d="$(find "$WORK" -maxdepth 7 -name det_train_meta.json -path '*/best/*' -printf '%T@ %h\n' 2>/dev/null \
+             | sort -rn | head -1 | cut -d' ' -f2-)"
+    fi
+    [ -n "$d" ] && [ -f "$d/det_train_meta.json" ] && echo "$d"
+}
+
 case "${1:-}" in
     log)  # without RUN=: the newest run's log, not run1's
           [ -n "${RUN_SET:-}" ] || LOG="$(ls -t "$WORK"/herd/log_*.txt 2>/dev/null | head -1 || true)"
@@ -61,18 +72,11 @@ case "${1:-}" in
     stress)
         [ -n "${RUN_SET:-}" ] || RUN="$(basename "$(dirname "$(ls -t "$WORK"/herd/*/model.pt 2>/dev/null | head -1)")")"
         MODEL="$WORK/herd/$RUN/model.pt"
-        DET="${DET:-$WORK/lora-runs/detector/best}"
         [ -f "$MODEL" ] || { echo "no model at $MODEL - train first, or RUN=<run>"; exit 1; }
-        if [ ! -f "$DET/det_train_meta.json" ]; then
-            # not where the LoRA runs put it: the newest trained detector anywhere under WORK
-            found="$(find "$WORK" -maxdepth 7 -name det_train_meta.json -path '*/best/*' -printf '%T@ %h\n' 2>/dev/null \
-                     | sort -rn | head -1 | cut -d' ' -f2-)"
-            [ -n "$found" ] || { echo "no trained detector under $WORK (no best/det_train_meta.json)."
-                                 echo "copy one here or train it: bash cowbench/lora/run_lora.sh (detector steps),"
-                                 echo "then DET=<.../detector/best> bash $0 stress"; exit 1; }
-            echo "detector: $found"
-            DET="$found"
-        fi
+        DET="$(find_det)" || { echo "no trained detector under $WORK (no best/det_train_meta.json)."
+                               echo "copy one here or train it: bash cowbench/lora/run_lora.sh (detector steps),"
+                               echo "then DET=<.../detector/best> bash $0 stress"; exit 1; }
+        echo "detector: $DET"
         SOUT="$WORK/herd/stress_$RUN"
         mkdir -p "$SOUT"
         cmd="$(printf '%q ' "$VENV/bin/python" "$HERE/herd.py" stress --model "$MODEL" --detector "$DET" \
@@ -92,7 +96,7 @@ if [ -z "${HERD_IN_TMUX:-}" ]; then
     if tmux has-session -t "$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     mkdir -p "$WORK/herd"
     knobs=""
-    for v in WORK RUN EPOCHS ENCODER GRID MAX_ERROR MARGIN POS MOTION; do knobs+="$v=$(printf '%q' "${!v}") "; done
+    for v in WORK RUN EPOCHS ENCODER GRID MAX_ERROR MARGIN POS MOTION DET; do knobs+="$v=$(printf '%q' "${!v}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env HERD_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/run_pod.sh"); echo; echo '[run_pod.sh finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log   ($LOG)"
@@ -106,7 +110,7 @@ set -E
 trap 'rc=$?; echo "!! line $LINENO failed (exit $rc): $BASH_COMMAND"' ERR
 step() { echo; echo "=== $*   [$(date '+%F %T')]"; }
 
-step "1/7  Python environment ($VENV)"
+step "1/8  Python environment ($VENV)"
 if ! command -v uv >/dev/null 2>&1; then curl -LsSf https://astral.sh/uv/install.sh | sh; fi
 export PATH="$HOME/.local/bin:$PATH"
 uv self update >/dev/null 2>&1 || true
@@ -121,7 +125,7 @@ if ! ready; then
 fi
 "$PY" -c "import torch; print('torch', torch.__version__, torch.cuda.get_device_name(0))"
 
-step "2/7  CBVD-5 with its videos"
+step "2/8  CBVD-5 with its videos"
 # The LoRA runs only needed keyframes; bursts are cut from the 10 s, 25 fps clips.
 if [ ! -f "$DATA/annotations/ava_train_v2.1.csv" ] || [ ! -d "$DATA/labelframes" ] || [ ! -d "$DATA/videos/videos" ]; then
     command -v unzip >/dev/null || apt-get install -y -qq unzip
@@ -140,12 +144,12 @@ fi
 echo "keyframes: $(find "$DATA/labelframes" -name '*.jpg' | wc -l), videos: $(find "$DATA/videos" -name '*.mp4' | wc -l)"
 
 cd "$HERE"
-step "3/7  Stage A: frame vectors (DINOv2, frozen) - train"
+step "3/8  Stage A: frame vectors (DINOv2, frozen) - train"
 "$PY" herd.py extract --root "$DATA" --out "$FEAT" --split train --encoder "$ENCODER" --grid "$GRID" --margin "$MARGIN"
-step "4/7  Stage A: frame vectors - val"
+step "4/8  Stage A: frame vectors - val"
 "$PY" herd.py extract --root "$DATA" --out "$FEAT" --split val --encoder "$ENCODER" --grid "$GRID" --margin "$MARGIN"
 
-step "5/7  The rhythm of every burst (chewing) - train + val, CPU"
+step "5/8  The rhythm of every burst (chewing) - train + val, CPU"
 if [ "$MOTION" = "1" ]; then
     WORKERS="$(( $(nproc) > 4 ? $(nproc) - 2 : 2 ))"; [ "$WORKERS" -gt 16 ] && WORKERS=16   # each holds one decoded clip in memory
     "$PY" herd.py motion --root "$DATA" --out "$FEAT" --split train --workers "$WORKERS"
@@ -154,7 +158,7 @@ else
     echo "MOTION=0: skipped"
 fi
 
-step "6/7  Training: temporal transformer + heads ($EPOCHS epochs)"
+step "6/8  Training: temporal transformer + heads ($EPOCHS epochs)"
 if [ -f "$OUT/model.pt" ] && [ -f "$OUT/eval_val.json" ]; then
     echo "trained already: $OUT"
 else
@@ -163,8 +167,18 @@ fi
 "$PY" "$REPO/cowbench/cowbench.py" --out "$OUT/eval-val" score
 "$PY" "$REPO/cowbench/cowbench.py" --out "$OUT/eval-val" report
 
-step "7/7  The NaN model (max error $MAX_ERROR among answers)"
+step "7/8  The NaN model (max error $MAX_ERROR among answers)"
 "$PY" herd.py abstain --features "$FEAT" --run "$OUT" --max-error "$MAX_ERROR"
+
+step "8/8  On the detector's boxes: detector misses count as errors"
+if DET="$(find_det)"; then
+    echo "detector: $DET"
+    "$PY" herd.py eval-det --run "$OUT" --detector "$DET" --root "$DATA"
+    "$PY" "$REPO/cowbench/cowbench.py" --out "$OUT/eval-val-det" score
+    "$PY" "$REPO/cowbench/cowbench.py" --out "$OUT/eval-val-det" report
+else
+    echo "no trained detector under $WORK - skipped (DET=<.../detector/best> to point at one)"
+fi
 
 echo
 echo "Done. In $OUT:"
@@ -172,3 +186,4 @@ echo "  model.pt            the temporal transformer + heads (and the frame head
 echo "  eval_val.json       val: re-ID top-1, posture / activity errors, rumination recall"
 echo "  eval-val/report.md  the same keyframes as the LoRA runs, cowbench format"
 echo "  abstain.json        when to answer NaN, and how often it does"
+echo "  eval_det.json, eval-val-det/report.md   the same on the detector's boxes: its misses count"

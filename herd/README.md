@@ -55,7 +55,16 @@ python herd/herd.py motion --split val
 python herd/herd.py train --motion 1           # minutes: no images, no big encoder in the loop
 python herd/herd.py abstain                    # NaN model + cut-off -> abstain.json
 python cowbench/cowbench.py --out /workspace/herd/run1/eval-val score   # same 2532 cows as the LoRA runs
+python herd/herd.py eval-det --run /workspace/herd/run1 # the same on RT-DETRv2's boxes: its misses are errors
+python cowbench/cowbench.py --out /workspace/herd/run1/eval-val-det score
 ```
+
+Two error figures, as for the LoRA runs: `eval-val` scores the heads on the
+annotated boxes (how good they are when the cow is found); `eval-val-det` on
+the detector's boxes, a cow it misses counted wrong - the error the barn sees.
+`eval_det.json` has the detector's own recall / precision (IoU 0.5 and 0.3, by
+cow size) and both errors side by side; `cowbench/summary.py` lists both runs
+with "missed by detector" and "error on found cows".
 
 What CBVD-5 can and cannot show:
 
@@ -82,7 +91,9 @@ Two tests on CBVD-5 val videos with the real models: **a burst alone** (7 s at
 encode / temporal / gallery, cows and crops per burst, one 1 fps tick) and
 **live** (5 cameras at once, each a video at its real 25 fps through the same
 code as the barn, a tick a second and a burst a minute each, staggered; 30 s
-warm-up, 300 s measured). Result: `stress_herd_5cam.md` / `.json` - ticks done,
+warm-up, 300 s measured). Result: `stress_herd_5cam.md` / `.json` - the detector at its live settings on
+the val keyframes from the videos (recall, precision, cows missed, extra boxes,
+by size, ms a frame), ticks done,
 tick lag p50-p99, bursts done and how late, GPU busy share by part, memory, CPU,
 and how many cameras one GPU could take. Keeps up when >= 98% of ticks are done,
 tick lag p99 <= 2 s, every burst is done, and each ends before its camera's next.
@@ -118,6 +129,7 @@ time on tracks no cow could be given.
 | `motion.py` | the rhythm of a burst's crops: what rumination (chewing) looks like |
 | `cbvd_bursts.py` | CBVD-5 -> bursts + keyframes -> Stage A vectors |
 | `train.py` | Stage A training, re-ID / posture / rumination scoring, cowbench export |
+| `eval_det.py` | the 1 fps heads on the detector's boxes: detector error included |
 | `abstain.py` | the NaN model |
 | `gallery.py` | prototypes, matching, enrolment, change-over, retirement |
 | `pipeline.py` | cameras -> 1 fps + bursts -> store |
