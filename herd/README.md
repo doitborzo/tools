@@ -95,7 +95,9 @@ than on the annotation's (21.4%). Two remedies:
 
 ```bash
 bash herd/run_pod.sh detector    # a new RT-DETRv2 for Full HD: 1088 input (a 1080x1080 tile at ~native
-                                 # size), zoom crops in training, whole frame + tiles, chosen by F2
+                                 # size), zoom crops in training, whole frame + tiles, chosen by F2;
+                                 # R101 backbone by default (DET_MODEL=PekingU/rtdetr_v2_r50vd: the R50
+                                 # used so far) -> detector_fhd_r101 / detector_fhd_r50
 RUN=run6 POS=1 bash herd/run_pod.sh   # step 6: keyframe crops from that detector's boxes (+ jittered
                                       # annotated boxes) -> the frame heads learn on them (--det-keys)
 ```

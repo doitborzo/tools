@@ -115,6 +115,9 @@ cow boxes with a score. Settings that matter:
   far cow is 1.8x wider there; about 3x the work;
 - a new detector for Full HD: `bash herd/run_pod.sh detector` (1088 input, zoom crops
   in training, threshold chosen by F2 — a missed cow costs more than an extra box).
+  It trains the deeper R101 backbone by default (`PekingU/rtdetr_v2_r101vd`, ~76M
+  parameters, Apache-2.0, never tried before); `DET_MODEL=PekingU/rtdetr_v2_r50vd`
+  trains the R50 (~42M) used so far, for a like-for-like comparison.
 
 ### 4.2 Frame encoder — DINOv2-S (`model.FrameEncoder`)
 
@@ -227,7 +230,8 @@ Knobs (`NAME=value bash herd/run_pod.sh`):
 ### 5.2 Other pod commands
 
 ```bash
-bash herd/run_pod.sh detector    # a new Full HD detector (hours), then eval-det of the newest run
+bash herd/run_pod.sh detector    # a new Full HD detector, R101 (hours), then eval-det of the newest run
+DET_MODEL=PekingU/rtdetr_v2_r50vd bash herd/run_pod.sh detector   # the same with R50, to compare
 bash herd/run_pod.sh stress      # 5 cameras in real time on one GPU (~7 min)
 CAMERAS=20 RUN=run7 bash herd/run_pod.sh stress
 bash herd/run_pod.sh stop
