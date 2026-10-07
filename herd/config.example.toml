@@ -58,6 +58,12 @@ period_days = 3
 [store]
 path = "/workspace/herd/barn/herd.sqlite"   # gallery/ and names.json live next to it
 
+[training_cache]                # the barn's bursts as identity training data (barn_dataset.py)
+enabled = false                 # true: keep every_n-th burst's frame vectors + a thumbnail
+every_n = 10                    # 60 cows, a burst a minute each: ~360 of ~3600 bursts an hour, ~250 MB an hour
+max_gb = 200                    # stop keeping when the folder reaches this
+folder = "training_cache"       # next to the store unless absolute
+
 # One block per camera. The cameras look down and partly overlap: draw each
 # mask (0-1 frame coordinates, one polygon or a list of them) over the floor
 # that camera alone owns, so every patch of floor is in exactly one mask.

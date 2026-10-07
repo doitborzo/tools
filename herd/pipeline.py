@@ -129,6 +129,9 @@ class Models:
         self.model, ck = HerdModel.load(ck_path, map_location=self.dev)
         self.model.to(self.dev).eval()
         feat = ck.get("features", {})
+        self.features_meta = {k: feat.get(k, d) for k, d in (("encoder", cfg["model"]["encoder"]),
+                              ("grid", cfg["model"]["grid"]), ("crop", cfg["model"]["crop"]), ("margin", 0.1),
+                              ("dim", None))}
         self.crop_size = feat.get("crop", cfg["model"]["crop"])
         self.margin = feat.get("margin", 0.1)          # the context the model was trained with
         self.encoder = FrameEncoder(feat.get("encoder", cfg["model"]["encoder"]),
@@ -203,7 +206,10 @@ class Models:
                    "rumination": float(o["rumination"][0].sigmoid()),
                    "posture": POSTURES[int(o["posture"][0].argmax())],
                    "activity": ACTIVITIES[int(o["activity"][0].argmax())],
-                   "lameness": float(o["lameness"][0]) if self.lameness else None}
+                   "lameness": float(o["lameness"][0]) if self.lameness else None,
+                   # good burst or bad: will it identify the cow (train.py --quality)
+                   "burst_quality": (float(o["burst_quality"][0].sigmoid())
+                                     if o.get("burst_quality") is not None else None)}
         # a cow that feeds or drinks is not ruminating, whatever the head says
         out["ruminating"] = bool(out["rumination"] >= self.rum_thr and out["activity"] == "none")
         return out
@@ -253,6 +259,7 @@ class Camera:
         self.next_burst = start_ts + self.burst_every * index / max(1, n_cams)
         self.stats = collections.Counter()
         self.timings = None          # a list to record every tick and burst into (stress.py)
+        self.cache = None            # barn_dataset.TrainingCache, when [training_cache] enabled
 
     def push(self, ts, frame_rgb):
         h, w = frame_rgb.shape[:2]
@@ -377,8 +384,14 @@ class Camera:
             self.store.burst((self.id, tid, t0, decision["state"], decision["cow"], decision["sim"],
                               decision["margin"], decision["p"], out["rumination"], out["posture"],
                               out["activity"], out["lameness"], out["quality_max"], int(valid.sum()),
-                              int(out["ruminating"])))
+                              int(out["ruminating"]), out.get("burst_quality")))
             part["gallery"] += time.perf_counter() - t
+            if self.cache is not None:
+                from model import box_pos
+                self.cache.add(self.id, tid, t0, feats.float().cpu().numpy(), rel, valid, motion,
+                               np.mean([box_pos(b) for b in boxes], 0), crops[len(crops) // 2],
+                               {"state": decision["state"], "cow": decision["cow"], "sim": decision["sim"],
+                                "p": decision["p"], "area": area, "burst_quality": out.get("burst_quality")})
             cows += 1
             crops_n += len(crops)
             rum_p.append(round(out["rumination"], 3))
@@ -414,7 +427,8 @@ class SharedGallery:
                 res = self.g.nightly(ts)
                 self.store.event(ts, "nightly", json.dumps(res))
                 self.next_nightly = self._next_hour(ts, self.cfg["farm"]["nightly_hour"])
-            d = self.g.match(out["fingerprint"], out["quality_max"], out["quality_mean"], area)
+            d = self.g.match(out["fingerprint"], out["quality_max"], out["quality_mean"], area,
+                             out.get("burst_quality"))
             self.g.observe(d, out["fingerprint"], ts, track)
             return d
 
@@ -496,6 +510,13 @@ def run(cfg, start=None, models=None, max_wall_s=None):
     models = models or Models(cfg)
     cams = [Camera(c, i, len(cfg["cameras"]), cfg, models, shared, store, start_ts)
             for i, c in enumerate(cfg["cameras"])]
+    if cfg["training_cache"]["enabled"]:
+        from barn_dataset import TrainingCache
+        meta = dict(models.features_meta, dim=models.features_meta.get("dim") or models.encoder.out_dim)
+        cache = TrainingCache(cfg, meta)
+        for cam in cams:
+            cam.cache = cache
+        print(f"[run] keeping every {cache.every_n}th burst for training in {cache.folder}", flush=True)
     stop = threading.Event()
     threads = []
     for cam, c in zip(cams, cfg["cameras"]):

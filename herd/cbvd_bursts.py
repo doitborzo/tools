@@ -7,6 +7,10 @@
              features/<split>/index.jsonl  one row per burst and per keyframe, with labels
     motion   videos -> the rhythm of each burst's crops (motion.py), no GPU:
              features/<split>/<clip>.motion.npz   motion (B, DIM), ok (B,)
+    degrade  stretches of each burst spoilt (degrade.py: occlusion by another cow,
+             mud, blur, dark) and encoded, for the quality head to learn on:
+             features/<split>/<clip>.degraded.npz   deg_idx (B, K) frame or -1,
+                                                    deg_kind (B, K), deg_feats (B, K, D)
     keys     the detector on every keyframe -> its boxes, matched to the annotated
              cows, and one jittered copy of each annotated box, encoded like the
              keyframes: what the once-a-second heads get in the barn
@@ -270,6 +274,68 @@ def cmd_motion(args):
                    "margin": meta.get("margin", 0.1)}, fh, indent=2)
 
 
+def cmd_degrade(args):
+    """Spoilt twins of a part of every burst's frames (degrade.py), encoded with
+    the features' own encoder - clip by clip, resumable. Only the spoilt frames
+    are stored; the clean ones are in <clip>.npz already."""
+    import torch
+    import degrade as deg
+    from model import FrameEncoder
+    from common import device
+    out_dir = os.path.join(args.out, args.split)
+    meta = json.load(open(os.path.join(out_dir, "meta.json"), encoding="utf-8"))
+    rows = [r for r in read_jsonl(os.path.join(out_dir, "index.jsonl")) if r["kind"] == "burst"]
+    tracks = collections.defaultdict(dict)
+    for r in rows:
+        tracks[r["clip"]][r["i"]] = r["track"]
+    clips = build_specs(split_boxes(args.root, args.split), meta.get("burst_seconds", 7.0))
+    n_frames = int(round(meta.get("burst_seconds", 7.0) * VIDEO_FPS))
+    size, margin = meta.get("crop", 224), meta.get("margin", 0.1)
+    todo = [c for c in sorted(tracks, key=int) if not os.path.exists(os.path.join(out_dir, f"{c}.degraded.npz"))]
+    print(f"[degrade] {args.split}: {len(tracks)} clips with bursts, {len(todo)} to do", flush=True)
+    if not todo:
+        return
+    enc = FrameEncoder(meta["encoder"], meta["grid"]).to(device()).eval()
+    t0 = time.time()
+    for k, clip in enumerate(todo, 1):
+        bursts = clips.get(clip, {}).get("bursts", [])
+        if [b["track"] for b in bursts] != [tracks[clip][i] for i in sorted(tracks[clip])]:
+            sys.exit(f"clip {clip}: bursts differ from the extracted ones - re-run extract")
+        rng = random.Random(f"{args.seed}-{clip}")
+        try:
+            frames, fps = read_video(cbvd.video_path(args.root, clip))
+        except FileNotFoundError:
+            continue
+        all_crops = []
+        for b in bursts:
+            keys = {float(t): v for t, v in b["keys"].items()}
+            ts = [b["start"] + j / VIDEO_FPS for j in range(n_frames)]
+            idx = [min(len(frames) - 1, int(round(t * fps))) for t in ts]
+            all_crops.append(np.stack([crop(frames[ix], interpolate_box(keys, t), size, margin)
+                                       for ix, t in zip(idx, ts)]))
+        del frames
+        K = int(n_frames * 0.65)
+        deg_idx = np.full((len(bursts), K), -1, np.int16)
+        deg_kind = np.zeros((len(bursts), K), np.int8)
+        deg_feats = np.zeros((len(bursts), K, meta["dim"]), np.float16)
+        for i, crops in enumerate(all_crops):
+            others = [c for j, c in enumerate(all_crops) if j != i]
+            ix, kinds, spoilt = deg.spoil(crops, deg.plan(len(crops), rng), others, rng)
+            ix, kinds, spoilt = ix[:K], kinds[:K], spoilt[:K]
+            if len(ix):
+                with torch.no_grad():
+                    deg_feats[i, :len(ix)] = encode(enc, spoilt)
+                deg_idx[i, :len(ix)] = ix
+                deg_kind[i, :len(ix)] = kinds
+        path = os.path.join(out_dir, f"{clip}.degraded.npz")
+        np.savez(path + ".part.npz", deg_idx=deg_idx, deg_kind=deg_kind, deg_feats=deg_feats)
+        os.replace(path + ".part.npz", path)
+        el = time.time() - t0
+        print(f"\r  {k}/{len(todo)} clips  {el / 60:.1f} min  ~{el / k * (len(todo) - k) / 60:.0f} min left",
+              end="", flush=True)
+    print(flush=True)
+
+
 def jitter_box(b, rng, shift=0.12, scale=0.15):
     """An annotated box as a detector might draw it: centre moved up to `shift`
     of its size, each side scaled by up to `scale`."""
@@ -360,7 +426,7 @@ def cbvd_frame(root, clip, ts):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    sub = argv[0] if argv and argv[0] in ("motion", "keys") else "extract"
+    sub = argv[0] if argv and argv[0] in ("motion", "keys", "degrade") else "extract"
     if sub != "extract":
         argv = argv[1:]
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -386,7 +452,7 @@ def main(argv=None):
     p.add_argument("--jitter", type=int, default=1, help="keys: jittered copies of each annotated box")
     p.add_argument("--fresh", action="store_true", help="keys: redo")
     args = p.parse_args(argv)
-    {"motion": cmd_motion, "keys": cmd_keys, "extract": cmd_extract}[sub](args)
+    {"motion": cmd_motion, "keys": cmd_keys, "degrade": cmd_degrade, "extract": cmd_extract}[sub](args)
 
 
 if __name__ == "__main__":

@@ -45,6 +45,8 @@ DEFAULTS = {
                "lying_change": 0.20},
     "report": {"period_days": 3},
     "store": {"path": "herd.sqlite"},
+    # the barn's bursts kept for training identity on the barn's own cows (barn_dataset.py)
+    "training_cache": {"enabled": False, "every_n": 10, "folder": "training_cache", "max_gb": 200},
     "cameras": [],
 }
 

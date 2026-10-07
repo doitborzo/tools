@@ -1,5 +1,8 @@
 # herd
 
+Подробная инструкция на русском (что к чему, как работает, что не завершено и как
+завершить): [GUIDE.md](GUIDE.md).
+
 The barn system from the brief (up to 60 cows, 4-5 IP cameras looking down,
 partly overlapping): identify every cow by itself, record lying, standing,
 feeding, drinking, idle time every second and rumination every minute, report
@@ -149,6 +152,8 @@ time on tracks no cow could be given.
 | `common.py` | config (TOML over defaults), masks, crops, box interpolation |
 | `model.py` | DINOv2 frame encoder, frame heads, temporal transformer, losses |
 | `motion.py` | the rhythm of a burst's crops: what rumination (chewing) looks like |
+| `degrade.py` | bursts spoilt on purpose (occlusion, mud, blur, dark): what the quality heads learn on |
+| `barn_dataset.py` | the barn's own bursts (training cache) -> identity training across tracks and days |
 | `cbvd_bursts.py` | CBVD-5 -> bursts + keyframes -> Stage A vectors |
 | `train.py` | Stage A training, re-ID / posture / rumination scoring, cowbench export |
 | `eval_det.py` | the 1 fps heads on the detector's boxes: detector error included, cut-off sweep |

@@ -26,7 +26,8 @@ CREATE INDEX IF NOT EXISTS seconds_ts ON seconds(ts);
 CREATE INDEX IF NOT EXISTS seconds_track ON seconds(track);
 CREATE TABLE IF NOT EXISTS bursts (cam TEXT, track TEXT, ts REAL, state TEXT, cow TEXT, sim REAL, margin REAL,
                                    p REAL, rumination_p REAL, posture TEXT, activity TEXT, lameness REAL,
-                                   quality REAL, n_frames INTEGER, ruminating INTEGER);
+                                   quality REAL, n_frames INTEGER, ruminating INTEGER,
+                                   burst_quality REAL);
 CREATE INDEX IF NOT EXISTS bursts_ts ON bursts(ts);
 CREATE INDEX IF NOT EXISTS bursts_track ON bursts(track);
 CREATE TABLE IF NOT EXISTS events (ts REAL, kind TEXT, detail TEXT);
@@ -44,9 +45,10 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(bursts)")}
-        if "ruminating" not in cols:          # a store from before the burst decided it
-            self.db.execute("ALTER TABLE bursts ADD COLUMN ruminating INTEGER")
-            self.db.commit()
+        for name, kind in (("ruminating", "INTEGER"), ("burst_quality", "REAL")):
+            if name not in cols:              # a store from before the burst wrote it
+                self.db.execute(f"ALTER TABLE bursts ADD COLUMN {name} {kind}")
+        self.db.commit()
         self.lock = threading.Lock()
 
     def seconds(self, rows):
@@ -56,10 +58,10 @@ class Store:
 
     def burst(self, row):
         """cam, track, ts, state, cow, sim, margin, p, rumination_p, posture,
-        activity, lameness, quality, n_frames[, ruminating (0/1)]"""
-        row = tuple(row) + (None,) * (15 - len(row))
+        activity, lameness, quality, n_frames[, ruminating (0/1)[, burst_quality (0-1)]]"""
+        row = tuple(row) + (None,) * (16 - len(row))
         with self.lock:
-            self.db.execute("INSERT INTO bursts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
+            self.db.execute("INSERT INTO bursts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
             self.db.commit()
 
     def event(self, ts, kind, detail):

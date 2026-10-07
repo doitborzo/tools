@@ -118,7 +118,7 @@ class Gallery:
         os.replace(js + ".part", js)
 
     # ------------------------------------------------------------------ match
-    def match(self, fp, quality_max=0.0, quality_mean=0.0, area=0.05):
+    def match(self, fp, quality_max=0.0, quality_mean=0.0, area=0.05, burst_quality=None):
         """-> {"state": confirmed|tentative|unknown, "cow", "sim", "margin", "p"}."""
         fp = _norm(fp)
         if not self.cows:
@@ -131,8 +131,9 @@ class Gallery:
         margin = sim - second
         if self.abstain:
             row = {"sim": sim, "margin": margin, "quality_max": quality_max, "quality_mean": quality_mean,
-                   "area": area}
-            p = float(abstain_mod.predict(self.abstain, abstain_mod.feature_matrix([row]))[0])
+                   "area": area, "burst_quality": burst_quality}
+            feats = tuple(self.abstain.get("features", abstain_mod.FEATURES))
+            p = float(abstain_mod.predict(self.abstain, abstain_mod.feature_matrix([row], feats))[0])
             sure = p >= self.abstain["threshold"]
         else:                                # no reliability model yet: a plain margin rule
             p = None
