@@ -1,7 +1,7 @@
 # herd
 
-Подробная инструкция на русском (что к чему, как работает, что не завершено и как
-завершить): [GUIDE.md](GUIDE.md).
+The full guide (what is where, how it works, how to run it, what is unfinished and
+how to finish it): [GUIDE.md](GUIDE.md).
 
 The barn system from the brief (up to 60 cows, 4-5 IP cameras looking down,
 partly overlapping): identify every cow by itself, record lying, standing,
