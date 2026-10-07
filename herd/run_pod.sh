@@ -60,7 +60,16 @@ case "${1:-}" in
         MODEL="$WORK/herd/$RUN/model.pt"
         DET="${DET:-$WORK/lora-runs/detector/best}"
         [ -f "$MODEL" ] || { echo "no model at $MODEL - train first, or RUN=<run>"; exit 1; }
-        [ -f "$DET/det_train_meta.json" ] || { echo "no detector at $DET - set DET=<.../detector/best>"; exit 1; }
+        if [ ! -f "$DET/det_train_meta.json" ]; then
+            # not where the LoRA runs put it: the newest trained detector anywhere under WORK
+            found="$(find "$WORK" -maxdepth 7 -name det_train_meta.json -path '*/best/*' -printf '%T@ %h\n' 2>/dev/null \
+                     | sort -rn | head -1 | cut -d' ' -f2-)"
+            [ -n "$found" ] || { echo "no trained detector under $WORK (no best/det_train_meta.json)."
+                                 echo "copy one here or train it: bash cowbench/lora/run_lora.sh (detector steps),"
+                                 echo "then DET=<.../detector/best> bash $0 stress"; exit 1; }
+            echo "detector: $found"
+            DET="$found"
+        fi
         SOUT="$WORK/herd/stress_$RUN"
         mkdir -p "$SOUT"
         cmd="$(printf '%q ' "$VENV/bin/python" "$HERE/herd.py" stress --model "$MODEL" --detector "$DET" \
