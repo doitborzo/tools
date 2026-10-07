@@ -43,7 +43,7 @@ scaffold that switches on with the barn's footage (section 8).
 | A 7 s, 25 fps burst a minute, cameras in turn | `pipeline.Camera.burst`, `step_burst` | works, tested with 5 cameras (section 6) |
 | A small Temporal Transformer attends to the burst's frames | `model.TemporalModel` (3 layers, d=256) | works and is trained |
 | The cow's embedding (fingerprint) = weighted average over the frames | `quality` head → frame weights → `fingerprint` | works; weights are learnt (directly with `--quality 1`) |
-| Good burst / bad burst (mud, hidden behind another cow) | `--quality 1`: spoilt frames (`degrade.py`) + `burst_quality` head | **built, to be trained on the pod** (section 5, step 6) |
+| Good burst / bad burst (mud, hidden behind another cow) | `--quality 1`: spoilt frames (`degrade.py`) teach the frame `quality` head; the NaN model judges the burst from the match and the frame qualities | **built, to be trained on the pod** (section 5, step 6) |
 | Gait, identification across days | scaffold `barn_dataset.py` + `train.py --extra-train` | **waits for barn footage** (section 8.1) |
 | K-means over the herd's week, the cluster closest to the fingerprint | `gallery.py`: per cow up to 6 k-means centres of her bursts over 7 days | works (tested on synthetic data) |
 | NaN when unsure | `abstain.py`: p(right) from similarity, margin, quality; a cut-off | works: on CBVD-5 val answers ~86–91% of the time at ~0.3–1% wrong |
@@ -74,7 +74,7 @@ once a minute (cameras in turn, 60/N s apart):
          -> DINOv2-S -> 175 vectors
          -> pixel rhythm (motion.py, on the CPU alongside)
          -> TemporalModel -> weight of every frame, fingerprint (512 numbers),
-                             burst quality, rumination, posture, activity, lameness
+                             rumination, posture, activity, lameness
          -> gallery: nearest cow + NaN model -> confirmed / tentative / unknown
          -> table bursts (who, ruminating or not, quality ...)
          -> (if enabled) every N-th burst into the training cache
@@ -141,7 +141,6 @@ other frame of the burst. Outputs:
 | `quality` (per frame) | how useful the frame is → frame weights (softmax) | through the ID loss; with `--quality 1` also directly: spoilt frames (`degrade.py`) must score low |
 | `frame_ids` (per frame) | one frame's fingerprint (512) | ID loss |
 | `fingerprint` | **the weighted average of the frame fingerprints** — the burst's fingerprint | SupCon: two pieces of one burst are one cow, the rest of the batch other cows. With barn data: all bursts of one cow |
-| `burst_quality` | 0–1: will this burst find its own cow (good / bad burst) | with `--quality 1`: the target is whether the burst's fingerprint found its own cow in the batch |
 | `rumination` | probability of rumination | from the CBVD-5 labels; with `MOTION=1` it also gets the motion rhythm |
 | `posture`, `activity` | posture, activity over the burst | from the labels |
 | `lameness` | lameness score | **no labels** — off |
@@ -179,7 +178,7 @@ same "nearest cluster to the fingerprint", only sturdier.
 ### 4.7 NaN model (`abstain.py`)
 
 A small logistic regression: p(the answer is right) from the similarity, the margin to
-the second cow, frame quality, cow size and (when the model has it) `burst_quality`.
+the second cow, frame quality and cow size.
 It is fitted on the dev clips (spoilt bursts included, when they have been made). The
 cut-off is set so that at most `MAX_ERROR` (1% by default) of the answers given are
 wrong. "Not sure" is a NaN in the reports.
@@ -218,7 +217,7 @@ Knobs (`NAME=value bash herd/run_pod.sh`):
 | `EPOCHS` | 40 | maximum epochs (early stopping applies) |
 | `POS` | 0 | 1: the heads know where the cow is in the frame (1 recommended) |
 | `MOTION` | 1 | motion rhythm for rumination |
-| `QUALITY` | 1 | good / bad burst taught directly |
+| `QUALITY` | 1 | frame quality taught directly on spoilt frames |
 | `DET_KEYS` | 1 | frame heads also learn on the detector's boxes |
 | `GRID` | 2 | DINOv2 patch grid (4: finer, features 3.4x larger) |
 | `MARGIN` | 0.1 | context around the box in the crop (0.5 was worse: neighbouring cows) |
@@ -273,8 +272,6 @@ One table of every run: `python cowbench/summary.py /workspace/herd /workspace/l
   - `reid_spoilt_weighted` and `reid_spoilt_uniform` — re-identification from spoilt
     bursts with the frame weights and with a plain average; the difference is what the
     weights win;
-  - `burst_quality_auc` — does `burst_quality` tell bursts that find their cow from
-    those that do not;
   - `barn_reid_cross_track_top1` — barn data only: identification across tracks and
     days.
 - `eval-val/report.md` — the full cowbench report (the same 2532 cows as the LoRA
@@ -435,7 +432,7 @@ above, feed a larger crop of the head and neck instead of the whole cow.
 ### 8.6 Coat colour and NaN
 
 Solid-coloured cows (no pattern) are harder to identify. The system should say NaN for
-them more often by itself: their margin to the second cow and their `burst_quality` are
+them more often by itself: their margin to the second cow and their frame quality are
 lower. This can only be checked in the barn: look at `abstain.json` on barn data and at
 how often such cows get NaN. If needed, give them a separate error budget.
 
@@ -484,7 +481,7 @@ Store tables (`store.py`):
 - `seconds` — track and second: box, posture, activity;
 - `bursts` — track and burst: the gallery's decision (`state`, `cow`, `sim`, `margin`,
   `p`), `rumination_p`, `ruminating`, burst posture and activity, lameness, frame
-  quality, `burst_quality`;
+  quality;
 - `events` — enrolments, retirements, change-overs, nightly rebuilds;
 - `alerts`, `verdicts` — alerts and the vet's answers.
 

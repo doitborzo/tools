@@ -32,7 +32,7 @@ SQLite (seconds, bursts) -> track -> cow from confirmed bursts -> per-cow days
 | Rumination in a burst | the temporal model's head plus the rhythm of the burst's own crops (motion.py: per-pixel spectrum over the 7 s, bands around 1 chew a second, per cell of a 4x4 grid); ruminating = p over the cut-off calibrated with the model (heads.json) and not feeding or drinking; written per burst (`bursts.ruminating`), summed into minutes by the reports |
 | Identity between bursts | the tracker carries it; a track gets the cow most of its confirmed bursts say (2/3), else its time is NaN |
 | k-means | per cow (her own looks: lying, walking, dirty), rebuilt nightly from confirmed bursts only |
-| NaN | a small model of p(right) from similarity, margin to the next cow, burst quality, cow size; cut-off so that ≤1% of answers are wrong |
+| NaN | a small model of p(right) from similarity, margin to the next cow, frame quality, cow size; cut-off so that ≤1% of answers are wrong |
 | New cows (no RFID) | unknown bursts are pooled; tracks are grouped; a group seen often becomes `new-<date>-<n>`; first start enrols the herd this way. Tuesday 10:00 starts a change-over; cows unseen 48 h after it retire. `names.json` (optional) maps ids to ear tags for reports |
 | Overlapping cameras | each camera's mask covers only the floor it owns; a cow counts where her box centre is |
 | Cameras do not see everything | reports carry observed minutes and shares, not just hours |

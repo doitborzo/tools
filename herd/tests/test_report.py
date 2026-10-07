@@ -67,3 +67,19 @@ def test_csv_alerts_verdicts():
     report.add_verdict(st, alerts[1][0], False)
     stats = {s["kind"]: s for s in report.alert_stats(st)}
     assert sum(s["confirmed"] for s in stats.values()) == 1 and all(s["answered"] == 1 for s in stats.values())
+
+
+def test_store_from_older_version():
+    """A store made while bursts still had a burst_quality column takes new bursts."""
+    import sqlite3
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "old.sqlite")
+        db = sqlite3.connect(path)
+        db.execute("CREATE TABLE bursts (cam TEXT, track TEXT, ts REAL, state TEXT, cow TEXT, sim REAL, "
+                   "margin REAL, p REAL, rumination_p REAL, posture TEXT, activity TEXT, lameness REAL, "
+                   "quality REAL, n_frames INTEGER, ruminating INTEGER, burst_quality REAL)")
+        db.commit()
+        db.close()
+        st = Store(path)
+        st.burst(("cam1", "t1", 1.0, "confirmed", "A", 0.9, 0.2, 0.99, 0.1, "lying", "none", None, 0.5, 175, 0))
+        assert st.query("SELECT cow, ruminating, burst_quality FROM bursts") == [("A", 0, None)]

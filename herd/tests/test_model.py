@@ -41,6 +41,16 @@ def test_motion_branch_and_old_checkpoints():
         back, _ = HerdModel.load(os.path.join(d, "m.pt"))
     assert back.motion_dim == 0 and back.temporal.motion is None
     assert back.temporal(x, t, valid)["rumination"].shape == (2,)
+    # a model saved with the removed burst-quality head loads without it
+    with tempfile.TemporaryDirectory() as d:
+        old.save(os.path.join(d, "bq.pt"))
+        ck = torch.load(os.path.join(d, "bq.pt"), weights_only=False)
+        ck["kw"]["burst_quality"] = True
+        ck["state"]["temporal.burst_quality.weight"] = torch.zeros(1, 32)
+        ck["state"]["temporal.burst_quality.bias"] = torch.zeros(1)
+        torch.save(ck, os.path.join(d, "bq.pt"))
+        back, _ = HerdModel.load(os.path.join(d, "bq.pt"))
+    assert "burst_quality" not in back.temporal(x, t, valid)
 
 
 def test_motion_features_find_a_rhythm():

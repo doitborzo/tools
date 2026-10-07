@@ -206,10 +206,7 @@ class Models:
                    "rumination": float(o["rumination"][0].sigmoid()),
                    "posture": POSTURES[int(o["posture"][0].argmax())],
                    "activity": ACTIVITIES[int(o["activity"][0].argmax())],
-                   "lameness": float(o["lameness"][0]) if self.lameness else None,
-                   # good burst or bad: will it identify the cow (train.py --quality)
-                   "burst_quality": (float(o["burst_quality"][0].sigmoid())
-                                     if o.get("burst_quality") is not None else None)}
+                   "lameness": float(o["lameness"][0]) if self.lameness else None}
         # a cow that feeds or drinks is not ruminating, whatever the head says
         out["ruminating"] = bool(out["rumination"] >= self.rum_thr and out["activity"] == "none")
         return out
@@ -384,14 +381,14 @@ class Camera:
             self.store.burst((self.id, tid, t0, decision["state"], decision["cow"], decision["sim"],
                               decision["margin"], decision["p"], out["rumination"], out["posture"],
                               out["activity"], out["lameness"], out["quality_max"], int(valid.sum()),
-                              int(out["ruminating"]), out.get("burst_quality")))
+                              int(out["ruminating"])))
             part["gallery"] += time.perf_counter() - t
             if self.cache is not None:
                 from model import box_pos
                 self.cache.add(self.id, tid, t0, feats.float().cpu().numpy(), rel, valid, motion,
                                np.mean([box_pos(b) for b in boxes], 0), crops[len(crops) // 2],
                                {"state": decision["state"], "cow": decision["cow"], "sim": decision["sim"],
-                                "p": decision["p"], "area": area, "burst_quality": out.get("burst_quality")})
+                                "p": decision["p"], "area": area})
             cows += 1
             crops_n += len(crops)
             rum_p.append(round(out["rumination"], 3))
@@ -427,8 +424,7 @@ class SharedGallery:
                 res = self.g.nightly(ts)
                 self.store.event(ts, "nightly", json.dumps(res))
                 self.next_nightly = self._next_hour(ts, self.cfg["farm"]["nightly_hour"])
-            d = self.g.match(out["fingerprint"], out["quality_max"], out["quality_mean"], area,
-                             out.get("burst_quality"))
+            d = self.g.match(out["fingerprint"], out["quality_max"], out["quality_mean"], area)
             self.g.observe(d, out["fingerprint"], ts, track)
             return d
 

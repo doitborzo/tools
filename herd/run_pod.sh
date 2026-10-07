@@ -27,10 +27,9 @@
 #                     barrier); another MARGIN extracts into its own features_m<MARGIN>
 #   MOTION=1          the rhythm of each burst (chewing, motion.py) to the rumination and activity
 #                     heads; computed once from the videos on the CPU (step 5), 0: without
-#   QUALITY=1         good burst / bad burst taught directly: stretches of every burst spoilt
+#   QUALITY=1         frame quality taught directly: stretches of every burst spoilt
 #                     (degrade.py: another cow in front, mud, blur, dark) and encoded (step 6,
-#                     GPU), the quality head learns to weigh them down and a burst-quality head
-#                     whether the burst will identify the cow; 0: without
+#                     GPU), the quality head learns to weigh them down; 0: without
 #   DET_KEYS=1        the frame heads also learn on the detector's boxes (+ jittered annotated
 #                     boxes), so they answer as well on what the barn gives them (step 6)
 #   POS=0             1: the heads also get where the cow is in the frame (fixed cameras: the
@@ -243,7 +242,7 @@ fi
 echo
 echo "Done. In $OUT:"
 echo "  model.pt            the temporal transformer + heads (and the frame heads)"
-echo "  eval_val.json       also: frame_quality_auc, reid_spoilt_weighted vs _uniform, burst_quality_auc"
+echo "  eval_val.json       also: frame_quality_auc, reid_spoilt_weighted vs _uniform"
 echo "  eval_val.json       val: re-ID top-1, posture / activity errors, rumination recall"
 echo "  eval-val/report.md  the same keyframes as the LoRA runs, cowbench format"
 echo "  abstain.json        when to answer NaN, and how often it does"

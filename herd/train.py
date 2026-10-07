@@ -313,7 +313,7 @@ class _Subset:
 # ----------------------------------------------------------------- scoring
 
 def embed(model, split, ids, crop_s, starts, batch=64, degrade=False):
-    """Deterministic views -> fingerprints, quality weights, burst head outputs.
+    """Deterministic views -> fingerprints, quality weights, burst-level head outputs.
     degrade: the views with their spoilt frames in (needs cbvd_bursts.py degrade);
     then also the plain average of the frame ids (no quality weights) and every
     frame's quality with whether it was spoilt - to score the quality head."""
@@ -328,8 +328,6 @@ def embed(model, split, ids, crop_s, starts, batch=64, degrade=False):
                                      degrade_p=1.0 if degrade else 0.0, with_clean=True)
             o = model.temporal(x, t, v, positions(split.burst_pos, chunk),
                                motion_of(split, chunk) if model.motion_dim else None)
-            if o.get("burst_quality") is not None:
-                out["burst_quality"].append(o["burst_quality"].sigmoid().cpu())
             if degrade:
                 vf = v.float().unsqueeze(-1)
                 out["fingerprint_uniform"].append(torch.nn.functional.normalize(
@@ -372,7 +370,6 @@ def reid(model, split, crop_s, degrade=False):
                          "sim": float(s[i, best]), "margin": float(s[i, best] - s[i, second]),
                          "quality_max": float(q["quality_max"][i]), "quality_mean": float(q["quality_mean"][i]),
                          "area": float(split.bursts[i]["area"]), "n_candidates": len(cands),
-                         "burst_quality": float(q["burst_quality"][i]) if "burst_quality" in q else None,
                          "spoilt": bool(degrade)})
     return rows, q
 
@@ -397,10 +394,7 @@ def identity_reid(model, split):
         return {"barn_queries": 0}
     best = sim.argmax(1)
     hit = ident[best] == ident
-    out = {"barn_queries": int(askable.sum()), "barn_reid_cross_track_top1": float(hit[askable].mean())}
-    if "burst_quality" in e:
-        out["barn_burst_quality_auc"] = auc(e["burst_quality"][askable], hit[askable])
-    return out
+    return {"barn_queries": int(askable.sum()), "barn_reid_cross_track_top1": float(hit[askable].mean())}
 
 
 def auc(score, label):
@@ -416,11 +410,10 @@ def auc(score, label):
 
 
 def quality_eval(model, split, crop_s):
-    """Good burst / bad burst, scored on spoilt views (degrade.py) of the split:
+    """Frame quality, scored on spoilt views (degrade.py) of the split:
        frame_quality_auc        the quality head ranks clean frames above spoilt ones
        reid_spoilt_weighted     re-ID with spoilt queries, frames weighed by quality (the model)
        reid_spoilt_uniform      the same with a plain average of the frames: what the weights win
-       burst_quality_auc        the burst-quality head ranks right matches above wrong ones
     None until the split has spoilt twins."""
     if split.deg_idx is None:
         return {}
@@ -430,12 +423,9 @@ def quality_eval(model, split, crop_s):
     q = embed(model, split, ids, crop_s, {i: T - crop_s for i in ids}, degrade=True)
     right = lambda f: (np.argmax(f @ g["fingerprint"].T, 1) == np.arange(len(ids)))
     hit_w, hit_u = right(q["fingerprint"]), right(q["fingerprint_uniform"])
-    m = {"frame_quality_auc": auc(q["frame_quality"], q["frame_clean"]),
-         "spoilt_frame_share": float(1 - np.mean(q["frame_clean"])),
-         "reid_spoilt_weighted": float(hit_w.mean()), "reid_spoilt_uniform": float(hit_u.mean())}
-    if "burst_quality" in q:
-        m["burst_quality_auc"] = auc(q["burst_quality"], hit_w)
-    return m
+    return {"frame_quality_auc": auc(q["frame_quality"], q["frame_clean"]),
+            "spoilt_frame_share": float(1 - np.mean(q["frame_clean"])),
+            "reid_spoilt_weighted": float(hit_w.mean()), "reid_spoilt_uniform": float(hit_u.mean())}
 
 
 def frame_predictions(model, split, batch=1024):
@@ -601,11 +591,10 @@ def cmd_train(args):
     if args.motion and not train.motion_dim:
         sys.exit("--motion 1 needs the motion features: herd.py motion --split train (and val)")
     model = HerdModel(train.dim, use_pos=bool(args.pos), d=args.d, layers=args.layers, heads=args.heads,
-                      motion_dim=train.motion_dim if args.motion else 0,
-                      burst_quality=bool(args.quality)).to(device())
+                      motion_dim=train.motion_dim if args.motion else 0).to(device())
     if args.quality:
         print(f"[train] quality taught directly: {args.degrade_p:.0%} of the views carry spoilt frames "
-              "(occlusion, mud, blur, dark); burst-quality head on", flush=True)
+              "(occlusion, mud, blur, dark)", flush=True)
     if args.motion:
         print(f"[train] motion features: {train.motion_dim} per burst -> rumination, activity", flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
@@ -656,23 +645,13 @@ def cmd_train(args):
             l_fp = masked_ce(fo["posture"], torch.tensor([train.keys[i]["posture"] for i in kidx], device=device()))
             l_fa = masked_ce(fo["activity"], torch.tensor([train.keys[i]["activity"] for i in kidx], device=device()))
             loss = args.w_id * l_id + l_post + l_act + l_rum + l_fp + l_fa
-            l_q = l_bq = torch.zeros((), device=device())
+            l_q = torch.zeros((), device=device())
             if args.quality:
                 # frames: a spoilt one (mud, another cow in front, blur, dark) must score below a clean one
                 valid = torch.cat([padt(v1, False), padt(v2, False)])
                 clean = torch.cat([padt(c1, 1.0), padt(c2, 1.0)])
                 l_q = torch.nn.functional.binary_cross_entropy_with_logits(o["quality"][valid], clean[valid])
-                # the burst as a whole: will its fingerprint find its own cow among the batch's?
-                with torch.no_grad():
-                    f = o["fingerprint"].detach()
-                    B = len(ids)
-                    sim = f[:B] @ f[B:].T
-                    same = ident[:B].unsqueeze(1) == ident[B:].unsqueeze(0)
-                    hit1 = same[torch.arange(B), sim.argmax(1)]
-                    hit2 = same[sim.argmax(0), torch.arange(B)]
-                l_bq = torch.nn.functional.binary_cross_entropy_with_logits(
-                    o["burst_quality"], torch.cat([hit1, hit2]).float())
-                loss = loss + args.w_quality * (l_q + l_bq)
+                loss = loss + args.w_quality * l_q
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -681,7 +660,7 @@ def cmd_train(args):
             step += 1
             for k, v in (("id", l_id), ("posture", l_post), ("activity", l_act), ("rumination", l_rum),
                          ("frame_posture", l_fp), ("frame_activity", l_fa), ("quality", l_q),
-                         ("burst_quality", l_bq), ("total", loss)):
+                         ("total", loss)):
                 losses[k].append(float(v.detach()))
         m, _, _, _ = evaluate(model, dev, args.crop_s)
         # recall alone rewarded calling everything rumination (run1 kept epoch 3 of 40 for it)
@@ -738,7 +717,7 @@ def cmd_eval(args):
     if base is not None:
         m["rumination_f1_motion_only"] = base
     m["motion"] = bool(model.motion_dim)
-    if model.has_burst_quality or val.deg_idx is not None:
+    if val.deg_idx is not None:
         m.update(quality_eval(model, val, ck["crop_s"]))
     for folder in args.extra_val or []:
         m.update(identity_reid(model, Split(folder)))
@@ -774,10 +753,10 @@ def main(argv=None):
     p.add_argument("--det-keys", type=int, default=0,
                    help="1: the frame heads also learn on detector / jittered boxes; needs herd.py keys --split train")
     p.add_argument("--quality", type=int, default=0,
-                   help="1: teach the quality head on spoilt frames and add a burst-quality head; "
+                   help="1: teach the frame quality head on spoilt frames; "
                         "needs herd.py degrade --split train (and val to score it)")
     p.add_argument("--degrade-p", type=float, default=0.5, help="share of training views with spoilt frames")
-    p.add_argument("--w-quality", type=float, default=0.5, help="weight of the two quality losses")
+    p.add_argument("--w-quality", type=float, default=0.5, help="weight of the frame quality loss")
     p.add_argument("--extra-train", nargs="*", default=None,
                    help="more feature folders for identity only (barn_dataset.py): bursts carry an identity")
     p.add_argument("--extra-val", nargs="*", default=None,

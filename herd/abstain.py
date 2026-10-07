@@ -30,12 +30,10 @@ import numpy as np
 from common import device, read_jsonl, write_json
 
 FEATURES = ("sim", "margin", "quality_max", "quality_mean", "log_area")
-# + "burst_quality" when the model has the burst-quality head (train.py --quality)
 
 
 def feature_matrix(rows, features=FEATURES):
-    col = {"log_area": lambda r: np.log(max(r["area"], 1e-4)),
-           "burst_quality": lambda r: r.get("burst_quality") if r.get("burst_quality") is not None else 0.5}
+    col = {"log_area": lambda r: np.log(max(r["area"], 1e-4))}
     return np.array([[col[f](r) if f in col else r[f] for f in features] for r in rows], dtype=np.float64)
 
 
@@ -84,12 +82,11 @@ def cmd(args):
     dev = train_mod.Split(os.path.join(args.features, "train"), set(ck["dev_clips"]))
     rows, _ = train_mod.reid(model, dev, ck["crop_s"])
     # bad bursts too (degrade.py), when made: the barn has them, and only from them
-    # can the NaN model learn that a low burst quality means "do not trust"
+    # can the NaN model learn that low frame quality means "do not trust"
     if dev.deg_idx is not None:
         rows += train_mod.reid(model, dev, ck["crop_s"], degrade=True)[0]
     rows = [r for r in rows if r["scope"] == args.scope]
-    features = FEATURES + (("burst_quality",) if rows and all(r.get("burst_quality") is not None for r in rows)
-                           else ())
+    features = FEATURES
     X, y = feature_matrix(rows, features), np.array([r["correct"] for r in rows], float)
     m = fit_logistic(X, y)
     p = predict(m, X)
