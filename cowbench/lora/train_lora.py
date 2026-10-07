@@ -49,7 +49,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH = os.path.dirname(HERE)
-sys.path.insert(0, BENCH)
+if BENCH not in sys.path:   # herd imports this with cowbench already on its path
+    sys.path.insert(0, BENCH)
 
 import cbvd  # noqa: E402
 import client as client_mod  # noqa: E402

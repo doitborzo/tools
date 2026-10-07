@@ -159,6 +159,8 @@ def build(args):
     cfg["detector"]["weights"] = args.detector or cfg["detector"]["weights"]
     if args.threshold is not None:
         cfg["detector"]["threshold"] = args.threshold
+    if args.det_tiles is not None:
+        cfg["detector"]["tiles"] = bool(args.det_tiles)
     s = cfg["sampling"]
     s["burst_every_s"] = args.burst_every or s["burst_every_s"]
     s["burst_seconds"] = args.burst_seconds or s["burst_seconds"]
@@ -426,7 +428,8 @@ def fmt(d, k="p50", unit="", dd=2):
 def markdown(res):
     a, L, D = res.get("alone"), res.get("live"), res.get("detector_check")
     out = [f"# herd: one GPU, {L['cameras'] if L else '-'} cameras", "",
-           f"- model: `{res['model']}`", f"- detector: `{res['detector']}` on {res['detector_device']}",
+           f"- model: `{res['model']}`", f"- detector: `{res['detector']}` on {res['detector_device']}"
+           + (", whole frame + tiles" if res.get("detector_tiles") else ""),
            f"- GPU: {res.get('gpu_name') or '-'}", ""]
     if D:
         q5, q3 = D["iou0.5"], D["iou0.3"]
@@ -504,7 +507,8 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", default=None, help="herd checkpoint (model.pt)")
     p.add_argument("--detector", default=None, help="RT-DETRv2 best/ folder")
-    p.add_argument("--threshold", type=float, default=None)
+    p.add_argument("--threshold", type=float, default=None, help="detector score cut-off (eval-det's sweep picks one)")
+    p.add_argument("--det-tiles", type=int, default=None, help="1: detector on the whole frame + tiles (~3x its work)")
     p.add_argument("--config", default=None, help="a barn TOML (optional): sampling, model, detector")
     p.add_argument("--root", default="/workspace/cbvd5")
     p.add_argument("--cameras", type=int, default=5)
@@ -528,6 +532,7 @@ def main(argv=None):
     cfg, models, shared, store = build(args)
     res = {"model": cfg["model"]["checkpoint"], "detector": cfg["detector"]["weights"],
            "detector_device": getattr(models.detector, "device", "?"),
+           "detector_tiles": bool(getattr(models.detector, "tiles", False)),
            "burst_seconds": cfg["sampling"]["burst_seconds"], "clips": len(clips),
            "motion": bool(models.motion_dim), "rumination_threshold": models.rum_thr}
     if models.dev.type == "cuda":

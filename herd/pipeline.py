@@ -137,7 +137,8 @@ class Models:
             self.detector = detector
         else:
             import detector as det_mod
-            self.detector = det_mod.Live(cfg["detector"]["weights"], cfg["detector"]["threshold"])
+            self.detector = det_mod.Live(cfg["detector"]["weights"], cfg["detector"]["threshold"],
+                                         tiles=cfg["detector"].get("tiles"))
         self.lameness = cfg["lameness"]["enabled"]
         self.motion_dim = self.model.motion_dim
         # The cut-off calibrated with the model: "ruminating" per burst, summed

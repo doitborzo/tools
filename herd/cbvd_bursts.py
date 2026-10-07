@@ -7,6 +7,10 @@
              features/<split>/index.jsonl  one row per burst and per keyframe, with labels
     motion   videos -> the rhythm of each burst's crops (motion.py), no GPU:
              features/<split>/<clip>.motion.npz   motion (B, DIM), ok (B,)
+    keys     the detector on every keyframe -> its boxes, matched to the annotated
+             cows, and one jittered copy of each annotated box, encoded like the
+             keyframes: what the once-a-second heads get in the barn
+             features/<split>/keys_aug.npz (feats), keys_aug.jsonl (rows)
 
 A burst is 7 s at 25 fps of one cow. CBVD-5 clips are 10 s at 25 fps with
 keyframes at whole seconds (keyframe t = frame t*25, checked in cowbench's
@@ -266,6 +270,89 @@ def cmd_motion(args):
                    "margin": meta.get("margin", 0.1)}, fh, indent=2)
 
 
+def jitter_box(b, rng, shift=0.12, scale=0.15):
+    """An annotated box as a detector might draw it: centre moved up to `shift`
+    of its size, each side scaled by up to `scale`."""
+    w, h = b[2] - b[0], b[3] - b[1]
+    cx = (b[0] + b[2]) / 2 + rng.uniform(-shift, shift) * w
+    cy = (b[1] + b[3]) / 2 + rng.uniform(-shift, shift) * h
+    w *= rng.uniform(1 - scale, 1 + scale)
+    h *= rng.uniform(1 - scale, 1 + scale)
+    return [max(0.0, cx - w / 2), max(0.0, cy - h / 2), min(1.0, cx + w / 2), min(1.0, cy + h / 2)]
+
+
+def cmd_keys(args):
+    """Keyframe crops as the barn makes them: from the detector's boxes (matched
+    to the annotated cows at IoU >= --match-iou, loose boxes included - the
+    heads have to answer about those too) and jittered annotated boxes. Labels
+    are the annotated cow's. Same encoder, grid, crop and margin as extract."""
+    import torch
+    import detect as detect_mod
+    import detector as det_mod
+    from model import FrameEncoder
+    from common import device
+    out_dir = os.path.join(args.out, args.split)
+    meta = json.load(open(os.path.join(out_dir, "meta.json"), encoding="utf-8"))
+    keys = [r for r in read_jsonl(os.path.join(out_dir, "index.jsonl")) if r["kind"] == "key"]
+    by_frame = collections.defaultdict(list)
+    for r in keys:
+        by_frame[(r["clip"], r["timestamp"])].append(r)
+    out_path = os.path.join(out_dir, "keys_aug.npz")
+    meta_path = os.path.join(out_dir, "keys_aug_meta.json")
+    det = det_mod.Live(args.detector, args.det_threshold, tiles=args.det_tiles)
+    made_with = {"detector": os.path.abspath(args.detector), "threshold": det.threshold, "tiles": det.tiles,
+                 "match_iou": args.match_iou, "jitter": args.jitter}
+    if os.path.exists(out_path) and os.path.exists(meta_path) and not args.fresh:
+        if json.load(open(meta_path, encoding="utf-8")) == made_with:
+            print(f"[keys] done already with this detector: {out_path} (--fresh to redo)")
+            return
+        print("[keys] made with another detector or settings - redoing", flush=True)
+    enc = FrameEncoder(meta["encoder"], meta["grid"]).to(device()).eval()
+    size, margin = meta.get("crop", 224), meta.get("margin", 0.1)
+    rng = random.Random(args.seed)
+    rows, feats = [], []
+    n_det = n_missed = 0
+    t0 = time.time()
+    frames = sorted(by_frame.items(), key=lambda kv: (int(kv[0][0]), kv[0][1]))
+    for k, ((clip, ts), gts) in enumerate(frames, 1):
+        img = cbvd_frame(args.root, clip, ts)
+        arr = np.asarray(img)
+        boxes = [c["bbox"] for c in det(img)]
+        pairs = detect_mod.match(boxes, [g["bbox"] for g in gts], args.match_iou)
+        crops, new = [], []
+        for i, j, v in pairs:
+            crops.append(crop(arr, boxes[i], size, margin))
+            new.append({"source": "detector", "iou": round(v, 3), "bbox": boxes[i], "g": gts[j]})
+        n_det += len(pairs)
+        n_missed += len(gts) - len(pairs)
+        for g in gts:
+            for _ in range(args.jitter):
+                b = jitter_box(g["bbox"], rng)
+                crops.append(crop(arr, b, size, margin))
+                new.append({"source": "jitter", "iou": None, "bbox": b, "g": g})
+        if crops:
+            with torch.no_grad():
+                feats.append(encode(enc, np.stack(crops)))
+            for r in new:
+                g = r.pop("g")
+                rows.append({"clip": clip, "uid": g["uid"], "timestamp": ts, "posture": g["posture"],
+                             "activity": g["activity"], "rumination": g["rumination"], **r})
+        el = time.time() - t0
+        print(f"\r  {k}/{len(frames)} keyframes, {n_det} detector boxes on cows, {n_missed} cows it missed  "
+              f"{el / 60:.1f} min  ~{el / k * (len(frames) - k) / 60:.0f} min left", end="", flush=True)
+    print(flush=True)
+    feats = np.concatenate(feats) if feats else np.zeros((0, meta["dim"]), np.float16)
+    np.savez(out_path + ".part.npz", feats=feats)
+    with open(os.path.join(out_dir, "keys_aug.jsonl"), "w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+    os.replace(out_path + ".part.npz", out_path)
+    with open(meta_path, "w", encoding="utf-8") as fh:
+        json.dump(made_with, fh, indent=2)
+    print(f"[keys] {args.split}: {len(rows)} crops ({n_det} from the detector, "
+          f"{sum(1 for r in rows if r['source'] == 'jitter')} jittered) -> {out_path}")
+
+
 def cbvd_frame(root, clip, ts):
     from PIL import Image
     return Image.open(cbvd.frame_path(root, cbvd.Box(clip, ts, 0, 0, 0, 0, "1", ()))).convert("RGB")
@@ -273,8 +360,8 @@ def cbvd_frame(root, clip, ts):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    motion = bool(argv) and argv[0] == "motion"
-    if motion:
+    sub = argv[0] if argv and argv[0] in ("motion", "keys") else "extract"
+    if sub != "extract":
         argv = argv[1:]
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--root", default="/workspace/cbvd5")
@@ -292,8 +379,14 @@ def main(argv=None):
     p.add_argument("--photo-aug", type=int, default=1)
     p.add_argument("--limit-clips", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--detector", default="/workspace/lora-runs/detector/best", help="keys: RT-DETRv2 best/")
+    p.add_argument("--det-threshold", type=float, default=None, help="keys: default the detector's own")
+    p.add_argument("--det-tiles", type=int, default=None, help="keys: whole frame + tiles; default as trained")
+    p.add_argument("--match-iou", type=float, default=0.3, help="keys: detector box <-> annotated cow")
+    p.add_argument("--jitter", type=int, default=1, help="keys: jittered copies of each annotated box")
+    p.add_argument("--fresh", action="store_true", help="keys: redo")
     args = p.parse_args(argv)
-    (cmd_motion if motion else cmd_extract)(args)
+    {"motion": cmd_motion, "keys": cmd_keys, "extract": cmd_extract}[sub](args)
 
 
 if __name__ == "__main__":

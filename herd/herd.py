@@ -4,6 +4,7 @@
 Training (on CBVD-5 today, on the barn's own footage later):
     herd.py extract  --split train|val      frozen DINOv2 vectors of every crop (Stage A input)
     herd.py motion   --split train|val      the rhythm of every burst (chewing), CPU only
+    herd.py keys     --split train          keyframe crops from the detector's boxes (+ jittered), for --det-keys
     herd.py train                           temporal transformer + all heads on those vectors
     herd.py eval                            val scores + cowbench-format results
     herd.py eval-det --run R                the same on the detector's boxes: detector misses count
@@ -59,9 +60,9 @@ def main():
     if cmd == "extract":
         import cbvd_bursts
         return cbvd_bursts.main(argv)
-    if cmd == "motion":
+    if cmd in ("motion", "keys"):
         import cbvd_bursts
-        return cbvd_bursts.main(["motion"] + argv)
+        return cbvd_bursts.main([cmd] + argv)
     if cmd in ("train", "eval"):
         import train
         return train.main([cmd] + argv)

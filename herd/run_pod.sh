@@ -11,6 +11,11 @@
 #                                 1 fps + a 7 s burst a minute each (tmux "herd-stress", ~7 min);
 #                                 RUN= the model (default: the newest run), DET= the detector's best/,
 #                                 CAMERAS=5 DURATION=300 (s measured)
+#   bash herd/run_pod.sh detector a new RT-DETRv2 for Full HD and far cows (tmux "herd-det", hours):
+#                                 input DET_SIZE=1088 (a 1080x1080 tile at ~native size), zoom
+#                                 crops in training, whole frame + tiles, epoch and threshold by F2
+#                                 (a missed cow costs more than an extra box) -> WORK/herd/detector_fhd;
+#                                 then eval-det of the newest run with it. DET_EPOCHS=24 DET_BATCH=8
 #
 # Every step resumes: features are written clip by clip, so a rerun after a
 # crash continues where it stopped. Knobs:
@@ -22,6 +27,8 @@
 #                     barrier); another MARGIN extracts into its own features_m<MARGIN>
 #   MOTION=1          the rhythm of each burst (chewing, motion.py) to the rumination and activity
 #                     heads; computed once from the videos on the CPU (step 5), 0: without
+#   DET_KEYS=1        the frame heads also learn on the detector's boxes (+ jittered annotated
+#                     boxes), so they answer as well on what the barn gives them (step 6)
 #   POS=0             1: the heads also get where the cow is in the frame (fixed cameras: the
 #                     feed barrier is a place in the picture); no new features needed
 
@@ -38,6 +45,7 @@ MAX_ERROR="${MAX_ERROR:-0.01}"
 MARGIN="${MARGIN:-0.1}"
 POS="${POS:-0}"
 MOTION="${MOTION:-1}"
+DET_KEYS="${DET_KEYS:-1}"
 DATA="$WORK/cbvd5"
 # Features depend on margin and grid: another value gets its own folder
 # (a shared one would be skipped as "done" and silently reused).
@@ -51,11 +59,16 @@ SESSION=herd
 DATASET_URL="https://www.kaggle.com/api/v1/datasets/download/fandaoerji/cbvd-5cow-behavior-video-dataset"
 export HF_HOME="$WORK/hf-cache"
 
-# The trained RT-DETRv2: DET if set, else where the LoRA runs put it, else the
-# newest best/ anywhere under WORK; nothing printed and status 1 if none.
+# The trained RT-DETRv2: DET if set; else the newest finished one under WORK
+# (best/ next to train_done - a newer detector_fhd wins over the LoRA runs'
+# one); else any best/; nothing printed and status 1 if none.
 find_det() {
-    local d="${DET:-$WORK/lora-runs/detector/best}"
-    if [ ! -f "$d/det_train_meta.json" ]; then
+    local d="${DET:-}"
+    if [ -z "$d" ]; then
+        d="$(find "$WORK" -maxdepth 7 -name det_train_meta.json -path '*/best/*' -printf '%T@ %h\n' 2>/dev/null \
+             | sort -rn | cut -d' ' -f2- | while read -r b; do [ -f "$(dirname "$b")/train_done" ] && { echo "$b"; break; }; done)"
+    fi
+    if [ -z "$d" ]; then
         d="$(find "$WORK" -maxdepth 7 -name det_train_meta.json -path '*/best/*' -printf '%T@ %h\n' 2>/dev/null \
              | sort -rn | head -1 | cut -d' ' -f2-)"
     fi
@@ -87,8 +100,27 @@ case "${1:-}" in
         echo "Started in tmux session 'herd-stress' (model $MODEL).  log: tail -F $SOUT/log.txt"
         echo "result: $SOUT/stress_herd_${CAMERAS:-5}cam.md"
         exit 0 ;;
+    detector)
+        DOUT="$WORK/herd/detector_${DET_TAG:-fhd}"
+        mkdir -p "$DOUT"
+        LAST="$(basename "$(dirname "$(ls -t "$WORK"/herd/*/model.pt 2>/dev/null | head -1)")" 2>/dev/null || true)"
+        q() { printf '%q ' "$@"; }
+        train="$(q "$VENV/bin/python" "$REPO/cowbench/detector.py" train --root "$DATA" --out "$DOUT" \
+                   --size "${DET_SIZE:-1088}" --zoom "${DET_ZOOM:-0.5}" --tiles 1 --select f2 \
+                   --epochs "${DET_EPOCHS:-24}" --batch "${DET_BATCH:-8}")"
+        evald=""
+        if [ -n "$LAST" ] && [ -f "$WORK/herd/$LAST/model.pt" ]; then
+            evald="&& $(q "$VENV/bin/python" "$HERE/herd.py" eval-det --run "$WORK/herd/$LAST" --detector "$DOUT/best" \
+                       --root "$DATA" --out "$WORK/herd/$LAST/eval-val-det-${DET_TAG:-fhd}")"
+        fi
+        tmux has-session -t herd-det 2>/dev/null && { echo "already running: tmux attach -t herd-det"; exit 1; }
+        env -u TMUX tmux new-session -d -s herd-det -x 200 -y 50 \
+            "export HF_HOME=$(printf '%q' "$HF_HOME"); ( $train $evald ) 2>&1 | tee -a $(printf '%q' "$DOUT/log.txt"); echo '[detector finished]'; exec bash"
+        echo "Started in tmux session 'herd-det' -> $DOUT/best.  log: tail -F $DOUT/log.txt"
+        [ -n "$evald" ] && echo "then eval-det of $LAST with it -> $WORK/herd/$LAST/eval-val-det-${DET_TAG:-fhd}/eval_det.json"
+        exit 0 ;;
     "") ;;
-    *) echo "usage: $0 [log|stop|stress]"; exit 2 ;;
+    *) echo "usage: $0 [log|stop|stress|detector]"; exit 2 ;;
 esac
 
 if [ -z "${HERD_IN_TMUX:-}" ]; then
@@ -96,7 +128,7 @@ if [ -z "${HERD_IN_TMUX:-}" ]; then
     if tmux has-session -t "$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     mkdir -p "$WORK/herd"
     knobs=""
-    for v in WORK RUN EPOCHS ENCODER GRID MAX_ERROR MARGIN POS MOTION DET; do knobs+="$v=$(printf '%q' "${!v}") "; done
+    for v in WORK RUN EPOCHS ENCODER GRID MAX_ERROR MARGIN POS MOTION DET DET_KEYS; do knobs+="$v=$(printf '%q' "${!v}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env HERD_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/run_pod.sh"); echo; echo '[run_pod.sh finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log   ($LOG)"
@@ -110,7 +142,7 @@ set -E
 trap 'rc=$?; echo "!! line $LINENO failed (exit $rc): $BASH_COMMAND"' ERR
 step() { echo; echo "=== $*   [$(date '+%F %T')]"; }
 
-step "1/8  Python environment ($VENV)"
+step "1/9  Python environment ($VENV)"
 if ! command -v uv >/dev/null 2>&1; then curl -LsSf https://astral.sh/uv/install.sh | sh; fi
 export PATH="$HOME/.local/bin:$PATH"
 uv self update >/dev/null 2>&1 || true
@@ -125,7 +157,7 @@ if ! ready; then
 fi
 "$PY" -c "import torch; print('torch', torch.__version__, torch.cuda.get_device_name(0))"
 
-step "2/8  CBVD-5 with its videos"
+step "2/9  CBVD-5 with its videos"
 # The LoRA runs only needed keyframes; bursts are cut from the 10 s, 25 fps clips.
 if [ ! -f "$DATA/annotations/ava_train_v2.1.csv" ] || [ ! -d "$DATA/labelframes" ] || [ ! -d "$DATA/videos/videos" ]; then
     command -v unzip >/dev/null || apt-get install -y -qq unzip
@@ -144,12 +176,12 @@ fi
 echo "keyframes: $(find "$DATA/labelframes" -name '*.jpg' | wc -l), videos: $(find "$DATA/videos" -name '*.mp4' | wc -l)"
 
 cd "$HERE"
-step "3/8  Stage A: frame vectors (DINOv2, frozen) - train"
+step "3/9  Stage A: frame vectors (DINOv2, frozen) - train"
 "$PY" herd.py extract --root "$DATA" --out "$FEAT" --split train --encoder "$ENCODER" --grid "$GRID" --margin "$MARGIN"
-step "4/8  Stage A: frame vectors - val"
+step "4/9  Stage A: frame vectors - val"
 "$PY" herd.py extract --root "$DATA" --out "$FEAT" --split val --encoder "$ENCODER" --grid "$GRID" --margin "$MARGIN"
 
-step "5/8  The rhythm of every burst (chewing) - train + val, CPU"
+step "5/9  The rhythm of every burst (chewing) - train + val, CPU"
 if [ "$MOTION" = "1" ]; then
     WORKERS="$(( $(nproc) > 4 ? $(nproc) - 2 : 2 ))"; [ "$WORKERS" -gt 16 ] && WORKERS=16   # each holds one decoded clip in memory
     "$PY" herd.py motion --root "$DATA" --out "$FEAT" --split train --workers "$WORKERS"
@@ -158,19 +190,34 @@ else
     echo "MOTION=0: skipped"
 fi
 
-step "6/8  Training: temporal transformer + heads ($EPOCHS epochs)"
+step "6/9  Keyframe crops from the detector's boxes (+ jittered) - train"
+USE_KEYS=0
+if [ "$DET_KEYS" = "1" ]; then
+    if D6="$(find_det)"; then
+        echo "detector: $D6"
+        "$PY" herd.py keys --root "$DATA" --out "$FEAT" --split train --detector "$D6"
+        USE_KEYS=1
+    else
+        echo "no trained detector under $WORK - the frame heads learn on annotated boxes only"
+    fi
+else
+    echo "DET_KEYS=0: skipped"
+fi
+
+step "7/9  Training: temporal transformer + heads ($EPOCHS epochs)"
 if [ -f "$OUT/model.pt" ] && [ -f "$OUT/eval_val.json" ]; then
     echo "trained already: $OUT"
 else
-    "$PY" herd.py train --features "$FEAT" --out "$OUT" --epochs "$EPOCHS" --pos "$POS" --motion "$MOTION"
+    "$PY" herd.py train --features "$FEAT" --out "$OUT" --epochs "$EPOCHS" --pos "$POS" --motion "$MOTION" \
+        --det-keys "$USE_KEYS"
 fi
 "$PY" "$REPO/cowbench/cowbench.py" --out "$OUT/eval-val" score
 "$PY" "$REPO/cowbench/cowbench.py" --out "$OUT/eval-val" report
 
-step "7/8  The NaN model (max error $MAX_ERROR among answers)"
+step "8/9  The NaN model (max error $MAX_ERROR among answers)"
 "$PY" herd.py abstain --features "$FEAT" --run "$OUT" --max-error "$MAX_ERROR"
 
-step "8/8  On the detector's boxes: detector misses count as errors"
+step "9/9  On the detector's boxes: detector misses count as errors"
 if DET="$(find_det)"; then
     echo "detector: $DET"
     "$PY" herd.py eval-det --run "$OUT" --detector "$DET" --root "$DATA"
