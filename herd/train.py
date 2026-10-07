@@ -244,6 +244,15 @@ def best_threshold(p, y):
     return float(f1s.max()), float(ts[top[len(top) // 2]])
 
 
+def share_threshold(p, y):
+    """The cut-off at which the share of bursts called ruminating equals the
+    true share: per burst it is wrong more often than the F1 cut-off, but
+    summed into minutes it neither inflates nor shrinks rumination time."""
+    ts = np.linspace(0.05, 0.95, 91)
+    target = float(np.mean(y)) if len(y) else 0.0
+    return float(ts[int(np.argmin([abs(float(np.mean(p >= t)) - target) for t in ts]))])
+
+
 def evaluate(model, split, crop_s, rum_thr=0.5):
     rows, q = reid(model, split, crop_s)
     m = {}
@@ -399,14 +408,25 @@ def cmd_eval(args):
     from model import HerdModel
     model, ck = HerdModel.load(os.path.join(args.out, "model.pt"), map_location=device())
     model.to(device())
+    dev = Split(os.path.join(args.features, "train"), set(ck["dev_clips"]))
+    md, _, qd, _ = evaluate(model, dev, ck["crop_s"])
     thr = ck.get("rum_threshold")
     if thr is None:      # a checkpoint from before the cut-off was calibrated: do it now, on its dev clips
-        dev = Split(os.path.join(args.features, "train"), set(ck["dev_clips"]))
-        thr = evaluate(model, dev, ck["crop_s"])[0].get("rumination_best_threshold", 0.5)
-    # the rumination cut-off travels with the model: pipeline and reports read it
-    write_json(os.path.join(args.out, "heads.json"), {"rumination_threshold": thr})
+        thr = md.get("rumination_best_threshold", 0.5)
+    yd = np.array([b["rumination"] for b in dev.bursts])
+    thr_time = share_threshold(qd["rumination"], yd)
+    # the rumination cut-offs travel with the model: pipeline and reports read them.
+    # rumination_threshold: per burst (best F1); _time: for minutes in reports (true share).
+    write_json(os.path.join(args.out, "heads.json"), {"rumination_threshold": thr,
+                                                      "rumination_threshold_time": thr_time})
     val = Split(os.path.join(args.features, "val"))
     m, rows, q, fp = evaluate(model, val, ck["crop_s"], thr)
+    yv = np.array([b["rumination"] for b in val.bursts])
+    if len(yv):
+        m["rumination_share_true"] = float(yv.mean())
+        m["rumination_share_called_f1"] = float(np.mean(q["rumination"] >= thr))
+        m["rumination_threshold_time"] = thr_time
+        m["rumination_share_called_time"] = float(np.mean(q["rumination"] >= thr_time))
     write_json(os.path.join(args.out, "eval_val.json"), {"epoch": ck["epoch"], **m})
     with open(os.path.join(args.out, "reid_val.jsonl"), "w", encoding="utf-8") as fh:
         for r in rows:

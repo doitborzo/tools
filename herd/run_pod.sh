@@ -10,7 +10,9 @@
 #
 # Every step resumes: features are written clip by clip, so a rerun after a
 # crash continues where it stopped. Knobs:
-#   WORK=/workspace   RUN=run1   EPOCHS=40   ENCODER=facebook/dinov2-small   GRID=2
+#   WORK=/workspace   RUN=run1   EPOCHS=40   ENCODER=facebook/dinov2-small
+#   GRID=2            patch tokens pooled to GRID x GRID per frame (4: finer, e.g. the jaw;
+#                     features 3.4x larger); another GRID extracts into features_g<GRID>
 #   MAX_ERROR=0.01    the NaN cut-off: at most this share of wrong IDs among answers
 #   MARGIN=0.1        context around each cow in the crops (0.5: twice the box, sees the feed
 #                     barrier); another MARGIN extracts into its own features_m<MARGIN>
@@ -30,8 +32,11 @@ MAX_ERROR="${MAX_ERROR:-0.01}"
 MARGIN="${MARGIN:-0.1}"
 POS="${POS:-0}"
 DATA="$WORK/cbvd5"
+# Features depend on margin and grid: another value gets its own folder
+# (a shared one would be skipped as "done" and silently reused).
 FEAT="$WORK/herd/features"
-[ "$MARGIN" = "0.1" ] || FEAT="$WORK/herd/features_m$MARGIN"
+[ "$MARGIN" = "0.1" ] || FEAT="${FEAT}_m$MARGIN"
+[ "$GRID" = "2" ] || FEAT="${FEAT}_g$GRID"
 OUT="$WORK/herd/$RUN"
 VENV="$WORK/herd/.venv"
 LOG="$WORK/herd/log_$RUN.txt"
