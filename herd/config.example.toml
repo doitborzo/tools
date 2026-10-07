@@ -1,0 +1,70 @@
+# herd configuration - copy to barn.toml and fill in. Values not set here
+# take the defaults in common.py (DEFAULTS).
+
+[farm]
+timezone_offset_hours = 2       # farm local time vs UTC: days, nights and Tuesday follow it
+migration_weekday = 1           # 0 = Monday: cows change on Tuesday ...
+migration_hour = 10             # ... at 10:00
+nightly_hour = 2                # gallery maintenance: retire, rebuild prototypes, enroll new cows
+
+[sampling]
+fps = 1.0                       # posture / activity once a second, every camera
+burst_every_s = 60              # a 7 s burst per camera every minute (staggered between cameras)
+burst_seconds = 7.0
+burst_fps = 25.0
+burst_detect_fps = 5.0          # detector runs on 5 of the 25 frames a second; boxes are interpolated
+frame_width = 1280              # frames are kept this wide in the ring buffer (memory)
+
+[model]
+checkpoint = "/workspace/herd/run1/model.pt"     # abstain.json next to it is picked up
+
+[detector]
+weights = "/workspace/lora-runs/detector/best"   # RT-DETRv2 (cowbench/detector.py)
+# threshold = 0.4                                # default: the one chosen at training
+
+[tracker]
+iou = 0.3
+max_age_s = 5
+
+[identity]
+prototypes_per_cow = 6          # k-means centres per cow
+history_days = 7                # prototypes from the last week of confirmed bursts
+max_error = 0.01                # the NaN cut-off is tuned for this error among answers (abstain.py)
+new_cow_similarity = 0.55       # bursts this similar are one cow when grouping unknowns;
+                                # start from same_cow_sim_p05 in abstain.json
+new_cow_min_bursts = 20         # a group needs this many bursts to become a new cow
+retire_after_hours = 48         # after a change-over, cows not seen this long have left
+
+[lameness]
+enabled = false                 # no lameness labels yet: the head exists, its output is not used
+# alert_score = 3.0
+
+[alerts]
+baseline_days = 7               # each cow against her own previous week
+min_baseline_days = 3
+min_observed_minutes = 120      # a day the cow was barely seen is not compared
+mad_z = 3.0                     # how unusual, in her own spread (MAD)
+rumination_drop = 0.20          # and at least this much lower than her median
+lying_directions = ["low", "high"]   # which way is "worse" is open: both are flagged
+lying_change = 0.20
+
+[report]
+period_days = 3
+
+[store]
+path = "/workspace/herd/barn/herd.sqlite"   # gallery/ and names.json live next to it
+
+# One block per camera. The cameras look down and partly overlap: draw each
+# mask (0-1 frame coordinates, one polygon or a list of them) over the floor
+# that camera alone owns, so every patch of floor is in exactly one mask.
+[[cameras]]
+id = "cam1"
+url = "rtsp://user:password@10.0.0.11:554/stream1"
+mask = [[0.0, 0.0], [0.55, 0.0], [0.55, 1.0], [0.0, 1.0]]
+
+[[cameras]]
+id = "cam2"
+url = "rtsp://user:password@10.0.0.12:554/stream1"
+mask = [[0.05, 0.0], [1.0, 0.0], [1.0, 1.0], [0.05, 1.0]]
+
+# [[cameras]]  cam3, cam4, cam5 the same way
