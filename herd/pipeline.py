@@ -195,6 +195,21 @@ class Models:
 
 # ------------------------------------------------------------------- camera
 
+_CROP_POOL = None
+
+
+def crops_of(pairs, size, margin):
+    """[(frame, box)] -> crops, in threads: PIL's resize lets go of the GIL, and a
+    burst is ~175 crops a cow - serial, the slowest part of it. Same pixels."""
+    global _CROP_POOL
+    if _CROP_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _CROP_POOL = ThreadPoolExecutor(max(1, min(8, (os.cpu_count() or 2) - 1)), thread_name_prefix="crop")
+    if len(pairs) < 8:
+        return [crop(img, b, size, margin) for img, b in pairs]
+    return list(_CROP_POOL.map(lambda p: crop(p[0], p[1], size, margin), pairs, chunksize=16))
+
+
 class Camera:
     """One camera: frames into a ring buffer (push, the reader's thread); the
     1 fps path (step_seconds) and the bursts (step_burst) each in a thread of
@@ -272,7 +287,7 @@ class Camera:
             tracked = self.tracker.update(ts, boxes)
         if tracked:
             size = self.models.crop_size
-            feats = self.models.encode([crop(img, b, size, self.models.margin) for _, b in tracked],
+            feats = self.models.encode(crops_of([(img, b) for _, b in tracked], size, self.models.margin),
                                        urgent=True, kind="second_encode")
             pp, pa = self.models.frame_heads(feats, [b for _, b in tracked])
             rows = [(self.id, tid, ts, *b, POSTURES[int(p.argmax())], ACTIVITIES[int(a.argmax())],
@@ -316,7 +331,7 @@ class Camera:
             valid = np.array([times[0] - 0.5 <= ts <= times[-1] + 0.5 for ts, _ in frames])
             boxes = [interpolate_box(ch, ts) for ts, _ in frames]
             t = time.perf_counter()
-            crops = [crop(img, b, size, self.models.margin) for (_, img), b in zip(frames, boxes)]
+            crops = crops_of([(img, b) for (_, img), b in zip(frames, boxes)], size, self.models.margin)
             part["crop"] += time.perf_counter() - t
             t = time.perf_counter()
             feats = self.models.encode(crops, kind="burst_encode")
