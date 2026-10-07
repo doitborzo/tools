@@ -3,7 +3,8 @@
     seconds   one row per tracked cow per second: box, posture, activity
               (the once-a-second path)
     bursts    one row per cow per burst (~ once a minute): the identity decision,
-              rumination, burst posture / activity, lameness, quality
+              rumination (p and the yes / no the burst decided), burst
+              posture / activity, lameness, quality
     events    gallery changes: cows enrolled, retired, change-over
     alerts    raised alerts;  verdicts  the vet's answer to each
 
@@ -25,7 +26,7 @@ CREATE INDEX IF NOT EXISTS seconds_ts ON seconds(ts);
 CREATE INDEX IF NOT EXISTS seconds_track ON seconds(track);
 CREATE TABLE IF NOT EXISTS bursts (cam TEXT, track TEXT, ts REAL, state TEXT, cow TEXT, sim REAL, margin REAL,
                                    p REAL, rumination_p REAL, posture TEXT, activity TEXT, lameness REAL,
-                                   quality REAL, n_frames INTEGER);
+                                   quality REAL, n_frames INTEGER, ruminating INTEGER);
 CREATE INDEX IF NOT EXISTS bursts_ts ON bursts(ts);
 CREATE INDEX IF NOT EXISTS bursts_track ON bursts(track);
 CREATE TABLE IF NOT EXISTS events (ts REAL, kind TEXT, detail TEXT);
@@ -42,6 +43,10 @@ class Store:
         self.db = sqlite3.connect(path, check_same_thread=False, timeout=60)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(bursts)")}
+        if "ruminating" not in cols:          # a store from before the burst decided it
+            self.db.execute("ALTER TABLE bursts ADD COLUMN ruminating INTEGER")
+            self.db.commit()
         self.lock = threading.Lock()
 
     def seconds(self, rows):
@@ -50,8 +55,11 @@ class Store:
             self.db.commit()
 
     def burst(self, row):
+        """cam, track, ts, state, cow, sim, margin, p, rumination_p, posture,
+        activity, lameness, quality, n_frames[, ruminating (0/1)]"""
+        row = tuple(row) + (None,) * (15 - len(row))
         with self.lock:
-            self.db.execute("INSERT INTO bursts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
+            self.db.execute("INSERT INTO bursts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
             self.db.commit()
 
     def event(self, ts, kind, detail):

@@ -101,7 +101,7 @@ def daily(store, cfg, since=None, until=None):
     bw = w.replace("s.ts", "b.ts")
     bursts = store.query(f"""
         SELECT m.cow, {day.replace('ts', 'b.ts')} AS d, COUNT(*),
-               SUM(b.rumination_p >= {rumination_threshold(cfg)} AND b.activity = 'none'),
+               SUM(COALESCE(b.ruminating, b.rumination_p >= {rumination_threshold(cfg)} AND b.activity = 'none')),
                AVG(b.lameness), SUM(b.lameness IS NOT NULL)
         FROM bursts b JOIN temp.trackmap m ON b.track = m.track {bw} GROUP BY m.cow, d""")
     out = {}

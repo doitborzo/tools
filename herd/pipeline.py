@@ -10,6 +10,8 @@ nothing is analysed at 25 fps except bursts:
    over the cameras)    per cow, interpolated to every frame -> 175 crops
                         -> frame encoder -> temporal model -> fingerprint,
                         quality, rumination, posture, activity, lameness
+                        (+ the rhythm of the crops, motion.py: chewing)
+                        -> ruminating yes / no (heads.json cut-off)
                         -> gallery: confirmed / tentative / unknown  -> table bursts
   nightly (02:00)       gallery: retire, rebuild prototypes, enroll new cows
   Tuesday 10:00         change-over starts (gallery.migration_due)
@@ -37,6 +39,7 @@ import time
 import numpy as np
 
 from common import ACTIVITIES, POSTURES, crop, device, in_mask, interpolate_box, iou, load_config
+from motion import motion_features
 
 
 # ------------------------------------------------------------------ tracker
@@ -136,6 +139,14 @@ class Models:
             import detector as det_mod
             self.detector = det_mod.Live(cfg["detector"]["weights"], cfg["detector"]["threshold"])
         self.lameness = cfg["lameness"]["enabled"]
+        self.motion_dim = self.model.motion_dim
+        # The cut-off calibrated with the model: "ruminating" per burst, summed
+        # into minutes by the reports (the one that keeps the share true).
+        try:
+            h = json.load(open(os.path.join(os.path.dirname(os.path.abspath(ck_path)), "heads.json"), encoding="utf-8"))
+            self.rum_thr = float(h.get("rumination_threshold_time", h["rumination_threshold"]))
+        except (OSError, KeyError, ValueError):
+            self.rum_thr = float(ck.get("rum_threshold") or 0.5)
         self.torch = torch
 
     def _sync(self):
@@ -177,20 +188,24 @@ class Models:
             o = self.model.frame(feats, pos)
             return o["posture"].softmax(-1).cpu().numpy(), o["activity"].softmax(-1).cpu().numpy()
 
-    def burst(self, feats, times, valid, boxes, urgent=False, kind="temporal"):
+    def burst(self, feats, times, valid, boxes, motion=None, urgent=False, kind="temporal"):
         from model import box_pos
         torch = self.torch
         with self.gpu(urgent, kind), torch.no_grad():
             pos = torch.tensor([box_pos(b) for b in boxes], device=self.dev).float().unsqueeze(0)
+            mot = None if motion is None else torch.as_tensor(motion, device=self.dev).float().unsqueeze(0)
             o = self.model.temporal(feats.unsqueeze(0), torch.as_tensor(times, device=self.dev).unsqueeze(0).float(),
-                                    torch.as_tensor(valid, device=self.dev).unsqueeze(0), pos)
-            return {"fingerprint": o["fingerprint"][0].cpu().numpy(),
-                    "quality_max": float(o["weights"][0].max()),
-                    "quality_mean": float(o["quality"][0][torch.as_tensor(valid, device=self.dev)].mean()),
-                    "rumination": float(o["rumination"][0].sigmoid()),
-                    "posture": POSTURES[int(o["posture"][0].argmax())],
-                    "activity": ACTIVITIES[int(o["activity"][0].argmax())],
-                    "lameness": float(o["lameness"][0]) if self.lameness else None}
+                                    torch.as_tensor(valid, device=self.dev).unsqueeze(0), pos, mot)
+            out = {"fingerprint": o["fingerprint"][0].cpu().numpy(),
+                   "quality_max": float(o["weights"][0].max()),
+                   "quality_mean": float(o["quality"][0][torch.as_tensor(valid, device=self.dev)].mean()),
+                   "rumination": float(o["rumination"][0].sigmoid()),
+                   "posture": POSTURES[int(o["posture"][0].argmax())],
+                   "activity": ACTIVITIES[int(o["activity"][0].argmax())],
+                   "lameness": float(o["lameness"][0]) if self.lameness else None}
+        # a cow that feeds or drinks is not ruminating, whatever the head says
+        out["ruminating"] = bool(out["rumination"] >= self.rum_thr and out["activity"] == "none")
+        return out
 
 
 # ------------------------------------------------------------------- camera
@@ -198,13 +213,18 @@ class Models:
 _CROP_POOL = None
 
 
-def crops_of(pairs, size, margin):
-    """[(frame, box)] -> crops, in threads: PIL's resize lets go of the GIL, and a
-    burst is ~175 crops a cow - serial, the slowest part of it. Same pixels."""
+def cpu_pool():
     global _CROP_POOL
     if _CROP_POOL is None:
         from concurrent.futures import ThreadPoolExecutor
         _CROP_POOL = ThreadPoolExecutor(max(1, min(8, (os.cpu_count() or 2) - 1)), thread_name_prefix="crop")
+    return _CROP_POOL
+
+
+def crops_of(pairs, size, margin):
+    """[(frame, box)] -> crops, in threads: PIL's resize lets go of the GIL, and a
+    burst is ~175 crops a cow - serial, the slowest part of it. Same pixels."""
+    cpu_pool()
     if len(pairs) < 8:
         return [crop(img, b, size, margin) for img, b in pairs]
     return list(_CROP_POOL.map(lambda p: crop(p[0], p[1], size, margin), pairs, chunksize=16))
@@ -320,7 +340,8 @@ class Camera:
                         used.add(j)
             chains += [{ts: b} for j, b in enumerate(boxes) if j not in used]
         size = self.models.crop_size
-        cows = crops_n = 0
+        cows = crops_n = rum_yes = 0
+        rum_p = []
         for ch in chains:
             if len(ch) < max(2, 0.5 * len(sampled)):      # seen in too little of the burst
                 continue
@@ -333,25 +354,39 @@ class Camera:
             t = time.perf_counter()
             crops = crops_of([(img, b) for (_, img), b in zip(frames, boxes)], size, self.models.margin)
             part["crop"] += time.perf_counter() - t
+            rel = [ts - t0 for ts, _ in frames]
+            # the rhythm on the CPU while the GPU encodes the same crops
+            fut = (cpu_pool().submit(motion_features, np.stack(crops), rel, valid)
+                   if self.models.motion_dim else None)
             t = time.perf_counter()
             feats = self.models.encode(crops, kind="burst_encode")
             part["encode"] += time.perf_counter() - t
             t = time.perf_counter()
-            out = self.models.burst(feats, [ts - t0 for ts, _ in frames], valid, boxes)
+            motion = None
+            if fut is not None:
+                m, ok = fut.result()
+                motion = m if ok else None
+            part["motion_wait"] += time.perf_counter() - t
+            t = time.perf_counter()
+            out = self.models.burst(feats, rel, valid, boxes, motion)
             part["temporal"] += time.perf_counter() - t
             t = time.perf_counter()
             area = float(np.mean([(b[2] - b[0]) * (b[3] - b[1]) for b in ch.values()]))
             decision = self.gallery.decide(out, area, t0, tid)
             self.store.burst((self.id, tid, t0, decision["state"], decision["cow"], decision["sim"],
                               decision["margin"], decision["p"], out["rumination"], out["posture"],
-                              out["activity"], out["lameness"], out["quality_max"], int(valid.sum())))
+                              out["activity"], out["lameness"], out["quality_max"], int(valid.sum()),
+                              int(out["ruminating"])))
             part["gallery"] += time.perf_counter() - t
             cows += 1
             crops_n += len(crops)
+            rum_p.append(round(out["rumination"], 3))
+            rum_yes += out["ruminating"]
             self.stats[f"id_{decision['state']}"] += 1
         self.stats["bursts"] += 1
         self._time("burst", t0, start=start, end=time.time(), ready=t0 + self.burst_s, frames=len(frames),
                    detected=len(sampled), chains=len(chains), cows=cows, crops=crops_n,
+                   ruminating=rum_yes, rumination_p=rum_p,
                    parts={k: round(v, 4) for k, v in part.items()})
 
 
