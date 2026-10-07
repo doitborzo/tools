@@ -25,6 +25,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 ID_DIM = 512
+
+
+def box_pos(box):
+    """[x1, y1, x2, y2] (0-1) -> [centre x, centre y, width, height]."""
+    return [(box[0] + box[2]) / 2, (box[1] + box[3]) / 2, box[2] - box[0], box[3] - box[1]]
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
@@ -69,21 +74,28 @@ class FrameHeads(nn.Module):
     """Posture and activity from one frame vector: the once-a-second path,
     which has no burst to look at."""
 
-    def __init__(self, in_dim, hidden=256, n_posture=2, n_activity=3):
+    def __init__(self, in_dim, hidden=256, n_posture=2, n_activity=3, use_pos=False):
         super().__init__()
         self.body = nn.Sequential(nn.LayerNorm(in_dim), nn.Linear(in_dim, hidden), nn.GELU(), nn.Dropout(0.1))
+        # Where the cow is in the frame (box centre and size). Cameras do not
+        # move, so "at the feed barrier" is a place in the picture - context a
+        # tight crop does not have and a wide crop pays for with the neighbours.
+        self.pos = nn.Sequential(nn.Linear(4, 64), nn.GELU(), nn.Linear(64, hidden)) if use_pos else None
         self.posture = nn.Linear(hidden, n_posture)
         self.activity = nn.Linear(hidden, n_activity)
 
-    def forward(self, x):
+    def forward(self, x, pos=None):
         h = self.body(x)
+        if self.pos is not None and pos is not None:
+            h = h + self.pos(pos)
         return {"posture": self.posture(h), "activity": self.activity(h)}
 
 
 class TemporalModel(nn.Module):
-    def __init__(self, in_dim, d=256, layers=3, heads=4, dropout=0.1, n_posture=2, n_activity=3):
+    def __init__(self, in_dim, d=256, layers=3, heads=4, dropout=0.1, n_posture=2, n_activity=3, use_pos=False):
         super().__init__()
         self.proj = nn.Sequential(nn.LayerNorm(in_dim), nn.Linear(in_dim, d))
+        self.pos = nn.Linear(4, d) if use_pos else None
         self.time = nn.Linear(d, d)
         self.d = d
         block = nn.TransformerEncoderLayer(d, heads, 4 * d, dropout, batch_first=True, norm_first=True,
@@ -97,9 +109,12 @@ class TemporalModel(nn.Module):
         self.rumination = nn.Linear(d, 1)
         self.lameness = nn.Linear(d, 1)
 
-    def forward(self, x, t, valid):
-        """x (B, T, in_dim) frame vectors, t (B, T) seconds, valid (B, T) bool."""
+    def forward(self, x, t, valid, pos=None):
+        """x (B, T, in_dim) frame vectors, t (B, T) seconds, valid (B, T) bool,
+        pos (B, 4) or (B, T, 4) box centre and size, used if the model has it."""
         h = self.proj(x) + self.time(time_embedding(t, self.d))
+        if self.pos is not None and pos is not None:
+            h = h + self.pos(pos if pos.dim() == 3 else pos.unsqueeze(1))
         h = self.norm(self.encoder(h, src_key_padding_mask=~valid))
         q = self.quality(h).squeeze(-1).masked_fill(~valid, -1e4)
         w = q.softmax(-1)                                          # quality weights over frames
@@ -113,12 +128,12 @@ class TemporalModel(nn.Module):
 
 
 class HerdModel(nn.Module):
-    def __init__(self, in_dim, **kw):
+    def __init__(self, in_dim, use_pos=False, **kw):
         super().__init__()
         self.in_dim = in_dim
-        self.kw = kw
-        self.frame = FrameHeads(in_dim)
-        self.temporal = TemporalModel(in_dim, **kw)
+        self.kw = dict(kw, use_pos=use_pos)
+        self.frame = FrameHeads(in_dim, use_pos=use_pos)
+        self.temporal = TemporalModel(in_dim, use_pos=use_pos, **kw)
 
     def save(self, path, extra=None):
         torch.save({"in_dim": self.in_dim, "kw": self.kw, "state": self.state_dict(), **(extra or {})}, path)

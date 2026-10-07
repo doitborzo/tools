@@ -123,16 +123,20 @@ class Models:
                     out.append(self.encoder(x).float())
         return torch.cat(out) if out else torch.zeros((0, self.encoder.out_dim), device=self.dev)
 
-    def frame_heads(self, feats):
+    def frame_heads(self, feats, boxes):
+        from model import box_pos
         with self.lock, self.torch.no_grad():
-            o = self.model.frame(feats)
+            pos = self.torch.tensor([box_pos(b) for b in boxes], device=self.dev).float()
+            o = self.model.frame(feats, pos)
             return o["posture"].softmax(-1).cpu().numpy(), o["activity"].softmax(-1).cpu().numpy()
 
-    def burst(self, feats, times, valid):
+    def burst(self, feats, times, valid, boxes):
+        from model import box_pos
         torch = self.torch
         with self.lock, torch.no_grad():
+            pos = torch.tensor([box_pos(b) for b in boxes], device=self.dev).float().unsqueeze(0)
             o = self.model.temporal(feats.unsqueeze(0), torch.as_tensor(times, device=self.dev).unsqueeze(0).float(),
-                                    torch.as_tensor(valid, device=self.dev).unsqueeze(0))
+                                    torch.as_tensor(valid, device=self.dev).unsqueeze(0), pos)
             return {"fingerprint": o["fingerprint"][0].cpu().numpy(),
                     "quality_max": float(o["weights"][0].max()),
                     "quality_mean": float(o["quality"][0][torch.as_tensor(valid, device=self.dev)].mean()),
@@ -190,7 +194,7 @@ class Camera:
             return
         size = self.models.crop_size
         feats = self.models.encode([crop(img, b, size, self.models.margin) for _, b in tracked])
-        pp, pa = self.models.frame_heads(feats)
+        pp, pa = self.models.frame_heads(feats, [b for _, b in tracked])
         rows = [(self.id, tid, ts, *b, POSTURES[int(p.argmax())], ACTIVITIES[int(a.argmax())],
                  float(p[POSTURES.index("lying")])) for (tid, b), p, a in zip(tracked, pp, pa)]
         self.store.seconds(rows)
@@ -222,9 +226,10 @@ class Camera:
             mid = times[len(times) // 2]
             tid = self.tracker.track_at(mid, ch[mid]) or f"{self.id}-burst-{int(t0)}-{times[0]:.0f}"
             valid = np.array([times[0] - 0.5 <= ts <= times[-1] + 0.5 for ts, _ in frames])
-            crops = [crop(img, interpolate_box(ch, ts), size, self.models.margin) for ts, img in frames]
+            boxes = [interpolate_box(ch, ts) for ts, _ in frames]
+            crops = [crop(img, b, size, self.models.margin) for (_, img), b in zip(frames, boxes)]
             feats = self.models.encode(crops)
-            out = self.models.burst(feats, [ts - t0 for ts, _ in frames], valid)
+            out = self.models.burst(feats, [ts - t0 for ts, _ in frames], valid, boxes)
             area = float(np.mean([(b[2] - b[0]) * (b[3] - b[1]) for b in ch.values()]))
             decision = self.gallery.decide(out, area, t0, tid)
             self.store.burst((self.id, tid, t0, decision["state"], decision["cow"], decision["sim"],
