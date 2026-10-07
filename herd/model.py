@@ -9,10 +9,15 @@
                        ID per frame       -> fingerprint = weighted average
                        pooled             -> posture, activity, rumination, lameness
                     + motion rhythm (motion.py), if the model has it -> rumination, activity
+                       pooled             -> burst quality (0-1: will this burst
+                                             identify the cow?), if the model has it
 
 The fingerprint is the brief's "weighted average of all the fingerprints from
 the burst", the weights the quality head's: a frame where the cow is hidden
-or blurred counts for little. The grid pool keeps some of where things are
+or blurred counts for little. With train.py --quality the quality head is
+also taught directly (frames spoilt on purpose by degrade.py must score low)
+and a burst-level head learns whether the burst as a whole will identify the
+cow - the brief's "good burst / bad burst". The grid pool keeps some of where things are
 in the crop (head vs body), which a jaw movement needs and a CLS token alone
 would average away.
 """
@@ -94,7 +99,7 @@ class FrameHeads(nn.Module):
 
 class TemporalModel(nn.Module):
     def __init__(self, in_dim, d=256, layers=3, heads=4, dropout=0.1, n_posture=2, n_activity=3, use_pos=False,
-                 motion_dim=0):
+                 motion_dim=0, burst_quality=False):
         super().__init__()
         self.proj = nn.Sequential(nn.LayerNorm(in_dim), nn.Linear(in_dim, d))
         self.pos = nn.Linear(4, d) if use_pos else None
@@ -109,6 +114,8 @@ class TemporalModel(nn.Module):
         self.posture = nn.Linear(d, n_posture)
         self.activity = nn.Linear(d, n_activity)
         self.lameness = nn.Linear(d, 1)
+        # Good burst or bad: will this burst's fingerprint find the right cow?
+        self.burst_quality = nn.Linear(d, 1) if burst_quality else None
         # The rhythm of the pixels over the burst (motion.py): chewing at ~1 Hz
         # is what rumination is, and what frame vectors average away. It goes
         # to rumination and activity (feeding chews faster, with head moves).
@@ -142,7 +149,8 @@ class TemporalModel(nn.Module):
             activity = activity + self.activity_motion(m)
         else:
             rumination = self.rumination(pooled)
-        return {"fingerprint": fingerprint, "quality": q, "weights": w,
+        return {"fingerprint": fingerprint, "quality": q, "weights": w, "frame_ids": ids,
+                "burst_quality": None if self.burst_quality is None else self.burst_quality(pooled).squeeze(-1),
                 "posture": self.posture(pooled), "activity": activity,
                 "rumination": rumination.squeeze(-1),
                 "lameness": self.lameness(pooled).squeeze(-1)}
@@ -159,6 +167,10 @@ class HerdModel(nn.Module):
     @property
     def motion_dim(self):
         return self.kw.get("motion_dim", 0)
+
+    @property
+    def has_burst_quality(self):
+        return bool(self.kw.get("burst_quality", False))
 
     def save(self, path, extra=None):
         torch.save({"in_dim": self.in_dim, "kw": self.kw, "state": self.state_dict(), **(extra or {})}, path)

@@ -30,11 +30,13 @@ import numpy as np
 from common import device, read_jsonl, write_json
 
 FEATURES = ("sim", "margin", "quality_max", "quality_mean", "log_area")
+# + "burst_quality" when the model has the burst-quality head (train.py --quality)
 
 
-def feature_matrix(rows):
-    return np.array([[r["sim"], r["margin"], r["quality_max"], r["quality_mean"],
-                      np.log(max(r["area"], 1e-4))] for r in rows], dtype=np.float64)
+def feature_matrix(rows, features=FEATURES):
+    col = {"log_area": lambda r: np.log(max(r["area"], 1e-4)),
+           "burst_quality": lambda r: r.get("burst_quality") if r.get("burst_quality") is not None else 0.5}
+    return np.array([[col[f](r) if f in col else r[f] for f in features] for r in rows], dtype=np.float64)
 
 
 def fit_logistic(X, y, l2=1e-2, steps=3000, lr=0.1):
@@ -81,28 +83,44 @@ def cmd(args):
     model.to(device())
     dev = train_mod.Split(os.path.join(args.features, "train"), set(ck["dev_clips"]))
     rows, _ = train_mod.reid(model, dev, ck["crop_s"])
+    # bad bursts too (degrade.py), when made: the barn has them, and only from them
+    # can the NaN model learn that a low burst quality means "do not trust"
+    if dev.deg_idx is not None:
+        rows += train_mod.reid(model, dev, ck["crop_s"], degrade=True)[0]
     rows = [r for r in rows if r["scope"] == args.scope]
-    X, y = feature_matrix(rows), np.array([r["correct"] for r in rows], float)
+    features = FEATURES + (("burst_quality",) if rows and all(r.get("burst_quality") is not None for r in rows)
+                           else ())
+    X, y = feature_matrix(rows, features), np.array([r["correct"] for r in rows], float)
     m = fit_logistic(X, y)
     p = predict(m, X)
     budgets = sorted(set([args.max_error, 0.01, 0.02, 0.05]))
     th = {e: cutoff(p, y, e) for e in budgets}
     same = np.array([r["sim"] for r in rows if r["correct"]])
-    out = {"features": list(FEATURES), **m, "max_error": args.max_error, "threshold": th[args.max_error],
+    out = {"features": list(features), **m, "max_error": args.max_error, "threshold": th[args.max_error],
            "scope": args.scope, "dev_queries": len(rows), "dev_top1": float(y.mean()) if len(y) else None,
            # a new cow's bursts look like each other at least this much: the gallery's
            # starting point for grouping unknown cows (identity.new_cow_similarity)
            "same_cow_sim_p05": float(np.percentile(same, 5)) if len(same) else None,
            "dev": coverage_table(p, y, [(f"{e:.0%}", th[e]) for e in budgets])}
-    val_rows = [r for r in read_jsonl(os.path.join(args.run, "reid_val.jsonl")) if r["scope"] == args.scope]
-    if val_rows:
-        pv = predict(m, feature_matrix(val_rows))
-        yv = np.array([r["correct"] for r in val_rows], float)
-        out["val"] = coverage_table(pv, yv, [(f"{e:.0%}", th[e]) for e in budgets])
-        out["val_top1"] = float(yv.mean())
+    val_dir = os.path.join(args.features, "val")
+    if os.path.exists(os.path.join(val_dir, "index.jsonl")):
+        val = train_mod.Split(val_dir)
+        sets = [("val", train_mod.reid(model, val, ck["crop_s"])[0])]
+        if val.deg_idx is not None:
+            sets.append(("val_spoilt", train_mod.reid(model, val, ck["crop_s"], degrade=True)[0]))
+    else:
+        sets = [("val", read_jsonl(os.path.join(args.run, "reid_val.jsonl")))]
+    for name, vr in sets:
+        vr = [r for r in vr if r["scope"] == args.scope]
+        if vr:
+            pv = predict(m, feature_matrix(vr, features))
+            yv = np.array([r["correct"] for r in vr], float)
+            out[name] = coverage_table(pv, yv, [(f"{e:.0%}", th[e]) for e in budgets])
+            out[f"{name}_top1"] = float(yv.mean())
     write_json(os.path.join(args.run, "abstain.json"), out)
     print(f"[abstain] dev: {len(rows)} queries, top-1 {out['dev_top1']:.1%}")
-    for part in ("dev", "val"):
+    print(f"[abstain] features: {', '.join(features)}")
+    for part in ("dev", "val", "val_spoilt"):
         for r in out.get(part, []):
             e = r["error_when_answered"]
             print(f"  {part}: budget {r['budget']:>4}  threshold {r['threshold']:.3f}  answers "
