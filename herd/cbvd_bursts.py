@@ -159,7 +159,7 @@ def cmd_extract(args):
         key_crops = []
         for key in spec["keys"]:
             img = np.asarray(cbvd_frame(args.root, clip, key["timestamp"]))
-            key_crops.append(crop(img, key["bbox"], args.crop))
+            key_crops.append(crop(img, key["bbox"], args.crop, args.margin))
         key_feats = encode(enc, np.stack(key_crops)) if key_crops else np.zeros((0, enc.out_dim), np.float16)
         for i, key in enumerate(spec["keys"]):
             rows.append({"kind": "key", "clip": clip, "i": i, **{k2: key[k2] for k2 in
@@ -178,7 +178,8 @@ def cmd_extract(args):
                 keys = {float(t): v for t, v in b["keys"].items()}
                 ts = [b["start"] + j / VIDEO_FPS for j in range(n_frames)]
                 idx = [min(len(frames) - 1, int(round(t * fps))) for t in ts]
-                crops = np.stack([crop(frames[ix], interpolate_box(keys, t), args.crop) for ix, t in zip(idx, ts)])
+                crops = np.stack([crop(frames[ix], interpolate_box(keys, t), args.crop, args.margin)
+                                  for ix, t in zip(idx, ts)])
                 if args.split == "train" and args.photo_aug and rng.random() < 0.5:
                     crops = photo_aug(crops, rng)
                 feats.append(encode(enc, crops))
@@ -199,7 +200,8 @@ def cmd_extract(args):
               end="", flush=True)
     print(flush=True)
     with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as fh:
-        json.dump({"encoder": args.encoder, "grid": args.grid, "crop": args.crop, "dim": enc.out_dim,
+        json.dump({"encoder": args.encoder, "grid": args.grid, "crop": args.crop, "margin": args.margin,
+                   "dim": enc.out_dim,
                    "burst_seconds": args.burst_seconds, "fps": VIDEO_FPS}, fh, indent=2)
 
 
@@ -216,6 +218,9 @@ def main(argv=None):
     p.add_argument("--encoder", default="facebook/dinov2-small")
     p.add_argument("--grid", type=int, default=2)
     p.add_argument("--crop", type=int, default=224)
+    p.add_argument("--margin", type=float, default=0.1,
+                   help="context around the box, per side, as a share of its long side: feeding and "
+                        "drinking are told apart by what is around the head (feed barrier, trough)")
     p.add_argument("--burst-seconds", type=float, default=7.0)
     p.add_argument("--photo-aug", type=int, default=1)
     p.add_argument("--limit-clips", type=int, default=0)

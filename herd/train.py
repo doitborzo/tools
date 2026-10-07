@@ -215,14 +215,17 @@ def frame_predictions(model, split, batch=1024):
 
 def best_threshold(p, y):
     """The rumination cut-off with the best F1 (rumination is rare: 0.5 is not it)."""
-    best = (0.0, 0.5)
-    for t in np.linspace(0.05, 0.95, 91):
+    ts = np.linspace(0.05, 0.95, 91)
+    f1s = []
+    for t in ts:
         pr = p >= t
         tp, fpos, fn = int((pr & (y == 1)).sum()), int((pr & (y == 0)).sum()), int((~pr & (y == 1)).sum())
-        f1 = 2 * tp / max(1, 2 * tp + fpos + fn)
-        if f1 > best[0]:
-            best = (f1, float(t))
-    return best
+        f1s.append(2 * tp / max(1, 2 * tp + fpos + fn))
+    f1s = np.array(f1s)
+    # An over-confident model leaves F1 flat over a wide range; run2 then took
+    # the plateau's lowest end (0.05) while val's best was 0.82. Take its middle.
+    top = np.where(f1s >= f1s.max() - 0.005)[0]
+    return float(f1s.max()), float(ts[top[len(top) // 2]])
 
 
 def evaluate(model, split, crop_s, rum_thr=0.5):
@@ -308,7 +311,11 @@ def cmd_train(args):
     os.makedirs(args.out, exist_ok=True)
     hist = open(os.path.join(args.out, "history.jsonl"), "a", encoding="utf-8")
     best, t0, step = -1.0, time.time(), 0
+    since_best = 0
     for epoch in range(args.epochs):
+        if since_best >= args.patience:
+            print(f"[train] no better dev score for {args.patience} epochs - stopping", flush=True)
+            break
         model.train()
         losses = collections.defaultdict(list)
         for _ in range(max(1, len(train.bursts) // args.P)):
@@ -358,8 +365,10 @@ def cmd_train(args):
               f"{m.get('reid_top1_clip') or 0:.1%}, frame posture err {m.get('frame_posture_error') or 0:.1%}, "
               f"frame activity err {m.get('frame_activity_error') or 0:.1%}, rumination F1 "
               f"{m.get('rumination_best_f1') or 0:.1%} at {m.get('rumination_best_threshold') or 0:.2f}", flush=True)
+        since_best += 1
         if score > best:
             best = score
+            since_best = 0
             model.save(os.path.join(args.out, "model.pt"), {"crop_s": args.crop_s, "epoch": epoch + 1,
                                                              "features": train.meta, "dev": m,
                                                              "dev_clips": sorted(dev_clips, key=int),
@@ -408,6 +417,7 @@ def main(argv=None):
     p.add_argument("--temperature", type=float, default=0.1)
     p.add_argument("--w-id", type=float, default=2.0, help="ID loss weight (weighted highest, as planned)")
     p.add_argument("--holdout", type=float, default=0.1)
+    p.add_argument("--patience", type=int, default=6, help="stop after this many epochs without a better dev score")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
     {"train": cmd_train, "eval": cmd_eval}[args.stage](args)

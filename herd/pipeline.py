@@ -97,6 +97,7 @@ class Models:
         self.model.to(self.dev).eval()
         feat = ck.get("features", {})
         self.crop_size = feat.get("crop", cfg["model"]["crop"])
+        self.margin = feat.get("margin", 0.1)          # the context the model was trained with
         self.encoder = FrameEncoder(feat.get("encoder", cfg["model"]["encoder"]),
                                     feat.get("grid", cfg["model"]["grid"])).to(self.dev).eval()
         if detector is not None:
@@ -188,7 +189,7 @@ class Camera:
         if not tracked:
             return
         size = self.models.crop_size
-        feats = self.models.encode([crop(img, b, size) for _, b in tracked])
+        feats = self.models.encode([crop(img, b, size, self.models.margin) for _, b in tracked])
         pp, pa = self.models.frame_heads(feats)
         rows = [(self.id, tid, ts, *b, POSTURES[int(p.argmax())], ACTIVITIES[int(a.argmax())],
                  float(p[POSTURES.index("lying")])) for (tid, b), p, a in zip(tracked, pp, pa)]
@@ -221,7 +222,7 @@ class Camera:
             mid = times[len(times) // 2]
             tid = self.tracker.track_at(mid, ch[mid]) or f"{self.id}-burst-{int(t0)}-{times[0]:.0f}"
             valid = np.array([times[0] - 0.5 <= ts <= times[-1] + 0.5 for ts, _ in frames])
-            crops = [crop(img, interpolate_box(ch, ts), size) for ts, img in frames]
+            crops = [crop(img, interpolate_box(ch, ts), size, self.models.margin) for ts, img in frames]
             feats = self.models.encode(crops)
             out = self.models.burst(feats, [ts - t0 for ts, _ in frames], valid)
             area = float(np.mean([(b[2] - b[0]) * (b[3] - b[1]) for b in ch.values()]))
