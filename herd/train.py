@@ -70,6 +70,12 @@ class Split:
         self.burst_times = np.stack(bt) if bt else np.zeros((0, 1), np.float32)
         self.key_feats = np.stack(kf) if kf else np.zeros((0, dim), np.float16)
         self.dim = dim
+        from model import box_pos
+        box_of = {(k["clip"], k["uid"]): k.get("bbox", [0.4, 0.4, 0.6, 0.6]) for k in self.keys}
+        self.key_pos = np.array([box_pos(k.get("bbox", [0.4, 0.4, 0.6, 0.6])) for k in self.keys], np.float32)
+        self.burst_pos = np.array([np.mean([box_pos(box_of[(b["clip"], u)]) for u in b.get("uids", [])
+                                            if (b["clip"], u) in box_of] or [[0.5, 0.5, 0.2, 0.2]], 0)
+                                   for b in self.bursts], np.float32).reshape(-1, 4)
         self.clips = sorted({r["clip"] for r in self.bursts + self.keys}, key=int)
 
 
@@ -125,6 +131,16 @@ def burst_batch(split, ids, rng, crop_s, train=True, starts=None, max_crop_s=Non
             torch.from_numpy(np.stack(vs)).to(dev))
 
 
+def positions(arr, ids, rng=None, jitter=0.0):
+    """Box centre and size; a little jitter in training, so the model learns
+    places in the barn, not the exact pixel of one annotated cow."""
+    import torch
+    p = arr[ids].copy()
+    if rng is not None and jitter:
+        p += np.array([[rng.uniform(-jitter, jitter) for _ in range(4)] for _ in ids], np.float32)
+    return torch.from_numpy(p).to(device())
+
+
 def labels(split, ids, field):
     import torch
     return torch.tensor([split.bursts[i][field] for i in ids], device=device())
@@ -162,7 +178,7 @@ def embed(model, split, ids, crop_s, starts, batch=64):
         for i in range(0, len(ids), batch):
             chunk = ids[i:i + batch]
             x, t, v = burst_batch(split, chunk, rng, crop_s, train=False, starts=[starts[j] for j in chunk])
-            o = model.temporal(x, t, v)
+            o = model.temporal(x, t, v, positions(split.burst_pos, chunk))
             out["fingerprint"].append(o["fingerprint"].cpu())
             out["quality_max"].append(o["weights"].max(1).values.cpu())
             out["quality_mean"].append(o["quality"].masked_fill(~v, 0).sum(1).div(v.sum(1)).cpu())
@@ -208,7 +224,7 @@ def frame_predictions(model, split, batch=1024):
     with torch.no_grad():
         for i in range(0, len(split.keys), batch):
             x = torch.from_numpy(split.key_feats[i:i + batch]).float().to(device())
-            o = model.frame(x)
+            o = model.frame(x, positions(split.key_pos, list(range(i, min(i + batch, len(split.keys))))))
             out.append(torch.stack([o["posture"].argmax(-1), o["activity"].argmax(-1)], 1).cpu())
     return torch.cat(out).numpy() if out else np.zeros((0, 2), int)
 
@@ -300,7 +316,7 @@ def cmd_train(args):
     dev = Split(tr_dir, dev_clips)
     print(f"[train] {len(train.bursts)} bursts / {len(train.keys)} keyframe cows in {len(train.clips)} clips; "
           f"dev {len(dev.bursts)} / {len(dev.keys)} in {len(dev.clips)} clips", flush=True)
-    model = HerdModel(train.dim, d=args.d, layers=args.layers, heads=args.heads).to(device())
+    model = HerdModel(train.dim, use_pos=bool(args.pos), d=args.d, layers=args.layers, heads=args.heads).to(device())
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
     steps = args.epochs * max(1, len(train.bursts) // args.P)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, args.lr, total_steps=steps, pct_start=0.05)
@@ -325,8 +341,9 @@ def cmd_train(args):
             n = max(x1.shape[1], x2.shape[1])
             padt = lambda a, fill: torch.nn.functional.pad(a, (0, 0, 0, n - a.shape[1]) if a.dim() == 3
                                                            else (0, n - a.shape[1]), value=fill)
+            bp = positions(train.burst_pos, ids, rng, 0.02)
             o = model.temporal(torch.cat([padt(x1, 0), padt(x2, 0)]), torch.cat([padt(t1, 0), padt(t2, 0)]),
-                               torch.cat([padt(v1, False), padt(v2, False)]))
+                               torch.cat([padt(v1, False), padt(v2, False)]), torch.cat([bp, bp]))
             ident = torch.arange(len(ids), device=device()).repeat(2)
             post, act, rum = (labels(train, ids, f).repeat(2) for f in ("posture", "activity", "rumination"))
             l_id = supcon(o["fingerprint"], ident, args.temperature)
@@ -337,7 +354,7 @@ def cmd_train(args):
                 o["rumination"][keep], rum[keep].float(), pos_weight=rum_w) if keep.any() else masked_bce(o["rumination"], rum)
             kidx = rng.sample(range(len(train.keys)), min(args.key_batch, len(train.keys)))
             kx = torch.from_numpy(train.key_feats[kidx]).float().to(device())
-            fo = model.frame(kx)
+            fo = model.frame(kx, positions(train.key_pos, kidx, rng, 0.02))
             l_fp = masked_ce(fo["posture"], torch.tensor([train.keys[i]["posture"] for i in kidx], device=device()))
             l_fa = masked_ce(fo["activity"], torch.tensor([train.keys[i]["activity"] for i in kidx], device=device()))
             loss = args.w_id * l_id + l_post + l_act + l_rum + l_fp + l_fa
@@ -418,6 +435,7 @@ def main(argv=None):
     p.add_argument("--w-id", type=float, default=2.0, help="ID loss weight (weighted highest, as planned)")
     p.add_argument("--holdout", type=float, default=0.1)
     p.add_argument("--patience", type=int, default=6, help="stop after this many epochs without a better dev score")
+    p.add_argument("--pos", type=int, default=0, help="1: give the heads where the cow is in the frame")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
     {"train": cmd_train, "eval": cmd_eval}[args.stage](args)

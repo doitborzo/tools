@@ -14,6 +14,8 @@
 #   MAX_ERROR=0.01    the NaN cut-off: at most this share of wrong IDs among answers
 #   MARGIN=0.1        context around each cow in the crops (0.5: twice the box, sees the feed
 #                     barrier); another MARGIN extracts into its own features_m<MARGIN>
+#   POS=0             1: the heads also get where the cow is in the frame (fixed cameras: the
+#                     feed barrier is a place in the picture); no new features needed
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,6 +28,7 @@ ENCODER="${ENCODER:-facebook/dinov2-small}"
 GRID="${GRID:-2}"
 MAX_ERROR="${MAX_ERROR:-0.01}"
 MARGIN="${MARGIN:-0.1}"
+POS="${POS:-0}"
 DATA="$WORK/cbvd5"
 FEAT="$WORK/herd/features"
 [ "$MARGIN" = "0.1" ] || FEAT="$WORK/herd/features_m$MARGIN"
@@ -52,7 +55,7 @@ if [ -z "${HERD_IN_TMUX:-}" ]; then
     if tmux has-session -t "$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     mkdir -p "$WORK/herd"
     knobs=""
-    for v in WORK RUN EPOCHS ENCODER GRID MAX_ERROR MARGIN; do knobs+="$v=$(printf '%q' "${!v}") "; done
+    for v in WORK RUN EPOCHS ENCODER GRID MAX_ERROR MARGIN POS; do knobs+="$v=$(printf '%q' "${!v}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env HERD_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/run_pod.sh"); echo; echo '[run_pod.sh finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log   ($LOG)"
@@ -109,7 +112,7 @@ step "5/6  Training: temporal transformer + heads ($EPOCHS epochs)"
 if [ -f "$OUT/model.pt" ] && [ -f "$OUT/eval_val.json" ]; then
     echo "trained already: $OUT"
 else
-    "$PY" herd.py train --features "$FEAT" --out "$OUT" --epochs "$EPOCHS"
+    "$PY" herd.py train --features "$FEAT" --out "$OUT" --epochs "$EPOCHS" --pos "$POS"
 fi
 "$PY" "$REPO/cowbench/cowbench.py" --out "$OUT/eval-val" score
 "$PY" "$REPO/cowbench/cowbench.py" --out "$OUT/eval-val" report
