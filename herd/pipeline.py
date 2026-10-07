@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import datetime as dt
 import json
 import math
@@ -84,13 +85,42 @@ class Tracker:
 
 # ------------------------------------------------------------------- models
 
+class GpuLock:
+    """One GPU, many camera threads. The once-a-second work (urgent) goes before
+    a waiting burst batch, so a big burst never holds up the 1 fps ticks for
+    longer than one batch. Counts the time it is held: the GPU's busy share."""
+
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.busy, self.urgent_waiting = False, 0
+        self.held = collections.Counter()           # kind -> seconds held
+
+    @contextlib.contextmanager
+    def __call__(self, urgent=False, kind="other"):
+        with self.cv:
+            self.urgent_waiting += urgent
+            while self.busy or (not urgent and self.urgent_waiting):
+                self.cv.wait()
+            self.urgent_waiting -= urgent
+            self.busy = True
+        t = time.perf_counter()
+        try:
+            yield
+        finally:
+            dt_ = time.perf_counter() - t
+            with self.cv:
+                self.held[kind] += dt_
+                self.busy = False
+                self.cv.notify_all()
+
+
 class Models:
     """Detector, frame encoder and herd model, shared by all cameras (one GPU)."""
 
     def __init__(self, cfg, detector=None):
         import torch
         from model import FrameEncoder, HerdModel
-        self.lock = threading.Lock()
+        self.gpu = GpuLock()
         self.dev = device()
         ck_path = cfg["model"]["checkpoint"]
         self.model, ck = HerdModel.load(ck_path, map_location=self.dev)
@@ -108,32 +138,49 @@ class Models:
         self.lameness = cfg["lameness"]["enabled"]
         self.torch = torch
 
-    def detect(self, img):
-        from PIL import Image
-        with self.lock:
-            return [c["bbox"] for c in self.detector(Image.fromarray(img))]
+    def _sync(self):
+        # the lock must cover the GPU work itself, not just queueing it
+        if self.dev.type == "cuda":
+            self.torch.cuda.synchronize()
 
-    def encode(self, crops, batch=256):
+    def detect(self, img, urgent=False, kind="detect"):
+        return self.detect_many([img], urgent=urgent, kind=kind)[0]
+
+    def detect_many(self, imgs, batch=8, urgent=False, kind="detect"):
+        from PIL import Image
+        out = []
+        many = getattr(self.detector, "many", None)
+        step = batch if many else 1
+        for i in range(0, len(imgs), step):
+            pils = [Image.fromarray(x) for x in imgs[i:i + step]]
+            with self.gpu(urgent, kind):
+                res = many(pils) if many else [self.detector(pils[0])]
+            out += [[c["bbox"] for c in r] for r in res]
+        return out
+
+    def encode(self, crops, batch=256, urgent=False, kind="encode"):
         torch = self.torch
         out = []
-        with self.lock, torch.no_grad():
-            for i in range(0, len(crops), batch):
-                x = torch.from_numpy(np.ascontiguousarray(np.stack(crops[i:i + batch]))).to(self.dev)
+        for i in range(0, len(crops), batch):
+            x = torch.from_numpy(np.ascontiguousarray(np.stack(crops[i:i + batch])))
+            with self.gpu(urgent, kind), torch.no_grad():
+                x = x.to(self.dev)
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.dev.type == "cuda"):
                     out.append(self.encoder(x).float())
+                self._sync()
         return torch.cat(out) if out else torch.zeros((0, self.encoder.out_dim), device=self.dev)
 
-    def frame_heads(self, feats, boxes):
+    def frame_heads(self, feats, boxes, urgent=True, kind="heads"):
         from model import box_pos
-        with self.lock, self.torch.no_grad():
+        with self.gpu(urgent, kind), self.torch.no_grad():
             pos = self.torch.tensor([box_pos(b) for b in boxes], device=self.dev).float()
             o = self.model.frame(feats, pos)
             return o["posture"].softmax(-1).cpu().numpy(), o["activity"].softmax(-1).cpu().numpy()
 
-    def burst(self, feats, times, valid, boxes):
+    def burst(self, feats, times, valid, boxes, urgent=False, kind="temporal"):
         from model import box_pos
         torch = self.torch
-        with self.lock, torch.no_grad():
+        with self.gpu(urgent, kind), torch.no_grad():
             pos = torch.tensor([box_pos(b) for b in boxes], device=self.dev).float().unsqueeze(0)
             o = self.model.temporal(feats.unsqueeze(0), torch.as_tensor(times, device=self.dev).unsqueeze(0).float(),
                                     torch.as_tensor(valid, device=self.dev).unsqueeze(0), pos)
@@ -149,6 +196,10 @@ class Models:
 # ------------------------------------------------------------------- camera
 
 class Camera:
+    """One camera: frames into a ring buffer (push, the reader's thread); the
+    1 fps path (step_seconds) and the bursts (step_burst) each in a thread of
+    their own when live, so a burst never stops the seconds."""
+
     def __init__(self, cam, index, n_cams, cfg, models, gallery, store, start_ts):
         s = cfg["sampling"]
         self.cam, self.cfg, self.models, self.gallery, self.store = cam, cfg, models, gallery, store
@@ -159,55 +210,90 @@ class Camera:
         self.width = s["frame_width"]
         self.buffer = collections.deque()
         self.buffer_s = self.burst_s + 3
+        self.buf_lock, self.trk_lock = threading.Lock(), threading.Lock()
         self.tracker = Tracker(self.id, cfg["tracker"]["iou"], cfg["tracker"]["max_age_s"])
         self.next_second = start_ts
         # Cameras burst in turn, not all at once: one GPU, an even load.
         self.next_burst = start_ts + self.burst_every * index / max(1, n_cams)
         self.stats = collections.Counter()
+        self.timings = None          # a list to record every tick and burst into (stress.py)
 
     def push(self, ts, frame_rgb):
         h, w = frame_rgb.shape[:2]
         if w > self.width:
             import cv2
             frame_rgb = cv2.resize(frame_rgb, (self.width, int(h * self.width / w)), interpolation=cv2.INTER_AREA)
-        self.buffer.append((ts, frame_rgb))
-        while self.buffer and ts - self.buffer[0][0] > self.buffer_s:
-            self.buffer.popleft()
+        with self.buf_lock:
+            self.buffer.append((ts, frame_rgb))
+            while self.buffer and ts - self.buffer[0][0] > self.buffer_s:
+                self.buffer.popleft()
+
+    def frames(self):
+        with self.buf_lock:
+            return list(self.buffer)
+
+    def _time(self, kind, ts, **kw):
+        if self.timings is not None:
+            self.timings.append({"cam": self.id, "kind": kind, "ts": ts, **kw})
 
     def step(self, now):
+        """Files: one thread does both, on the recording's clock."""
+        self.step_seconds(now)
+        self.step_burst(now)
+
+    def step_seconds(self, now):
         while now >= self.next_second:
-            frame = min(self.buffer, key=lambda x: abs(x[0] - self.next_second), default=None)
-            if frame and abs(frame[0] - self.next_second) <= 0.5:
-                self.second(self.next_second, frame[1])
+            t = self.next_second
             self.next_second += 1.0 / self.fps_out
-        if now >= self.next_burst + self.burst_s:
-            frames = [f for f in self.buffer if self.next_burst <= f[0] < self.next_burst + self.burst_s]
-            if len(frames) >= 10 and frames[-1][0] - frames[0][0] >= 0.8 * self.burst_s:
-                self.burst(self.next_burst, frames)
-            self.next_burst += self.burst_every
+            frame = min(self.frames(), key=lambda x: abs(x[0] - t), default=None)
+            if frame and abs(frame[0] - t) <= 0.5:
+                self.second(t, frame[1])
+            else:                                         # fell behind past the buffer, or no stream
+                self.stats["seconds_missed"] += 1
+                self._time("second", t, missed=True)
+
+    def step_burst(self, now):
+        if now < self.next_burst + self.burst_s:
+            return
+        t0 = self.next_burst
+        self.next_burst += self.burst_every
+        frames = [f for f in self.frames() if t0 <= f[0] < t0 + self.burst_s]
+        if len(frames) >= 10 and frames[-1][0] - frames[0][0] >= 0.8 * self.burst_s:
+            self.burst(t0, frames)
+        else:
+            self.stats["bursts_missed"] += 1
+            self._time("burst", t0, missed=True, frames=len(frames))
 
     # one frame a second
     def second(self, ts, img):
-        boxes = [b for b in self.models.detect(img) if in_mask(b, self.mask)]
-        tracked = self.tracker.update(ts, boxes)
-        if not tracked:
-            return
-        size = self.models.crop_size
-        feats = self.models.encode([crop(img, b, size, self.models.margin) for _, b in tracked])
-        pp, pa = self.models.frame_heads(feats, [b for _, b in tracked])
-        rows = [(self.id, tid, ts, *b, POSTURES[int(p.argmax())], ACTIVITIES[int(a.argmax())],
-                 float(p[POSTURES.index("lying")])) for (tid, b), p, a in zip(tracked, pp, pa)]
-        self.store.seconds(rows)
+        start = time.time()
+        boxes = [b for b in self.models.detect(img, urgent=True, kind="second_detect") if in_mask(b, self.mask)]
+        with self.trk_lock:
+            tracked = self.tracker.update(ts, boxes)
+        if tracked:
+            size = self.models.crop_size
+            feats = self.models.encode([crop(img, b, size, self.models.margin) for _, b in tracked],
+                                       urgent=True, kind="second_encode")
+            pp, pa = self.models.frame_heads(feats, [b for _, b in tracked])
+            rows = [(self.id, tid, ts, *b, POSTURES[int(p.argmax())], ACTIVITIES[int(a.argmax())],
+                     float(p[POSTURES.index("lying")])) for (tid, b), p, a in zip(tracked, pp, pa)]
+            self.store.seconds(rows)
         self.stats["seconds"] += 1
-        self.stats["cow_seconds"] += len(rows)
+        self.stats["cow_seconds"] += len(tracked)
+        self._time("second", ts, start=start, end=time.time(), cows=len(tracked))
 
     # 7 s at 25 fps
     def burst(self, t0, frames):
+        start = time.time()
+        part = collections.Counter()
         step = max(1, int(round(len(frames) / (self.burst_s * self.burst_det_fps))))
         sampled = frames[::step]
+        t = time.perf_counter()
+        detections = self.models.detect_many([img for _, img in sampled], kind="burst_detect")
+        part["detect"] += time.perf_counter() - t
         chains = []                                       # [{t: box}]
-        for ts, img in sampled:
-            boxes = [b for b in self.models.detect(img) if in_mask(b, self.mask)]
+        for (ts, _), found in zip(sampled, detections):
+            boxes = [b for b in found if in_mask(b, self.mask)]
             used = set()
             for ch in chains:
                 last_t = max(ch)
@@ -219,24 +305,39 @@ class Camera:
                         used.add(j)
             chains += [{ts: b} for j, b in enumerate(boxes) if j not in used]
         size = self.models.crop_size
+        cows = crops_n = 0
         for ch in chains:
             if len(ch) < max(2, 0.5 * len(sampled)):      # seen in too little of the burst
                 continue
             times = sorted(ch)
             mid = times[len(times) // 2]
-            tid = self.tracker.track_at(mid, ch[mid]) or f"{self.id}-burst-{int(t0)}-{times[0]:.0f}"
+            with self.trk_lock:
+                tid = self.tracker.track_at(mid, ch[mid]) or f"{self.id}-burst-{int(t0)}-{times[0]:.0f}"
             valid = np.array([times[0] - 0.5 <= ts <= times[-1] + 0.5 for ts, _ in frames])
             boxes = [interpolate_box(ch, ts) for ts, _ in frames]
+            t = time.perf_counter()
             crops = [crop(img, b, size, self.models.margin) for (_, img), b in zip(frames, boxes)]
-            feats = self.models.encode(crops)
+            part["crop"] += time.perf_counter() - t
+            t = time.perf_counter()
+            feats = self.models.encode(crops, kind="burst_encode")
+            part["encode"] += time.perf_counter() - t
+            t = time.perf_counter()
             out = self.models.burst(feats, [ts - t0 for ts, _ in frames], valid, boxes)
+            part["temporal"] += time.perf_counter() - t
+            t = time.perf_counter()
             area = float(np.mean([(b[2] - b[0]) * (b[3] - b[1]) for b in ch.values()]))
             decision = self.gallery.decide(out, area, t0, tid)
             self.store.burst((self.id, tid, t0, decision["state"], decision["cow"], decision["sim"],
                               decision["margin"], decision["p"], out["rumination"], out["posture"],
                               out["activity"], out["lameness"], out["quality_max"], int(valid.sum())))
-            self.stats["bursts"] += 1
+            part["gallery"] += time.perf_counter() - t
+            cows += 1
+            crops_n += len(crops)
             self.stats[f"id_{decision['state']}"] += 1
+        self.stats["bursts"] += 1
+        self._time("burst", t0, start=start, end=time.time(), ready=t0 + self.burst_s, frames=len(frames),
+                   detected=len(sampled), chains=len(chains), cows=cows, crops=crops_n,
+                   parts={k: round(v, 4) for k, v in part.items()})
 
 
 class SharedGallery:
@@ -297,23 +398,39 @@ def run_file(camera, url, start_ts):
         camera.step(ts)
 
 
-def run_live(camera, url, stop):
-    """Reader thread fills the buffer at the camera's rate; this thread analyses
-    on the wall clock, so a slow burst never makes the reader drop frames."""
+def run_live(camera, source, stop):
+    """Three threads per camera: the reader fills the buffer at the camera's
+    rate, the 1 fps path and the bursts run on the wall clock beside it, so a
+    slow burst neither drops frames nor holds up the seconds. source() gives
+    (ts, rgb) frames: frames_from(url) for RTSP, or a paced file (stress.py)."""
     def reader():
         while not stop.is_set():
             try:
-                for ts, img in frames_from(url):
+                for ts, img in source():
                     camera.push(ts, img)
                     if stop.is_set():
                         return
             except RuntimeError as e:
                 print(f"[{camera.id}] {e}; reconnecting in 5 s", flush=True)
-            time.sleep(5)
-    threading.Thread(target=reader, daemon=True).start()
-    while not stop.is_set():
-        camera.step(time.time())
-        time.sleep(0.05)
+            stop.wait(5)
+
+    def loop(step):
+        while not stop.is_set():
+            try:
+                step(time.time())
+            except Exception as e:                   # one bad frame must not stop the camera
+                import traceback
+                traceback.print_exc()
+                print(f"[{camera.id}] {e.__class__.__name__}: {e}", flush=True)
+            stop.wait(0.05)
+
+    threads = [threading.Thread(target=f, daemon=True, name=f"{camera.id}-{n}")
+               for n, f in (("reader", reader), ("seconds", lambda: loop(camera.step_seconds)),
+                            ("bursts", lambda: loop(camera.step_burst)))]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
 
 
 def run(cfg, start=None, models=None, max_wall_s=None):
@@ -332,7 +449,7 @@ def run(cfg, start=None, models=None, max_wall_s=None):
     threads = []
     for cam, c in zip(cams, cfg["cameras"]):
         target = (lambda cam=cam, c=c: run_file(cam, c["url"], start_ts)) if start is not None else \
-                 (lambda cam=cam, c=c: run_live(cam, c["url"], stop))
+                 (lambda cam=cam, c=c: run_live(cam, lambda: frames_from(c["url"]), stop))
         th = threading.Thread(target=target, daemon=True)
         th.start()
         threads.append(th)

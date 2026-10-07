@@ -7,10 +7,16 @@
 #   bash herd/run_pod.sh          start in tmux session "herd"
 #   bash herd/run_pod.sh log      follow the log
 #   bash herd/run_pod.sh stop
+#   bash herd/run_pod.sh stress   one GPU in real time: a burst alone, then CAMERAS (5) cameras at
+#                                 1 fps + a 7 s burst a minute each (tmux "herd-stress", ~7 min);
+#                                 RUN= the model (default: the newest run), DET= the detector's best/,
+#                                 CAMERAS=5 DURATION=300 (s measured)
 #
 # Every step resumes: features are written clip by clip, so a rerun after a
 # crash continues where it stopped. Knobs:
-#   WORK=/workspace   RUN=run1   EPOCHS=40   ENCODER=facebook/dinov2-small   GRID=2
+#   WORK=/workspace   RUN=run1   EPOCHS=40   ENCODER=facebook/dinov2-small
+#   GRID=2            patch tokens pooled to GRID x GRID per frame (4: finer, e.g. the jaw;
+#                     features 3.4x larger); another GRID extracts into features_g<GRID>
 #   MAX_ERROR=0.01    the NaN cut-off: at most this share of wrong IDs among answers
 #   MARGIN=0.1        context around each cow in the crops (0.5: twice the box, sees the feed
 #                     barrier); another MARGIN extracts into its own features_m<MARGIN>
@@ -30,8 +36,11 @@ MAX_ERROR="${MAX_ERROR:-0.01}"
 MARGIN="${MARGIN:-0.1}"
 POS="${POS:-0}"
 DATA="$WORK/cbvd5"
+# Features depend on margin and grid: another value gets its own folder
+# (a shared one would be skipped as "done" and silently reused).
 FEAT="$WORK/herd/features"
-[ "$MARGIN" = "0.1" ] || FEAT="$WORK/herd/features_m$MARGIN"
+[ "$MARGIN" = "0.1" ] || FEAT="${FEAT}_m$MARGIN"
+[ "$GRID" = "2" ] || FEAT="${FEAT}_g$GRID"
 OUT="$WORK/herd/$RUN"
 VENV="$WORK/herd/.venv"
 LOG="$WORK/herd/log_$RUN.txt"
@@ -46,8 +55,24 @@ case "${1:-}" in
           echo "following $LOG"
           exec tail -n 100 -F "$LOG" ;;
     stop) tmux kill-session -t "$SESSION" 2>/dev/null && echo stopped || echo "not running"; exit 0 ;;
+    stress)
+        [ -n "${RUN_SET:-}" ] || RUN="$(basename "$(dirname "$(ls -t "$WORK"/herd/*/model.pt 2>/dev/null | head -1)")")"
+        MODEL="$WORK/herd/$RUN/model.pt"
+        DET="${DET:-$WORK/lora-runs/detector/best}"
+        [ -f "$MODEL" ] || { echo "no model at $MODEL - train first, or RUN=<run>"; exit 1; }
+        [ -f "$DET/det_train_meta.json" ] || { echo "no detector at $DET - set DET=<.../detector/best>"; exit 1; }
+        SOUT="$WORK/herd/stress_$RUN"
+        mkdir -p "$SOUT"
+        cmd="$(printf '%q ' "$VENV/bin/python" "$HERE/herd.py" stress --model "$MODEL" --detector "$DET" \
+               --root "$DATA" --cameras "${CAMERAS:-5}" --duration "${DURATION:-300}" --out "$SOUT")"
+        tmux has-session -t herd-stress 2>/dev/null && { echo "already running: tmux attach -t herd-stress"; exit 1; }
+        env -u TMUX tmux new-session -d -s herd-stress -x 200 -y 50 \
+            "export HF_HOME=$(printf '%q' "$HF_HOME"); $cmd 2>&1 | tee $(printf '%q' "$SOUT/log.txt"); echo '[stress finished]'; exec bash"
+        echo "Started in tmux session 'herd-stress' (model $MODEL).  log: tail -F $SOUT/log.txt"
+        echo "result: $SOUT/stress_herd_${CAMERAS:-5}cam.md"
+        exit 0 ;;
     "") ;;
-    *) echo "usage: $0 [log|stop]"; exit 2 ;;
+    *) echo "usage: $0 [log|stop|stress]"; exit 2 ;;
 esac
 
 if [ -z "${HERD_IN_TMUX:-}" ]; then

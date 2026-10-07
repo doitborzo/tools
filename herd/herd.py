@@ -9,6 +9,7 @@ Training (on CBVD-5 today, on the barn's own footage later):
 
 Running:
     herd.py run --config barn.toml [--start ISO]   cameras (RTSP) or files -> herd.sqlite
+    herd.py stress --model M --detector D          one GPU: a burst alone, then 5 cameras live
 
 Reports:
     herd.py report --config barn.toml csv [--end DAY]       the 3-day CSV
@@ -65,6 +66,9 @@ def main():
     if cmd == "run":
         import pipeline
         return pipeline.main(argv)
+    if cmd == "stress":
+        import stress
+        return stress.main(argv)
     if cmd == "report":
         import report
         return report.main(argv)

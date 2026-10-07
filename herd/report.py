@@ -42,10 +42,13 @@ FIELDS = ("observed_min", "lying_min", "standing_min", "feeding_min", "drinking_
 
 
 def rumination_threshold(cfg):
-    """The cut-off calibrated at training (heads.json next to the model), else 0.5."""
+    """The cut-off calibrated at training (heads.json next to the model): the one
+    that keeps the share of ruminating bursts true, since reports sum minutes;
+    older models only have the per-burst one; else 0.5."""
     path = os.path.join(os.path.dirname(os.path.abspath(cfg["model"]["checkpoint"] or ".")), "heads.json")
     try:
-        return float(json.load(open(path, encoding="utf-8"))["rumination_threshold"])
+        h = json.load(open(path, encoding="utf-8"))
+        return float(h.get("rumination_threshold_time", h["rumination_threshold"]))
     except (OSError, KeyError, ValueError):
         return 0.5
 
