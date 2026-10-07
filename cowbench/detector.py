@@ -268,6 +268,12 @@ class Live:
             boxes = predict(self.model, self.processor, [img])[0]
         return [{"bbox": b[:4], "det_score": b[4]} for b in boxes if b[4] >= self.threshold]
 
+    def many(self, imgs):
+        """Several PIL images in one pass (herd's bursts): a list per image."""
+        with self._lock:
+            res = predict(self.model, self.processor, list(imgs))
+        return [[{"bbox": b[:4], "det_score": b[4]} for b in boxes if b[4] >= self.threshold] for boxes in res]
+
 
 # ------------------------------------------------------------------- detect
 

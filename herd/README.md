@@ -65,6 +65,28 @@ What CBVD-5 can and cannot show:
   view - the barn's own footage is needed for that (and the side-view CBVD-5 is
   not a top view).
 
+## One GPU, 5 cameras, in real time
+
+```bash
+bash herd/run_pod.sh stress                       # newest run's model, /workspace/lora-runs/detector/best
+RUN=run4 CAMERAS=5 DURATION=300 bash herd/run_pod.sh stress
+python herd/herd.py stress --model M --detector D --root /workspace/cbvd5 --out OUT   # by hand
+```
+
+Two tests on CBVD-5 val videos with the real models: **a burst alone** (7 s at
+25 fps, nothing else running: seconds per burst split into detect / crop /
+encode / temporal / gallery, cows and crops per burst, one 1 fps tick) and
+**live** (5 cameras at once, each a video at its real 25 fps through the same
+code as the barn, a tick a second and a burst a minute each, staggered; 30 s
+warm-up, 300 s measured). Result: `stress_herd_5cam.md` / `.json` - ticks done,
+tick lag p50-p99, bursts done and how late, GPU busy share by part, memory, CPU,
+and how many cameras one GPU could take. Keeps up when >= 98% of ticks are done,
+tick lag p99 <= 2 s, every burst is done, and each ends before its camera's next.
+
+Live, each camera runs three threads (reader, 1 fps, bursts); the GPU is taken
+batch by batch and the 1 fps work goes first, so a burst never holds a tick up
+by more than one batch.
+
 ## In the barn
 
 ```bash
@@ -94,6 +116,7 @@ time on tracks no cow could be given.
 | `abstain.py` | the NaN model |
 | `gallery.py` | prototypes, matching, enrolment, change-over, retirement |
 | `pipeline.py` | cameras -> 1 fps + bursts -> store |
+| `stress.py` | a burst alone, then N cameras live on one GPU: lag, burst time, GPU share |
 | `store.py`, `report.py` | SQLite; per-cow days, CSV, alerts, verdicts |
 | `tests/` | `python herd/tests/run_all.py` |
 
