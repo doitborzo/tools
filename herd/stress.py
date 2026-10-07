@@ -201,8 +201,8 @@ def burst_alone(args, cfg, models, shared, store, clips):
             continue
         cam.burst(t0, frames)
         r = cam.timings[-1]
-        print(f"  {os.path.basename(path)}: {r['end'] - r['start']:.2f} s, {r['cows']} cows, {r['crops']} crops  "
-              f"{r['parts']}", flush=True)
+        print(f"  {os.path.basename(path)}: {r['end'] - r['start']:.2f} s, {r['cows']} cows, {r['crops']} crops, "
+              f"ruminating {r.get('ruminating', 0)}  {r['parts']}", flush=True)
         for j in range(0, len(frames), max(1, len(frames) // 3)):   # a few 1 fps ticks on the same clip
             cam.second(frames[j][0], frames[j][1])
     bursts = [r for r in cam.timings if r["kind"] == "burst" and not r.get("missed")]
@@ -221,6 +221,9 @@ def burst_alone(args, cfg, models, shared, store, clips):
         "frames_per_burst": dist([r["frames"] for r in bursts], (50,)),
         "tick_s": dist([r["end"] - r["start"] for r in ticks], (50, 90)),
         "cows_per_tick": dist([r["cows"] for r in ticks], (50,)),
+        "ruminating": sum(r.get("ruminating", 0) for r in bursts),
+        "cow_bursts": sum(r["cows"] for r in bursts),
+        "rumination_p": dist([p for r in bursts for p in r.get("rumination_p", [])], (10, 50, 90)),
         "runs": bursts,
     }
 
@@ -317,6 +320,9 @@ def live(args, cfg, models, shared, store, clips):
             "burst_work_s": dist([r["end"] - r["start"] for r in done], (50, 90)),
             "cows_per_burst": dist([r["cows"] for r in done], (50,)),
         }
+    in_window = [r for r in timings if r["kind"] == "burst" and not r.get("missed") and t_from <= r["ts"] < t_to]
+    rum_yes = sum(r.get("ruminating", 0) for r in in_window)
+    cow_bursts = sum(r["cows"] for r in in_window)
     window = wall1 - wall0 if held0 is not None else args.duration
     busy = {k: (held1.get(k, 0) - (held0 or {}).get(k, 0)) / window for k in held1}
     busy_total = sum(busy.values())
@@ -336,6 +342,7 @@ def live(args, cfg, models, shared, store, clips):
         "tick_lag_s": dist(all_lag),
         "bursts_due": bursts_due, "bursts_done": bursts_done,
         "burst_late_s": dist(all_burst_late, (50, 90)),
+        "ruminating": rum_yes, "cow_bursts": cow_bursts,
         "gpu_busy_share": round(busy_total, 3),
         "gpu_busy_by_kind": {k: round(v, 3) for k, v in sorted(busy.items())},
         # GPU-bound estimate with 20% kept free; CPU (decode, crops) may stop it sooner
@@ -383,8 +390,13 @@ def markdown(res):
                 f"| crops in a burst | {fmt(a['crops_per_burst'], unit='', dd=0)} | | {fmt(a['crops_per_burst'], 'max', '', 0)} |",
                 f"| 1 fps tick, s | {fmt(a['tick_s'])} | {fmt(a['tick_s'], 'p90')} | {fmt(a['tick_s'], 'max')} |",
                 f"| cows in a tick | {fmt(a['cows_per_tick'], unit='', dd=0)} | | {fmt(a['cows_per_tick'], 'max', '', 0)} |",
+                f"| cows called ruminating | {a['ruminating']} of {a['cow_bursts']} | | |",
+                f"| rumination p (p10 / p50 / p90) | {fmt(a['rumination_p'], 'p10')} / {fmt(a['rumination_p'])} / "
+                f"{fmt(a['rumination_p'], 'p90')} | | |",
                 "", "Burst parts, p50 s: " + ", ".join(f"{k} {fmt(v)}" for k, v in a["burst_parts_s"].items())
-                + f"; encoder {a['crops_per_s_encode']:.0f} crops/s.", ""]
+                + f"; encoder {a['crops_per_s_encode']:.0f} crops/s. Rumination: model {res.get('motion') and 'with' or 'without'} "
+                f"the motion rhythm, ruminating = p >= {res.get('rumination_threshold', 0):.2f} and not feeding or drinking; "
+                "motion_wait is how long the burst waited for the rhythm after the encoder (it runs beside it).", ""]
     if L:
         g = L.get("gpu") or {}
         out += [f"## Live: {L['cameras']} cameras at once", "",
@@ -398,6 +410,7 @@ def markdown(res):
                 f"| tick lag (frame -> written) p50 / p90 / p99 / max | {fmt(L['tick_lag_s'])} / "
                 f"{fmt(L['tick_lag_s'], 'p90')} / {fmt(L['tick_lag_s'], 'p99')} / {fmt(L['tick_lag_s'], 'max')} |",
                 f"| bursts done | {L['bursts_done']} of {L['bursts_due']} |",
+                f"| cows called ruminating in those bursts | {L['ruminating']} of {L['cow_bursts']} |",
                 f"| burst ready -> done p50 / p90 / max | {fmt(L['burst_late_s'])} / {fmt(L['burst_late_s'], 'p90')} / "
                 f"{fmt(L['burst_late_s'], 'max')} |",
                 f"| GPU busy (model work) | {L['gpu_busy_share']:.0%} |",
@@ -451,7 +464,8 @@ def main(argv=None):
     cfg, models, shared, store = build(args)
     res = {"model": cfg["model"]["checkpoint"], "detector": cfg["detector"]["weights"],
            "detector_device": getattr(models.detector, "device", "?"),
-           "burst_seconds": cfg["sampling"]["burst_seconds"], "clips": len(clips)}
+           "burst_seconds": cfg["sampling"]["burst_seconds"], "clips": len(clips),
+           "motion": bool(models.motion_dim), "rumination_threshold": models.rum_thr}
     if models.dev.type == "cuda":
         res["gpu_name"] = models.torch.cuda.get_device_name()
     if args.alone:

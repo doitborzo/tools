@@ -13,6 +13,7 @@ cameras (RTSP)  ->  ring buffer per camera (last ~10 s)
    every 60 s   ->  7 s burst at 25 fps, every cow in view: 175 crops -> DINOv2-S
    (staggered)  ->  temporal transformer (#2) -> per-frame quality + ID
                 ->  fingerprint = quality-weighted average; rumination, posture, activity, lameness
+                ->  + the rhythm of the crops (motion.py: chewing ~1/s) -> ruminating yes / no
                 ->  gallery: k-means prototypes per cow -> confirmed / tentative / unknown (NaN)
 SQLite (seconds, bursts) -> track -> cow from confirmed bursts -> per-cow days
                 -> 3-day CSV, alerts vs the cow's own week, vet verdicts -> alert precision
@@ -25,6 +26,7 @@ SQLite (seconds, bursts) -> track -> cow from confirmed bursts -> per-cow days
 | Who runs in real time | Small trainable models only (RT-DETRv2, DINOv2-S, a 3-layer temporal transformer); Muse cannot do 5 frames/s (≈2/s measured) |
 | Burst | Per camera, not per cow: one 7 s burst gives every cow in view; cameras take turns |
 | What comes from where | posture, feeding, drinking: every second; rumination: bursts (one still frame cannot show it); lameness: bursts, once labels exist |
+| Rumination in a burst | the temporal model's head plus the rhythm of the burst's own crops (motion.py: per-pixel spectrum over the 7 s, bands around 1 chew a second, per cell of a 4x4 grid); ruminating = p over the cut-off calibrated with the model (heads.json) and not feeding or drinking; written per burst (`bursts.ruminating`), summed into minutes by the reports |
 | Identity between bursts | the tracker carries it; a track gets the cow most of its confirmed bursts say (2/3), else its time is NaN |
 | k-means | per cow (her own looks: lying, walking, dirty), rebuilt nightly from confirmed bursts only |
 | NaN | a small model of p(right) from similarity, margin to the next cow, burst quality, cow size; cut-off so that ≤1% of answers are wrong |
@@ -48,7 +50,9 @@ or by hand:
 ```bash
 python herd/herd.py extract --split train      # 175 crops per burst -> DINOv2 vectors on disk
 python herd/herd.py extract --split val
-python herd/herd.py train                      # minutes: no images, no big encoder in the loop
+python herd/herd.py motion --split train       # the rhythm of every burst (chewing), CPU only
+python herd/herd.py motion --split val
+python herd/herd.py train --motion 1           # minutes: no images, no big encoder in the loop
 python herd/herd.py abstain                    # NaN model + cut-off -> abstain.json
 python cowbench/cowbench.py --out /workspace/herd/run1/eval-val score   # same 2532 cows as the LoRA runs
 ```
@@ -111,6 +115,7 @@ time on tracks no cow could be given.
 |---|---|
 | `common.py` | config (TOML over defaults), masks, crops, box interpolation |
 | `model.py` | DINOv2 frame encoder, frame heads, temporal transformer, losses |
+| `motion.py` | the rhythm of a burst's crops: what rumination (chewing) looks like |
 | `cbvd_bursts.py` | CBVD-5 -> bursts + keyframes -> Stage A vectors |
 | `train.py` | Stage A training, re-ID / posture / rumination scoring, cowbench export |
 | `abstain.py` | the NaN model |

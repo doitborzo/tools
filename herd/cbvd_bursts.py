@@ -5,6 +5,8 @@
              features/<split>/<clip>.npz   burst_feats (B, T, D) fp16, burst_times (B, T)
                                            key_feats (K, D) fp16
              features/<split>/index.jsonl  one row per burst and per keyframe, with labels
+    motion   videos -> the rhythm of each burst's crops (motion.py), no GPU:
+             features/<split>/<clip>.motion.npz   motion (B, DIM), ok (B,)
 
 A burst is 7 s at 25 fps of one cow. CBVD-5 clips are 10 s at 25 fps with
 keyframes at whole seconds (keyframe t = frame t*25, checked in cowbench's
@@ -205,14 +207,79 @@ def cmd_extract(args):
                    "burst_seconds": args.burst_seconds, "fps": VIDEO_FPS}, fh, indent=2)
 
 
+def _motion_clip(job):
+    """One clip's bursts -> motion features (a worker process)."""
+    from motion import DIM, motion_features
+    root, clip, bursts, size, margin, n_frames, path = job
+    try:
+        frames, fps = read_video(cbvd.video_path(root, clip))
+    except FileNotFoundError:
+        return clip, 0
+    feats, oks = [], []
+    for b in bursts:
+        keys = {float(t): v for t, v in b["keys"].items()}
+        ts = [b["start"] + j / VIDEO_FPS for j in range(n_frames)]
+        idx = [min(len(frames) - 1, int(round(t * fps))) for t in ts]
+        crops = np.stack([crop(frames[ix], interpolate_box(keys, t), size, margin) for ix, t in zip(idx, ts)])
+        f, ok = motion_features(crops, np.asarray(ts) - b["start"])
+        feats.append(f)
+        oks.append(ok)
+    np.savez(path + ".part.npz", motion=np.stack(feats) if feats else np.zeros((0, DIM), np.float32),
+             ok=np.array(oks, bool))
+    os.replace(path + ".part.npz", path)
+    return clip, len(bursts)
+
+
+def cmd_motion(args):
+    """Motion features for every burst already extracted, from the same crops
+    (the features' own margin and size); clip by clip, resumable, CPU only."""
+    import multiprocessing as mp
+    from motion import BANDS, DIM, GRID, SIDE
+    out_dir = os.path.join(args.out, args.split)
+    meta = json.load(open(os.path.join(out_dir, "meta.json"), encoding="utf-8"))
+    rows = [r for r in read_jsonl(os.path.join(out_dir, "index.jsonl")) if r["kind"] == "burst"]
+    tracks = collections.defaultdict(dict)
+    for r in rows:
+        tracks[r["clip"]][r["i"]] = r["track"]
+    clips = build_specs(split_boxes(args.root, args.split), meta.get("burst_seconds", 7.0))
+    n_frames = int(round(meta.get("burst_seconds", 7.0) * VIDEO_FPS))
+    jobs = []
+    for clip, have in sorted(tracks.items(), key=lambda kv: int(kv[0])):
+        bursts = clips.get(clip, {}).get("bursts", [])
+        if [b["track"] for b in bursts] != [have[i] for i in sorted(have)]:
+            sys.exit(f"clip {clip}: bursts differ from the extracted ones - re-run extract")
+        path = os.path.join(out_dir, f"{clip}.motion.npz")
+        if not os.path.exists(path):
+            jobs.append((args.root, clip, bursts, meta.get("crop", 224), meta.get("margin", 0.1), n_frames, path))
+    print(f"[motion] {args.split}: {len(tracks)} clips with bursts, {len(jobs)} to do, {args.workers} processes",
+          flush=True)
+    t0, n = time.time(), 0
+    with mp.get_context("fork").Pool(args.workers) as pool:
+        for k, (clip, nb) in enumerate(pool.imap_unordered(_motion_clip, jobs), 1):
+            n += nb
+            el = time.time() - t0
+            print(f"\r  {k}/{len(jobs)} clips, {n} bursts  {el / 60:.1f} min  ~{el / k * (len(jobs) - k) / 60:.0f} min left",
+                  end="", flush=True)
+    print(flush=True)
+    with open(os.path.join(out_dir, "motion_meta.json"), "w", encoding="utf-8") as fh:
+        json.dump({"dim": DIM, "bands": BANDS, "grid": GRID, "side": SIDE, "crop": meta.get("crop", 224),
+                   "margin": meta.get("margin", 0.1)}, fh, indent=2)
+
+
 def cbvd_frame(root, clip, ts):
     from PIL import Image
     return Image.open(cbvd.frame_path(root, cbvd.Box(clip, ts, 0, 0, 0, 0, "1", ()))).convert("RGB")
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    motion = bool(argv) and argv[0] == "motion"
+    if motion:
+        argv = argv[1:]
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--root", default="/workspace/cbvd5")
+    p.add_argument("--workers", type=int, default=min(16, os.cpu_count() or 2),
+                   help="motion: processes (each holds one decoded clip)")
     p.add_argument("--out", default="/workspace/herd/features")
     p.add_argument("--split", choices=("train", "val"), default="train")
     p.add_argument("--encoder", default="facebook/dinov2-small")
@@ -225,7 +292,8 @@ def main(argv=None):
     p.add_argument("--photo-aug", type=int, default=1)
     p.add_argument("--limit-clips", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
-    cmd_extract(p.parse_args(argv))
+    args = p.parse_args(argv)
+    (cmd_motion if motion else cmd_extract)(args)
 
 
 if __name__ == "__main__":

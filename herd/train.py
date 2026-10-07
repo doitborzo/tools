@@ -50,18 +50,26 @@ class Split:
         self.meta = json.load(open(os.path.join(folder, "meta.json"), encoding="utf-8"))
         keep = (lambda c: True) if clips is None else (lambda c: c in clips)
         self.bursts, self.keys = [], []
-        bf, bt, kf = [], [], []
+        bf, bt, kf, bm, bok = [], [], [], [], []
+        have_motion = True
         by_clip = collections.defaultdict(list)
         for r in rows:
             if r["kind"] in ("burst", "key") and keep(r["clip"]):
                 by_clip[r["clip"]].append(r)
         for clip in sorted(by_clip, key=lambda c: int(c)):
             z = np.load(os.path.join(folder, f"{clip}.npz"))
+            mpath = os.path.join(folder, f"{clip}.motion.npz")
+            zm = np.load(mpath) if os.path.exists(mpath) else None
             for r in by_clip[clip]:
                 if r["kind"] == "burst" and len(z["burst_feats"]):
                     self.bursts.append(r)
                     bf.append(z["burst_feats"][r["i"]])
                     bt.append(z["burst_times"][r["i"]])
+                    if zm is None:
+                        have_motion = False
+                    elif have_motion:
+                        bm.append(zm["motion"][r["i"]])
+                        bok.append(bool(zm["ok"][r["i"]]))
                 elif r["kind"] == "key":
                     self.keys.append(r)
                     kf.append(z["key_feats"][r["i"]])
@@ -70,6 +78,10 @@ class Split:
         self.burst_times = np.stack(bt) if bt else np.zeros((0, 1), np.float32)
         self.key_feats = np.stack(kf) if kf else np.zeros((0, dim), np.float16)
         self.dim = dim
+        # the rhythm of each burst (cbvd_bursts.py motion); None until extracted for every clip
+        self.burst_motion = (np.stack(bm) * np.array(bok, np.float32)[:, None]
+                             if have_motion and bm and len(bm) == len(self.bursts) else None)
+        self.motion_dim = 0 if self.burst_motion is None else self.burst_motion.shape[1]
         from model import box_pos
         box_of = {(k["clip"], k["uid"]): k.get("bbox", [0.4, 0.4, 0.6, 0.6]) for k in self.keys}
         self.key_pos = np.array([box_pos(k.get("bbox", [0.4, 0.4, 0.6, 0.6])) for k in self.keys], np.float32)
@@ -141,6 +153,18 @@ def positions(arr, ids, rng=None, jitter=0.0):
     return torch.from_numpy(p).to(device())
 
 
+def motion_of(split, ids, rng=None, drop=0.1):
+    """The bursts' motion features; in training a few are zeroed, as for a cow
+    the barn saw too briefly to compute them."""
+    import torch
+    if split.burst_motion is None:
+        sys.exit("the model takes motion features and this split has none yet: herd.py motion --split <split>")
+    m = split.burst_motion[ids].copy()
+    if rng is not None:
+        m[[k for k in range(len(ids)) if rng.random() < drop]] = 0
+    return torch.from_numpy(m).float().to(device())
+
+
 def labels(split, ids, field):
     import torch
     return torch.tensor([split.bursts[i][field] for i in ids], device=device())
@@ -178,7 +202,8 @@ def embed(model, split, ids, crop_s, starts, batch=64):
         for i in range(0, len(ids), batch):
             chunk = ids[i:i + batch]
             x, t, v = burst_batch(split, chunk, rng, crop_s, train=False, starts=[starts[j] for j in chunk])
-            o = model.temporal(x, t, v, positions(split.burst_pos, chunk))
+            o = model.temporal(x, t, v, positions(split.burst_pos, chunk),
+                               motion_of(split, chunk) if model.motion_dim else None)
             out["fingerprint"].append(o["fingerprint"].cpu())
             out["quality_max"].append(o["weights"].max(1).values.cpu())
             out["quality_mean"].append(o["quality"].masked_fill(~v, 0).sum(1).div(v.sum(1)).cpu())
@@ -251,6 +276,46 @@ def share_threshold(p, y):
     ts = np.linspace(0.05, 0.95, 91)
     target = float(np.mean(y)) if len(y) else 0.0
     return float(ts[int(np.argmin([abs(float(np.mean(p >= t)) - target) for t in ts]))])
+
+
+def motion_baseline(train_dir, val_dir):
+    """Rumination from the motion features alone (logistic regression): does
+    the rhythm say anything by itself? F1 at the cut-off best on val - an upper
+    bound, a diagnostic only. None until motion is extracted."""
+    import torch
+
+    def load(folder):
+        rows = [r for r in read_jsonl(os.path.join(folder, "index.jsonl")) if r["kind"] == "burst"]
+        xs, ys = [], []
+        for clip in sorted({r["clip"] for r in rows}, key=int):
+            path = os.path.join(folder, f"{clip}.motion.npz")
+            if not os.path.exists(path):
+                return None, None
+            z = np.load(path)
+            for r in rows:
+                if r["clip"] == clip and r["i"] < len(z["motion"]) and z["ok"][r["i"]] and r["rumination"] >= 0:
+                    xs.append(z["motion"][r["i"]])
+                    ys.append(r["rumination"])
+        return (np.stack(xs), np.array(ys)) if xs else (None, None)
+
+    xt, yt = load(train_dir)
+    xv, yv = load(val_dir)
+    if xt is None or xv is None or yt.min() == yt.max():
+        return None
+    mu, sd = xt.mean(0), xt.std(0) + 1e-6
+    X = torch.from_numpy((xt - mu) / sd).float()
+    Y = torch.from_numpy(yt).float()
+    lin = torch.nn.Linear(X.shape[1], 1)
+    opt = torch.optim.AdamW(lin.parameters(), lr=1e-2, weight_decay=1e-2)
+    pw = torch.tensor(math.sqrt((1 - Y.mean()) / Y.mean().clamp(min=1e-3)))
+    for _ in range(400):
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(lin(X).squeeze(-1), Y, pos_weight=pw)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    with torch.no_grad():
+        p = lin(torch.from_numpy((xv - mu) / sd).float()).squeeze(-1).sigmoid().numpy()
+    return best_threshold(p, yv)[0]
 
 
 def evaluate(model, split, crop_s, rum_thr=0.5):
@@ -326,7 +391,12 @@ def cmd_train(args):
     dev = Split(tr_dir, dev_clips)
     print(f"[train] {len(train.bursts)} bursts / {len(train.keys)} keyframe cows in {len(train.clips)} clips; "
           f"dev {len(dev.bursts)} / {len(dev.keys)} in {len(dev.clips)} clips", flush=True)
-    model = HerdModel(train.dim, use_pos=bool(args.pos), d=args.d, layers=args.layers, heads=args.heads).to(device())
+    if args.motion and not train.motion_dim:
+        sys.exit("--motion 1 needs the motion features: herd.py motion --split train (and val)")
+    model = HerdModel(train.dim, use_pos=bool(args.pos), d=args.d, layers=args.layers, heads=args.heads,
+                      motion_dim=train.motion_dim if args.motion else 0).to(device())
+    if args.motion:
+        print(f"[train] motion features: {train.motion_dim} per burst -> rumination, activity", flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
     steps = args.epochs * max(1, len(train.bursts) // args.P)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, args.lr, total_steps=steps, pct_start=0.05)
@@ -352,8 +422,9 @@ def cmd_train(args):
             padt = lambda a, fill: torch.nn.functional.pad(a, (0, 0, 0, n - a.shape[1]) if a.dim() == 3
                                                            else (0, n - a.shape[1]), value=fill)
             bp = positions(train.burst_pos, ids, rng, 0.02)
+            bm = torch.cat([motion_of(train, ids, rng), motion_of(train, ids, rng)]) if model.motion_dim else None
             o = model.temporal(torch.cat([padt(x1, 0), padt(x2, 0)]), torch.cat([padt(t1, 0), padt(t2, 0)]),
-                               torch.cat([padt(v1, False), padt(v2, False)]), torch.cat([bp, bp]))
+                               torch.cat([padt(v1, False), padt(v2, False)]), torch.cat([bp, bp]), bm)
             ident = torch.arange(len(ids), device=device()).repeat(2)
             post, act, rum = (labels(train, ids, f).repeat(2) for f in ("posture", "activity", "rumination"))
             l_id = supcon(o["fingerprint"], ident, args.temperature)
@@ -428,6 +499,10 @@ def cmd_eval(args):
         m["rumination_share_called_f1"] = float(np.mean(q["rumination"] >= thr))
         m["rumination_threshold_time"] = thr_time
         m["rumination_share_called_time"] = float(np.mean(q["rumination"] >= thr_time))
+    base = motion_baseline(os.path.join(args.features, "train"), os.path.join(args.features, "val"))
+    if base is not None:
+        m["rumination_f1_motion_only"] = base
+    m["motion"] = bool(model.motion_dim)
     write_json(os.path.join(args.out, "eval_val.json"), {"epoch": ck["epoch"], **m})
     with open(os.path.join(args.out, "reid_val.jsonl"), "w", encoding="utf-8") as fh:
         for r in rows:
@@ -457,6 +532,8 @@ def main(argv=None):
     p.add_argument("--holdout", type=float, default=0.1)
     p.add_argument("--patience", type=int, default=6, help="stop after this many epochs without a better dev score")
     p.add_argument("--pos", type=int, default=0, help="1: give the heads where the cow is in the frame")
+    p.add_argument("--motion", type=int, default=0,
+                   help="1: the burst's rhythm (motion.py) to rumination and activity; needs herd.py motion")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
     {"train": cmd_train, "eval": cmd_eval}[args.stage](args)

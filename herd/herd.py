@@ -3,6 +3,7 @@
 
 Training (on CBVD-5 today, on the barn's own footage later):
     herd.py extract  --split train|val      frozen DINOv2 vectors of every crop (Stage A input)
+    herd.py motion   --split train|val      the rhythm of every burst (chewing), CPU only
     herd.py train                           temporal transformer + all heads on those vectors
     herd.py eval                            val scores + cowbench-format results
     herd.py abstain                         the NaN model and its cut-off
@@ -57,6 +58,9 @@ def main():
     if cmd == "extract":
         import cbvd_bursts
         return cbvd_bursts.main(argv)
+    if cmd == "motion":
+        import cbvd_bursts
+        return cbvd_bursts.main(["motion"] + argv)
     if cmd in ("train", "eval"):
         import train
         return train.main([cmd] + argv)

@@ -20,6 +20,8 @@
 #   MAX_ERROR=0.01    the NaN cut-off: at most this share of wrong IDs among answers
 #   MARGIN=0.1        context around each cow in the crops (0.5: twice the box, sees the feed
 #                     barrier); another MARGIN extracts into its own features_m<MARGIN>
+#   MOTION=1          the rhythm of each burst (chewing, motion.py) to the rumination and activity
+#                     heads; computed once from the videos on the CPU (step 5), 0: without
 #   POS=0             1: the heads also get where the cow is in the frame (fixed cameras: the
 #                     feed barrier is a place in the picture); no new features needed
 
@@ -35,6 +37,7 @@ GRID="${GRID:-2}"
 MAX_ERROR="${MAX_ERROR:-0.01}"
 MARGIN="${MARGIN:-0.1}"
 POS="${POS:-0}"
+MOTION="${MOTION:-1}"
 DATA="$WORK/cbvd5"
 # Features depend on margin and grid: another value gets its own folder
 # (a shared one would be skipped as "done" and silently reused).
@@ -89,7 +92,7 @@ if [ -z "${HERD_IN_TMUX:-}" ]; then
     if tmux has-session -t "$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     mkdir -p "$WORK/herd"
     knobs=""
-    for v in WORK RUN EPOCHS ENCODER GRID MAX_ERROR MARGIN POS; do knobs+="$v=$(printf '%q' "${!v}") "; done
+    for v in WORK RUN EPOCHS ENCODER GRID MAX_ERROR MARGIN POS MOTION; do knobs+="$v=$(printf '%q' "${!v}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env HERD_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/run_pod.sh"); echo; echo '[run_pod.sh finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log   ($LOG)"
@@ -103,7 +106,7 @@ set -E
 trap 'rc=$?; echo "!! line $LINENO failed (exit $rc): $BASH_COMMAND"' ERR
 step() { echo; echo "=== $*   [$(date '+%F %T')]"; }
 
-step "1/6  Python environment ($VENV)"
+step "1/7  Python environment ($VENV)"
 if ! command -v uv >/dev/null 2>&1; then curl -LsSf https://astral.sh/uv/install.sh | sh; fi
 export PATH="$HOME/.local/bin:$PATH"
 uv self update >/dev/null 2>&1 || true
@@ -118,7 +121,7 @@ if ! ready; then
 fi
 "$PY" -c "import torch; print('torch', torch.__version__, torch.cuda.get_device_name(0))"
 
-step "2/6  CBVD-5 with its videos"
+step "2/7  CBVD-5 with its videos"
 # The LoRA runs only needed keyframes; bursts are cut from the 10 s, 25 fps clips.
 if [ ! -f "$DATA/annotations/ava_train_v2.1.csv" ] || [ ! -d "$DATA/labelframes" ] || [ ! -d "$DATA/videos/videos" ]; then
     command -v unzip >/dev/null || apt-get install -y -qq unzip
@@ -137,21 +140,30 @@ fi
 echo "keyframes: $(find "$DATA/labelframes" -name '*.jpg' | wc -l), videos: $(find "$DATA/videos" -name '*.mp4' | wc -l)"
 
 cd "$HERE"
-step "3/6  Stage A: frame vectors (DINOv2, frozen) - train"
+step "3/7  Stage A: frame vectors (DINOv2, frozen) - train"
 "$PY" herd.py extract --root "$DATA" --out "$FEAT" --split train --encoder "$ENCODER" --grid "$GRID" --margin "$MARGIN"
-step "4/6  Stage A: frame vectors - val"
+step "4/7  Stage A: frame vectors - val"
 "$PY" herd.py extract --root "$DATA" --out "$FEAT" --split val --encoder "$ENCODER" --grid "$GRID" --margin "$MARGIN"
 
-step "5/6  Training: temporal transformer + heads ($EPOCHS epochs)"
+step "5/7  The rhythm of every burst (chewing) - train + val, CPU"
+if [ "$MOTION" = "1" ]; then
+    WORKERS="$(( $(nproc) > 4 ? $(nproc) - 2 : 2 ))"; [ "$WORKERS" -gt 16 ] && WORKERS=16   # each holds one decoded clip in memory
+    "$PY" herd.py motion --root "$DATA" --out "$FEAT" --split train --workers "$WORKERS"
+    "$PY" herd.py motion --root "$DATA" --out "$FEAT" --split val --workers "$WORKERS"
+else
+    echo "MOTION=0: skipped"
+fi
+
+step "6/7  Training: temporal transformer + heads ($EPOCHS epochs)"
 if [ -f "$OUT/model.pt" ] && [ -f "$OUT/eval_val.json" ]; then
     echo "trained already: $OUT"
 else
-    "$PY" herd.py train --features "$FEAT" --out "$OUT" --epochs "$EPOCHS" --pos "$POS"
+    "$PY" herd.py train --features "$FEAT" --out "$OUT" --epochs "$EPOCHS" --pos "$POS" --motion "$MOTION"
 fi
 "$PY" "$REPO/cowbench/cowbench.py" --out "$OUT/eval-val" score
 "$PY" "$REPO/cowbench/cowbench.py" --out "$OUT/eval-val" report
 
-step "6/6  The NaN model (max error $MAX_ERROR among answers)"
+step "7/7  The NaN model (max error $MAX_ERROR among answers)"
 "$PY" herd.py abstain --features "$FEAT" --run "$OUT" --max-error "$MAX_ERROR"
 
 echo

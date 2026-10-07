@@ -8,6 +8,7 @@
                        quality per frame  -> weights
                        ID per frame       -> fingerprint = weighted average
                        pooled             -> posture, activity, rumination, lameness
+                    + motion rhythm (motion.py), if the model has it -> rumination, activity
 
 The fingerprint is the brief's "weighted average of all the fingerprints from
 the burst", the weights the quality head's: a frame where the cow is hidden
@@ -92,7 +93,8 @@ class FrameHeads(nn.Module):
 
 
 class TemporalModel(nn.Module):
-    def __init__(self, in_dim, d=256, layers=3, heads=4, dropout=0.1, n_posture=2, n_activity=3, use_pos=False):
+    def __init__(self, in_dim, d=256, layers=3, heads=4, dropout=0.1, n_posture=2, n_activity=3, use_pos=False,
+                 motion_dim=0):
         super().__init__()
         self.proj = nn.Sequential(nn.LayerNorm(in_dim), nn.Linear(in_dim, d))
         self.pos = nn.Linear(4, d) if use_pos else None
@@ -106,12 +108,22 @@ class TemporalModel(nn.Module):
         self.id = nn.Linear(d, ID_DIM)
         self.posture = nn.Linear(d, n_posture)
         self.activity = nn.Linear(d, n_activity)
-        self.rumination = nn.Linear(d, 1)
         self.lameness = nn.Linear(d, 1)
+        # The rhythm of the pixels over the burst (motion.py): chewing at ~1 Hz
+        # is what rumination is, and what frame vectors average away. It goes
+        # to rumination and activity (feeding chews faster, with head moves).
+        self.motion_dim = motion_dim
+        self.motion = (nn.Sequential(nn.LayerNorm(motion_dim), nn.Linear(motion_dim, d), nn.GELU(),
+                                     nn.Dropout(0.2), nn.Linear(d, d)) if motion_dim else None)
+        self.rumination = (nn.Sequential(nn.Linear(2 * d, d), nn.GELU(), nn.Dropout(dropout), nn.Linear(d, 1))
+                           if motion_dim else nn.Linear(d, 1))
+        if motion_dim:
+            self.activity_motion = nn.Linear(d, n_activity, bias=False)
 
-    def forward(self, x, t, valid, pos=None):
+    def forward(self, x, t, valid, pos=None, motion=None):
         """x (B, T, in_dim) frame vectors, t (B, T) seconds, valid (B, T) bool,
-        pos (B, 4) or (B, T, 4) box centre and size, used if the model has it."""
+        pos (B, 4) or (B, T, 4) box centre and size, used if the model has it;
+        motion (B, motion_dim) the burst's rhythm features, if it has that."""
         h = self.proj(x) + self.time(time_embedding(t, self.d))
         if self.pos is not None and pos is not None:
             h = h + self.pos(pos if pos.dim() == 3 else pos.unsqueeze(1))
@@ -121,9 +133,18 @@ class TemporalModel(nn.Module):
         ids = F.normalize(self.id(h), dim=-1)
         fingerprint = F.normalize((w.unsqueeze(-1) * ids).sum(1), dim=-1)
         pooled = (w.unsqueeze(-1) * h).sum(1)
+        activity = self.activity(pooled)
+        if self.motion is not None:
+            if motion is None:                                   # not computed (cow seen too briefly)
+                motion = pooled.new_zeros(len(pooled), self.motion_dim)
+            m = self.motion(motion)
+            rumination = self.rumination(torch.cat([pooled, m], -1))
+            activity = activity + self.activity_motion(m)
+        else:
+            rumination = self.rumination(pooled)
         return {"fingerprint": fingerprint, "quality": q, "weights": w,
-                "posture": self.posture(pooled), "activity": self.activity(pooled),
-                "rumination": self.rumination(pooled).squeeze(-1),
+                "posture": self.posture(pooled), "activity": activity,
+                "rumination": rumination.squeeze(-1),
                 "lameness": self.lameness(pooled).squeeze(-1)}
 
 
@@ -134,6 +155,10 @@ class HerdModel(nn.Module):
         self.kw = dict(kw, use_pos=use_pos)
         self.frame = FrameHeads(in_dim, use_pos=use_pos)
         self.temporal = TemporalModel(in_dim, use_pos=use_pos, **kw)
+
+    @property
+    def motion_dim(self):
+        return self.kw.get("motion_dim", 0)
 
     def save(self, path, extra=None):
         torch.save({"in_dim": self.in_dim, "kw": self.kw, "state": self.state_dict(), **(extra or {})}, path)
