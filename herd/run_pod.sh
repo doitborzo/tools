@@ -17,6 +17,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "$HERE")"
 WORK="${WORK:-/workspace}"
+RUN_SET="${RUN:-}"
 RUN="${RUN:-run1}"
 EPOCHS="${EPOCHS:-40}"
 ENCODER="${ENCODER:-facebook/dinov2-small}"
@@ -32,7 +33,11 @@ DATASET_URL="https://www.kaggle.com/api/v1/datasets/download/fandaoerji/cbvd-5co
 export HF_HOME="$WORK/hf-cache"
 
 case "${1:-}" in
-    log)  exec tail -n 100 -F "$LOG" ;;
+    log)  # without RUN=: the newest run's log, not run1's
+          [ -n "${RUN_SET:-}" ] || LOG="$(ls -t "$WORK"/herd/log_*.txt 2>/dev/null | head -1 || true)"
+          [ -n "$LOG" ] || { echo "no log yet in $WORK/herd"; exit 1; }
+          echo "following $LOG"
+          exec tail -n 100 -F "$LOG" ;;
     stop) tmux kill-session -t "$SESSION" 2>/dev/null && echo stopped || echo "not running"; exit 0 ;;
     "") ;;
     *) echo "usage: $0 [log|stop]"; exit 2 ;;
