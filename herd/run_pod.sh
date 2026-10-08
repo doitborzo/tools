@@ -90,7 +90,7 @@ case "${1:-}" in
           [ -n "$LOG" ] || { echo "no log yet in $WORK/herd"; exit 1; }
           echo "following $LOG"
           exec tail -n 100 -F "$LOG" ;;
-    stop) tmux kill-session -t "$SESSION" 2>/dev/null && echo stopped || echo "not running"; exit 0 ;;
+    stop) tmux kill-session -t "=$SESSION" 2>/dev/null && echo stopped || echo "not running"; exit 0 ;;
     stress)
         [ -n "${RUN_SET:-}" ] || RUN="$(basename "$(dirname "$(ls -t "$WORK"/herd/*/model.pt 2>/dev/null | head -1)")")"
         MODEL="$WORK/herd/$RUN/model.pt"
@@ -103,7 +103,7 @@ case "${1:-}" in
         mkdir -p "$SOUT"
         cmd="$(printf '%q ' "$VENV/bin/python" "$HERE/herd.py" stress --model "$MODEL" --detector "$DET" \
                --root "$DATA" --cameras "${CAMERAS:-5}" --duration "${DURATION:-300}" --out "$SOUT")"
-        tmux has-session -t herd-stress 2>/dev/null && { echo "already running: tmux attach -t herd-stress"; exit 1; }
+        tmux has-session -t =herd-stress 2>/dev/null && { echo "already running: tmux attach -t herd-stress"; exit 1; }
         env -u TMUX tmux new-session -d -s herd-stress -x 200 -y 50 \
             "export HF_HOME=$(printf '%q' "$HF_HOME"); $cmd 2>&1 | tee $(printf '%q' "$SOUT/log.txt"); echo '[stress finished]'; exec bash"
         echo "Started in tmux session 'herd-stress' (model $MODEL).  log: tail -F $SOUT/log.txt"
@@ -124,7 +124,7 @@ case "${1:-}" in
             evald="&& $(q "$VENV/bin/python" "$HERE/herd.py" eval-det --run "$WORK/herd/$LAST" --detector "$DOUT/best" \
                        --root "$DATA" --out "$WORK/herd/$LAST/eval-val-det-${DET_TAG}")"
         fi
-        tmux has-session -t herd-det 2>/dev/null && { echo "already running: tmux attach -t herd-det"; exit 1; }
+        tmux has-session -t =herd-det 2>/dev/null && { echo "already running: tmux attach -t herd-det"; exit 1; }
         env -u TMUX tmux new-session -d -s herd-det -x 200 -y 50 \
             "export HF_HOME=$(printf '%q' "$HF_HOME"); ( $train $evald ) 2>&1 | tee -a $(printf '%q' "$DOUT/log.txt"); echo '[detector finished]'; exec bash"
         echo "Started in tmux session 'herd-det' -> $DOUT/best.  log: tail -F $DOUT/log.txt"
@@ -136,7 +136,7 @@ esac
 
 if [ -z "${HERD_IN_TMUX:-}" ]; then
     command -v tmux >/dev/null || { apt-get update -qq && apt-get install -y -qq tmux; }
-    if tmux has-session -t "$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
+    if tmux has-session -t "=$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     mkdir -p "$WORK/herd"
     knobs=""
     for v in WORK RUN EPOCHS ENCODER GRID MAX_ERROR MARGIN POS MOTION DET DET_KEYS QUALITY; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
