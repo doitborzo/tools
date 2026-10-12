@@ -12,6 +12,7 @@ stress and show_zone take it with no change.
 
     export  CBVD-5 train keyframes -> COCO folders (train/, valid/, test/; images linked, not copied)
             --extra <folder>...: public sets fetched by extra_det.py added (one class: cow)
+            --init <best/>: continue from a detector trained before (same size; fewer epochs, lower lr)
     train   export + rfdetr training + the threshold on the held-out clips -> <out>/best/
 
 Sizes: nano (384 px), small (512), medium (576), large (704) - all Apache-2.0;
@@ -158,6 +159,41 @@ def load(best_dir, meta):
     return model, predict, dev
 
 
+def init_checkpoint(args):
+    """--init: a best/ folder of rfdetr_det.py (or a .pth) -> the checkpoint path; its size and input
+    side are kept (a checkpoint of another size does not fit)."""
+    if not args.init:
+        return None
+    path = args.init
+    if os.path.isdir(path):
+        with open(os.path.join(path, "det_train_meta.json"), encoding="utf-8") as fh:
+            m = json.load(fh)
+        if m.get("kind") != "rfdetr":
+            sys.exit(f"--init {path}: not an RF-DETR detector (an RT-DETR cannot start an RF-DETR)")
+        if m.get("base_model") != f"rfdetr-{args.size}":
+            sys.exit(f"--init {path} is {m.get('base_model')}, not rfdetr-{args.size}: set --size to match")
+        if not args.resolution and m.get("size"):
+            args.resolution = m["size"]
+        path = os.path.join(path, m["checkpoint"])
+    if not os.path.exists(path):
+        sys.exit(f"--init: no checkpoint at {path}")
+    # rfdetr reads start weights with weights_only=True; a training checkpoint also pickles its
+    # args, so only the weights (and the class names, as plain data) are kept - our own file, trusted
+    import torch
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    state = ck.get("model") or {k[len("model."):]: v for k, v in ck.get("state_dict", {}).items()
+                                if k.startswith("model.")}
+    if not state:
+        sys.exit(f"--init {path}: no model weights in it")
+    a = ck.get("args")
+    names = a.get("class_names") if isinstance(a, dict) else getattr(a, "class_names", None)
+    slim = os.path.join(args.out, "init_weights.pth")
+    os.makedirs(args.out, exist_ok=True)
+    torch.save({"model": state, **({"args": {"class_names": list(names)}} if names else {})}, slim)
+    print(f"[rfdetr] starting from {path}", flush=True)
+    return slim
+
+
 def cmd_train(args):
     import rfdetr
     import detector as det_mod
@@ -167,9 +203,11 @@ def cmd_train(args):
     if os.path.exists(done) and not args.fresh:
         print(f"[rfdetr] already trained: {best}")
         return
+    init = init_checkpoint(args)
     ds, dev_frames = cmd_export(args)
     run_dir = os.path.join(args.out, "rf")
-    model = getattr(rfdetr, SIZES[args.size])()
+    # --init: start from a detector trained before (its weights, a fresh optimiser), not rfdetr's COCO weights
+    model = getattr(rfdetr, SIZES[args.size])(**({"pretrain_weights": init} if init else {}))
     kw = dict(dataset_dir=ds, epochs=args.epochs, batch_size=args.batch, grad_accum_steps=args.grad_accum,
               lr=args.lr, output_dir=run_dir)
     if args.resolution:
@@ -186,6 +224,7 @@ def cmd_train(args):
     size = args.resolution or getattr(getattr(model, "model_config", None), "resolution", None)
     meta = {"kind": "rfdetr", "base_model": f"rfdetr-{args.size}", "checkpoint": "checkpoint.pth", "size": size,
             "tiles": bool(args.tiles), "select": args.select, "threshold": 0.5,
+            "init": init,
             "extra": [{"name": x, "folder": os.path.abspath(d), "max_images": args.extra_max} for x, d in extra_sources(args)]}
     # the threshold, as detector.py picks it: the best F1 (or F2) on the held-out clips
     _, predict, _ = load(best, meta)
@@ -222,6 +261,8 @@ def main(argv=None):
     p.add_argument("--select", choices=("f1", "f2"), default="f1")
     p.add_argument("--holdout", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--init", default=None,
+                   help="fine-tune a detector trained before: its best/ folder (or a .pth) instead of COCO weights")
     p.add_argument("--extra", nargs="*", default=[],
                    help="more boxes: extra_det.py's source folders (e.g. /workspace/extra_det/zenodo)")
     p.add_argument("--extra-max", type=int, default=0, help="at most this many train images per --extra source")

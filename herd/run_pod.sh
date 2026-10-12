@@ -30,6 +30,8 @@
 #                                 new detector and every other detector_*/best are scored on each set's
 #                                 valid frames -> WORK/extra_det/eval_extra.json. MM_EVERY=8 (MmCows: every
 #                                 8th 15 s frame per camera, ~2.5k frames), EXTRA_MAX (cap per set).
+#                                 DET_INIT=<a best/ of an RF-DETR of the same size>: fine-tuned from it
+#                                 (DET_EPOCHS=12, DET_LR=5e-5 by default), DET_TAG gets _ft.
 #                                 Licences: zenodo CC BY 4.0; mmcows CC BY-NC-SA 4.0 and opencows UK
 #                                 Non-Commercial Government Licence - non-commercial use only.
 #
@@ -142,7 +144,8 @@ case "${1:-}" in
             # RF-DETR (DINOv2 backbone, Apache-2.0 sizes): cowbench/rfdetr_det.py
             RF_SIZE="${RF_SIZE:-large}"
             EXTRA="${EXTRA:-}"                 # zenodo,mmcows,opencows: public sets added (extra_det.py)
-            DET_TAG="${DET_TAG:-rfdetr_$RF_SIZE${EXTRA:+_${EXTRA//,/_}}}"
+            DET_INIT="${DET_INIT:-}"           # a best/ trained before: fine-tuned, not trained afresh
+            DET_TAG="${DET_TAG:-rfdetr_$RF_SIZE${EXTRA:+_${EXTRA//,/_}}${DET_INIT:+_ft}}"
             DOUT="$WORK/herd/detector_${DET_TAG}"
             XDIR="$WORK/extra_det"
             export PATH="$HOME/.local/bin:$PATH"
@@ -158,9 +161,12 @@ case "${1:-}" in
                            --every "${MM_EVERY:-8}") &&"
             fi
             train="$fetch $(q "$VENV/bin/python" "$REPO/cowbench/rfdetr_det.py" train --root "$DATA" --out "$DOUT" \
-                       --size "$RF_SIZE" --epochs "${DET_EPOCHS:-30}" --batch "${DET_BATCH:-8}" \
+                       --size "$RF_SIZE" --batch "${DET_BATCH:-8}" \
+                       --epochs "${DET_EPOCHS:-$([ -n "$DET_INIT" ] && echo 12 || echo 30)}" \
+                       --lr "${DET_LR:-$([ -n "$DET_INIT" ] && echo 5e-5 || echo 1e-4)}" \
                        --tiles "${DET_TILES:-0}" --select "${DET_SELECT:-f1}" \
                        ${DET_RES:+--resolution "$DET_RES"} ${EXTRA_MAX:+--extra-max "$EXTRA_MAX"} \
+                       ${DET_INIT:+--init "$DET_INIT"} \
                        ${EXTRA:+--extra "${xdirs[@]}"})"
             if [ -n "$EXTRA" ]; then
                 dets=(--detector "$DOUT/best")

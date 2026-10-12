@@ -202,6 +202,17 @@ if CBVD-5 val holds up and the other sets improve; opencows' head-less boxes may
 the boxes shorter, which is why it is tried separately. `EXTRA_MAX=N` caps the train
 frames taken from each set.
 
+**Fine-tuning a detector trained before.** `DET_INIT=<its best/>` starts RF-DETR from
+that detector's weights instead of rfdetr's COCO ones (same size; its input side is
+kept), with fewer epochs and a lower learning rate (`DET_EPOCHS=12`, `DET_LR=5e-5`),
+and `_ft` in the tag:
+
+    EXTRA=zenodo,mmcows DET_INIT=/workspace/herd/detector_rfdetr_large/best DET_ARCH=rfdetr bash herd/run_pod.sh detector
+
+CBVD-5 stays in the training set, so the detector does not forget it while it learns
+the new sets; it is ~2.5x quicker than training afresh. Compare both ways with
+`eval_extra.json` and eval-det.
+
 ### 4.2 Frame encoder — DINOv2-S (`model.FrameEncoder`)
 
 Frozen. Turns a 224x224 crop into a vector: CLS + the patch tokens pooled over a

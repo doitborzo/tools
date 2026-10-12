@@ -69,3 +69,25 @@ def test_extra_merged_into_rfdetr_coco():
         assert all(im["file_name"].startswith("x_zenodo_") for im in coco["images"])
         assert len(coco["annotations"]) == a and {c["image_id"] for c in coco["annotations"]} <= {1, 2}
         assert os.path.exists(os.path.join(out, coco["images"][0]["file_name"]))
+
+
+def test_rfdetr_init_from_own_detector():
+    import argparse
+    import torch
+    import rfdetr_det
+    with tempfile.TemporaryDirectory() as d:
+        best = os.path.join(d, "best")
+        os.makedirs(best)
+        torch.save({"model": {"class_embed.bias": torch.zeros(2)}, "args": argparse.Namespace(class_names=["cow"])},
+                   os.path.join(best, "checkpoint.pth"))
+        json.dump({"kind": "rfdetr", "base_model": "rfdetr-large", "checkpoint": "checkpoint.pth", "size": 704},
+                  open(os.path.join(best, "det_train_meta.json"), "w"))
+        a = argparse.Namespace(init=best, size="large", resolution=None, out=os.path.join(d, "new"))
+        slim = torch.load(rfdetr_det.init_checkpoint(a), weights_only=True)   # what rfdetr itself can read
+        assert a.resolution == 704 and slim["args"]["class_names"] == ["cow"] and "class_embed.bias" in slim["model"]
+        a.size = "small"
+        try:
+            rfdetr_det.init_checkpoint(a)
+            assert False, "another size must be refused"
+        except SystemExit:
+            pass
