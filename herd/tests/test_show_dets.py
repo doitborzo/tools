@@ -20,7 +20,7 @@ def test_yolo_label_beside_or_in_labels_folder():
 def test_score_found_loose_missed_extra():
     gts = [[0.1, 0.1, 0.3, 0.5], [0.5, 0.1, 0.7, 0.5], [0.8, 0.1, 0.95, 0.5]]
     dets = [[0.1, 0.1, 0.3, 0.5, 0.9],        # found
-            [0.55, 0.1, 0.78, 0.5, 0.6],      # the same cow, boxes disagree (IoU ~0.45)
+            [0.6, 0.1, 0.8, 0.5, 0.6],        # the same cow, boxes disagree (IoU 0.33)
             [0.0, 0.7, 0.1, 0.9, 0.5]]        # on no cow
     r = s.score(dets, gts)
     assert [i for i, _, _ in r["good"]] == [0] and [i for i, _, _ in r["loose"]] == [1]
