@@ -206,6 +206,13 @@ On a new pod, `bash herd/run_pod.sh setup` first (the environment and CBVD-5 onl
 steps 1-2), then copy the earlier detector's whole `best/` folder back
 (`checkpoint.pth`, `det_train_meta.json`, `box_calib.json`).
 
+**Seeing the boxes.** `herd.py show-dets --src <folder / pictures / videos> --detector
+<best/> [--detector <another best/>]` draws every box on every picture into one HTML
+gallery (`<out>/index.html`); with an annotation beside the pictures (COCO
+`_annotations.coco.json`, or YOLO `.txt` beside them / in `labels/`) found, boxes
+disagreeing, missed and extra are coloured as in eval-det, `--pick worst` shows the
+pictures with the most misses and extras first, `--cbvd <root>` takes CBVD-5 val.
+
 **Fine-tuning a detector trained before.** `DET_INIT=<its best/>` starts RF-DETR from
 that detector's weights instead of rfdetr's COCO ones (same size; its input side is
 kept), with fewer epochs and a lower learning rate (`DET_EPOCHS=12`, `DET_LR=5e-5`),
