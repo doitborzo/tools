@@ -5,7 +5,7 @@
 #   -> Stage A features (DINOv2-S, train + val) -> train -> eval -> NaN model
 #
 #   bash herd/run_pod.sh          start in tmux session "herd"
-#   bash herd/run_pod.sh log      follow the log
+#   bash herd/run_pod.sh log      follow the log ("log detector": the newest detector's log)
 #   bash herd/run_pod.sh stop
 #   bash herd/run_pod.sh setup    only the environment and CBVD-5 (steps 1-2), e.g. a new pod for "detector"
 #   bash herd/run_pod.sh stress   one GPU in real time: a burst alone, then CAMERAS (5) cameras at
@@ -111,7 +111,14 @@ find_det() {
 }
 
 case "${1:-}" in
-    log)  # without RUN=: the newest run's log, not run1's
+    log)  # without RUN=: the newest run's log, not run1's; "log detector": the newest detector's log
+          if [ "${2:-}" = "detector" ]; then
+              LOG="$(ls -t "$WORK"/herd/detector_*/log.txt 2>/dev/null | head -1 || true)"
+              [ -n "$LOG" ] || { echo "no detector log yet in $WORK/herd/detector_*/"; exit 1; }
+              echo "following $LOG"
+              tmux has-session -t "=herd-det" 2>/dev/null || echo "(no herd-det session: nothing is training now)"
+              exec tail -n 100 -F "$LOG"
+          fi
           [ -n "${RUN_SET:-}" ] || LOG="$(ls -t "$WORK"/herd/log_*.txt 2>/dev/null | head -1 || true)"
           [ -n "$LOG" ] || { echo "no log yet in $WORK/herd"; exit 1; }
           echo "following $LOG"
@@ -199,12 +206,12 @@ case "${1:-}" in
                                     echo "or stop it: bash $0 stop detector"; exit 1; }
         env -u TMUX tmux new-session -d -s herd-det -x 200 -y 50 \
             "export HF_HOME=$(printf '%q' "$HF_HOME"); ( $train $evald ) 2>&1 | tee -a $(printf '%q' "$DOUT/log.txt"); echo '[detector finished]'; exec bash"
-        echo "Started in tmux session 'herd-det' -> $DOUT/best.  log: tail -F $DOUT/log.txt"
+        echo "Started in tmux session 'herd-det' -> $DOUT/best.  log: bash $0 log detector  ($DOUT/log.txt)"
         [ -n "$evald" ] && echo "then eval-det of $LAST with it -> $WORK/herd/$LAST/eval-val-det-${DET_TAG}/eval_det.json"
         exit 0 ;;
     setup) SETUP_ONLY=1 ;;   # steps 1-2 only (environment + CBVD-5), e.g. on a new pod before "detector"
     "") ;;
-    *) echo "usage: $0 [log|stop [detector|stress]|stress|detector|setup]"; exit 2 ;;
+    *) echo "usage: $0 [log [detector]|stop [detector|stress]|stress|detector|setup]"; exit 2 ;;
 esac
 
 if [ -z "${HERD_IN_TMUX:-}" ]; then
