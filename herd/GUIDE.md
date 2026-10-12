@@ -348,6 +348,9 @@ DET_SIZE=960 DET_ZOOM=0 DET_TILES=0 DET_SELECT=f1 DET_TAG=r101_960 bash herd/run
 bash herd/run_pod.sh stress      # 5 cameras in real time on one GPU (~7 min)
 CAMERAS=20 RUN=run7 bash herd/run_pod.sh stress
 bash herd/run_pod.sh stop
+bash herd/run_pod.sh setup       # a new pod: the environment and CBVD-5 only
+bash herd/export_pod.sh          # three archives in WORK/export: models (detectors' best/, RUN's
+                                 # model.pt + abstain.json, DINOv2 from the HF cache), results, galleries
 ```
 
 ### 5.3 Single commands (`python herd/herd.py ...`)
