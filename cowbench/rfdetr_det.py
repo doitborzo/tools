@@ -11,6 +11,7 @@ stress and show_zone take it with no change.
     python herd/herd.py eval-det --run /workspace/herd/run7 --detector /workspace/herd/detector_rfdetr_l/best
 
     export  CBVD-5 train keyframes -> COCO folders (train/, valid/, test/; images linked, not copied)
+            --extra <folder>...: public sets fetched by extra_det.py added (one class: cow)
     train   export + rfdetr training + the threshold on the held-out clips -> <out>/best/
 
 Sizes: nano (384 px), small (512), medium (576), large (704) - all Apache-2.0;
@@ -44,9 +45,12 @@ def frames_of(rows):
     return [{"video_id": v, "timestamp": t, "boxes": b} for (v, t), b in out.items()]
 
 
-def write_coco(root, frames, folder):
-    """Keyframes -> folder/_annotations.coco.json + the images linked in (one class: cow)."""
+def write_coco(root, frames, folder, extra=()):
+    """Keyframes -> folder/_annotations.coco.json + the images linked in (one class: cow);
+    extra: [(source name, its COCO folder of this split, at most this many images or 0)]
+    appended (extra_det.py's sets)."""
     from PIL import Image
+    import random
     os.makedirs(folder, exist_ok=True)
     images, anns = [], []
     for i, f in enumerate(frames, 1):
@@ -65,21 +69,57 @@ def write_coco(root, frames, folder):
             x, y, bw, bh = b[0] * w, b[1] * h, (b[2] - b[0]) * w, (b[3] - b[1]) * h
             anns.append({"id": len(anns) + 1, "image_id": i, "category_id": 1, "bbox": [x, y, bw, bh],
                          "area": bw * bh, "iscrowd": 0})
+    for name, src, cap in extra:
+        with open(os.path.join(src, "_annotations.coco.json"), encoding="utf-8") as fh:
+            d = json.load(fh)
+        ims = d["images"]
+        if cap and len(ims) > cap:
+            ims = random.Random(0).sample(ims, cap)
+        by = {}
+        for a in d["annotations"]:
+            by.setdefault(a["image_id"], []).append(a)
+        for im in ims:
+            i = len(images) + 1
+            fname = f"x_{name}_{im['file_name']}"
+            dst = os.path.join(folder, fname)
+            if not os.path.lexists(dst):
+                try:
+                    os.symlink(os.path.abspath(os.path.join(src, im["file_name"])), dst)
+                except OSError:
+                    shutil.copy(os.path.join(src, im["file_name"]), dst)
+            images.append({"id": i, "file_name": fname, "width": im["width"], "height": im["height"]})
+            for a in by.get(im["id"], []):
+                anns.append({**a, "id": len(anns) + 1, "image_id": i, "category_id": 1})
     with open(os.path.join(folder, "_annotations.coco.json"), "w", encoding="utf-8") as fh:
         json.dump({"images": images, "annotations": anns,
                    "categories": [{"id": 1, "name": "cow", "supercategory": "none"}]}, fh)
     return len(images), len(anns)
 
 
+def extra_sources(args):
+    """--extra folders (extra_det.py fetch) -> [(name, folder)]; a missing one is an error, not skipped."""
+    out = []
+    for d in args.extra:
+        if not os.path.exists(os.path.join(d, "train", "_annotations.coco.json")):
+            sys.exit(f"--extra {d}: no train/_annotations.coco.json - fetch it first (cowbench/extra_det.py fetch)")
+        out.append((os.path.basename(os.path.normpath(d)), d))
+    return out
+
+
 def cmd_export(args):
-    """The same split as detector.py: CBVD-5 train minus the val clips, 10% of clips held out."""
+    """The same split as detector.py: CBVD-5 train minus the val clips, 10% of clips held out.
+    --extra sets join train (each at most --extra-max images) and valid (the checkpoint is chosen on
+    CBVD-5's held-out clips + their valid); the threshold is still chosen on CBVD-5 alone."""
     rows, _ = train_lora.load_train(args.root)
     rows, dev_rows = train_lora.split_dev(rows, args.holdout, args.seed)
     tr, dv = frames_of(rows), frames_of(dev_rows)
     ds = os.path.join(args.out, "dataset")
+    xs = extra_sources(args)
     for name, fr in (("train", tr), ("valid", dv), ("test", dv)):
-        n, a = write_coco(args.root, fr, os.path.join(ds, name))
-        print(f"[rfdetr] {name}: {n} keyframes, {a} cows")
+        extra = [(x, os.path.join(d, "train" if name == "train" else "valid"), args.extra_max if name == "train" else 0)
+                 for x, d in xs]
+        n, a = write_coco(args.root, fr, os.path.join(ds, name), extra)
+        print(f"[rfdetr] {name}: {n} images ({len(fr)} CBVD-5 keyframes), {a} cows")
     return ds, dv
 
 
@@ -145,7 +185,8 @@ def cmd_train(args):
     shutil.copy(ckpt, os.path.join(best, "checkpoint.pth"))
     size = args.resolution or getattr(getattr(model, "model_config", None), "resolution", None)
     meta = {"kind": "rfdetr", "base_model": f"rfdetr-{args.size}", "checkpoint": "checkpoint.pth", "size": size,
-            "tiles": bool(args.tiles), "select": args.select, "threshold": 0.5}
+            "tiles": bool(args.tiles), "select": args.select, "threshold": 0.5,
+            "extra": [{"name": x, "folder": os.path.abspath(d), "max_images": args.extra_max} for x, d in extra_sources(args)]}
     # the threshold, as detector.py picks it: the best F1 (or F2) on the held-out clips
     _, predict, _ = load(best, meta)
     dets = {}
@@ -181,6 +222,9 @@ def main(argv=None):
     p.add_argument("--select", choices=("f1", "f2"), default="f1")
     p.add_argument("--holdout", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--extra", nargs="*", default=[],
+                   help="more boxes: extra_det.py's source folders (e.g. /workspace/extra_det/zenodo)")
+    p.add_argument("--extra-max", type=int, default=0, help="at most this many train images per --extra source")
     p.add_argument("--fresh", action="store_true")
     args = p.parse_args(argv)
     {"export": cmd_export, "train": cmd_train}[args.stage](args)

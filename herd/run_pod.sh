@@ -24,6 +24,14 @@
 #                                 DET_ARCH=rfdetr: RF-DETR instead (DINOv2 backbone; cowbench/rfdetr_det.py),
 #                                 RF_SIZE=large|medium|small|nano, DET_RES (input side), DET_EPOCHS=30
 #                                 -> WORK/herd/detector_rfdetr_<size>; installs rfdetr[train] if missing
+#                                 EXTRA=zenodo,mmcows,opencows (any of them): public cow boxes added to
+#                                 training - downloaded on the pod (cowbench/extra_det.py -> WORK/extra_det;
+#                                 ~0.1 + ~1 + ~0.7 GB on disk), DET_TAG=rfdetr_<size>_<sets>; after it the
+#                                 new detector and every other detector_*/best are scored on each set's
+#                                 valid frames -> WORK/extra_det/eval_extra.json. MM_EVERY=8 (MmCows: every
+#                                 8th 15 s frame per camera, ~2.5k frames), EXTRA_MAX (cap per set).
+#                                 Licences: zenodo CC BY 4.0; mmcows CC BY-NC-SA 4.0 and opencows UK
+#                                 Non-Commercial Government Licence - non-commercial use only.
 #
 # Every step resumes: features are written clip by clip, so a rerun after a
 # crash continues where it stopped. Knobs:
@@ -133,16 +141,37 @@ case "${1:-}" in
         if [ "${DET_ARCH:-rtdetr}" = "rfdetr" ]; then
             # RF-DETR (DINOv2 backbone, Apache-2.0 sizes): cowbench/rfdetr_det.py
             RF_SIZE="${RF_SIZE:-large}"
-            DET_TAG="${DET_TAG:-rfdetr_$RF_SIZE}"
+            EXTRA="${EXTRA:-}"                 # zenodo,mmcows,opencows: public sets added (extra_det.py)
+            DET_TAG="${DET_TAG:-rfdetr_$RF_SIZE${EXTRA:+_${EXTRA//,/_}}}"
             DOUT="$WORK/herd/detector_${DET_TAG}"
+            XDIR="$WORK/extra_det"
             export PATH="$HOME/.local/bin:$PATH"
             "$VENV/bin/python" -c "import rfdetr, pytorch_lightning" 2>/dev/null || \
                 uv pip install --python "$VENV/bin/python" "rfdetr[train]"
-            train="$(q "$VENV/bin/python" "$REPO/cowbench/rfdetr_det.py" train --root "$DATA" --out "$DOUT" \
+            xdirs=()
+            for x in ${EXTRA//,/ }; do xdirs+=("$XDIR/$x"); done
+            fetch=""
+            # every set downloaded on the pod itself; the new detector and the others already
+            # there are then compared on each set's valid frames
+            if [ -n "$EXTRA" ]; then
+                fetch="$(q "$VENV/bin/python" "$REPO/cowbench/extra_det.py" fetch --dest "$XDIR" --sources "$EXTRA" \
+                           --every "${MM_EVERY:-8}") &&"
+            fi
+            train="$fetch $(q "$VENV/bin/python" "$REPO/cowbench/rfdetr_det.py" train --root "$DATA" --out "$DOUT" \
                        --size "$RF_SIZE" --epochs "${DET_EPOCHS:-30}" --batch "${DET_BATCH:-8}" \
                        --tiles "${DET_TILES:-0}" --select "${DET_SELECT:-f1}" \
-                       ${DET_RES:+--resolution "$DET_RES"})"
+                       ${DET_RES:+--resolution "$DET_RES"} ${EXTRA_MAX:+--extra-max "$EXTRA_MAX"} \
+                       ${EXTRA:+--extra "${xdirs[@]}"})"
+            if [ -n "$EXTRA" ]; then
+                dets=(--detector "$DOUT/best")
+                for b in "$WORK"/herd/detector_*/best; do
+                    [ "$b" != "$DOUT/best" ] && [ -f "$b/det_train_meta.json" ] && dets+=(--detector "$b")
+                done
+                train="$train && $(q "$VENV/bin/python" "$REPO/cowbench/extra_det.py" eval --data "$XDIR" \
+                           --sources "$EXTRA" "${dets[@]}")"
+            fi
         else
+            [ -z "${EXTRA:-}" ] || { echo "EXTRA= (the public sets) is for DET_ARCH=rfdetr only"; exit 1; }
             DET_MODEL="${DET_MODEL:-PekingU/rtdetr_v2_r101vd}"
             DET_TAG="${DET_TAG:-fhd_$(echo "$DET_MODEL" | sed -n 's/.*_\(r[0-9]*\)vd$/\1/p')}"
             DOUT="$WORK/herd/detector_${DET_TAG}"
@@ -153,8 +182,10 @@ case "${1:-}" in
         mkdir -p "$DOUT"
         LAST="$(basename "$(dirname "$(ls -t "$WORK"/herd/*/model.pt 2>/dev/null | head -1)")" 2>/dev/null || true)"
         evald=""
+        # the new detector's boxes calibrated to CBVD-5's habit before anything scores it (CALIB=0: not)
+        [ "${CALIB:-1}" = "0" ] || evald="&& $(q "$VENV/bin/python" "$HERE/herd.py" calibrate --detector "$DOUT/best" --root "$DATA")"
         if [ -n "$LAST" ] && [ -f "$WORK/herd/$LAST/model.pt" ]; then
-            evald="&& $(q "$VENV/bin/python" "$HERE/herd.py" eval-det --run "$WORK/herd/$LAST" --detector "$DOUT/best" \
+            evald="$evald && $(q "$VENV/bin/python" "$HERE/herd.py" eval-det --run "$WORK/herd/$LAST" --detector "$DOUT/best" \
                        --root "$DATA" --out "$WORK/herd/$LAST/eval-val-det-${DET_TAG}")"
         fi
         busy herd-det detector && { echo "a detector is still training: tmux attach -t herd-det (Ctrl+B D to leave),"

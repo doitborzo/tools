@@ -174,6 +174,34 @@ and writes `<detector>/box_calib.json`; `detector.Live` applies it to every box 
 then on (pipeline, keys, eval-det, show_zone). `run_pod.sh` does it in step 7
 (`CALIB=1`); `eval-det --calib 0` scores the raw boxes for comparison.
 
+**Public cow boxes (`cowbench/extra_det.py`).** Three more sets can join RF-DETR's
+training, all downloaded on the pod itself (`fetch` reads the zips through HTTP Range
+requests and takes only the frames it needs; a small zip is downloaded whole):
+
+| set | licence | view | what it adds |
+|---|---|---|---|
+| `zenodo` (HAMK, Zenodo 20426189) | CC BY 4.0 | angled barn camera, 11 videos | 769 frames, ~8.7k whole-cow boxes, crowded stalls |
+| `mmcows` (Purdue, MmCows) | CC BY-NC-SA 4.0 | 4 high cameras over one pen, 4480x2800 | one day, a frame per 2 min per camera (`MM_EVERY=8`): ~2.5k frames, whole-cow boxes, day and night |
+| `opencows` (Bristol, OpenCows2020) | UK Non-Commercial Government Licence | straight down: indoor walkway, drone over a field | 3.7k real frames; boxes are the body **without the head**, cows cut by the frame edge often unboxed |
+
+Two are non-commercial: fine for herd as a research system, not for a product. Each
+set is split into train / valid without neighbouring frames on both sides (zenodo by
+video, mmcows by hour, opencows by its authors' fold 0) and stored as COCO (one
+class, `cow`), images at most 1920 px on the longer side.
+
+    EXTRA=zenodo,mmcows DET_ARCH=rfdetr bash herd/run_pod.sh detector
+    EXTRA=zenodo,mmcows,opencows DET_ARCH=rfdetr bash herd/run_pod.sh detector   # then compare
+
+This downloads the sets to `WORK/extra_det`, trains `detector_rfdetr_large_<sets>`
+(train = CBVD-5 + the sets' train; the checkpoint is chosen on CBVD-5's held-out clips
++ the sets' valid; the threshold on CBVD-5 alone), scores it and every other
+`detector_*/best` on each set's valid frames (`WORK/extra_det/eval_extra.json`: recall
+and precision at IoU 0.5 and 0.3 at the detector's own threshold, best F1), calibrates
+its boxes to CBVD-5's habit and runs eval-det on CBVD-5 val. Keep the new detector only
+if CBVD-5 val holds up and the other sets improve; opencows' head-less boxes may make
+the boxes shorter, which is why it is tried separately. `EXTRA_MAX=N` caps the train
+frames taken from each set.
+
 ### 4.2 Frame encoder — DINOv2-S (`model.FrameEncoder`)
 
 Frozen. Turns a 224x224 crop into a vector: CLS + the patch tokens pooled over a
@@ -448,6 +476,10 @@ cut-off is strict.
 
 **Why:** the detector is trained on CBVD-5 (side view). From above, cows look
 different, though they overlap less.
+
+A first step needs no labelling: `EXTRA=...` (section 4.1) adds public sets taken
+from above or at a steep angle (MmCows, OpenCows2020). Labelled barn frames are still
+the only fair test of the barn's own cameras.
 
 **How to finish:**
 
