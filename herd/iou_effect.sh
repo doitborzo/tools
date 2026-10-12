@@ -94,8 +94,25 @@ if [ -z "${RUN_DIR:-}" ] || [ -z "${DET:-}" ]; then
     if [ ! -f "$WDIR/.unpacked" ]; then
         mkdir -p "$WDIR"
         A="$WDIR/download"
-        [ -s "$A" ] || "$VENV/bin/gdown" --fuzzy "$WEIGHTS_URL" -O "$A" \
-            || curl -L --fail --retry 5 -o "$A" "$WEIGHTS_URL"
+        # a web page instead of the archive (Drive's sign-in or virus-scan page): not kept
+        is_page() { head -c 512 "$1" 2>/dev/null | grep -qi '<!doctype html\|<html'; }
+        [ -s "$A" ] && is_page "$A" && rm -f "$A"
+        if [ ! -s "$A" ]; then
+            ID="$(printf '%s' "$WEIGHTS_URL" | sed -n 's#.*/d/\([A-Za-z0-9_-]*\).*#\1#p; s#.*[?&]id=\([A-Za-z0-9_-]*\).*#\1#p' | head -1)"
+            if [ -n "$ID" ]; then      # Google Drive: gdown by id (any version), then Drive's direct link
+                "$VENV/bin/gdown" "$ID" -O "$A" || { rm -f "$A"; curl -L --fail --retry 5 -o "$A" \
+                    "https://drive.usercontent.google.com/download?id=$ID&export=download&confirm=t"; }
+            else
+                curl -L --fail --retry 5 -o "$A" "$WEIGHTS_URL"
+            fi
+        fi
+        if [ ! -s "$A" ] || is_page "$A"; then
+            rm -f "$A"
+            echo "!! the download is a web page, not the archive: share the Drive file as 'Anyone with the link',"
+            echo "   or copy the archive to the pod yourself and run: RUN_DIR=<run9 folder> DET=<detector best/> bash $0"
+            exit 1
+        fi
+        echo "downloaded $(du -h "$A" | cut -f1)"
         case "$(file -b "$A" 2>/dev/null || echo unknown)" in
             Zip*)          command -v unzip >/dev/null || apt-get install -y -qq unzip; unzip -q -o "$A" -d "$WDIR" ;;
             gzip*|*tar*|POSIX*) tar -xf "$A" -C "$WDIR" ;;
