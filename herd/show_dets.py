@@ -5,6 +5,7 @@
     python herd/herd.py show-dets --src /workspace/extra_det/mmcows/valid --detector OLD/best --detector NEW/best
     python herd/herd.py show-dets --src barn_cam1.mp4 --every-sec 2 --detector D
     python herd/herd.py show-dets --cbvd /workspace/cbvd5 --detector D --pick worst     # CBVD-5 val keyframes
+    python herd/herd.py show-dets --cbvd /workspace/cbvd5 --cbvd-split train --detector D --max 200
 
 --src: a folder (searched recursively for .jpg/.jpeg/.png/.bmp/.webp pictures and
 .mp4/.avi/.mkv/.mov videos), or single files; a video gives a frame every
@@ -123,11 +124,15 @@ def video_frames(path, every_sec, limit):
     return out
 
 
-def cbvd_items(root):
-    """CBVD-5 val keyframes with their annotated boxes."""
+def cbvd_items(root, split="val"):
+    """CBVD-5 keyframes with their annotated boxes: val (never trained on), or train
+    (the detector's own training frames, the val clips left out as in training)."""
     import cbvd
     import train_lora
-    rows = cbvd.load_boxes(os.path.join(root, "annotations", "ava_val_v2.1.csv"))
+    rows = cbvd.load_boxes(os.path.join(root, "annotations", f"ava_{split}_v2.1.csv"))
+    if split == "train":
+        val = {b.video_id for b in cbvd.load_boxes(os.path.join(root, "annotations", "ava_val_v2.1.csv"))}
+        rows = [b for b in rows if b.video_id not in val]
     by = {}
     for b in rows:
         by.setdefault((b.video_id, b.timestamp), []).append(list(b.xyxy))
@@ -249,7 +254,9 @@ disagree (IoU 0.3–0.5)</span><span><i style="background:#eb2828"></i>missed</s
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--src", nargs="*", default=[], help="folders / pictures / videos")
-    p.add_argument("--cbvd", default=None, help="a CBVD-5 root: its val keyframes with the annotation")
+    p.add_argument("--cbvd", default=None, help="a CBVD-5 root: its keyframes with the annotation")
+    p.add_argument("--cbvd-split", choices=("val", "train"), default="val",
+                   help="val: 292 keyframes no detector trained on; train: ~2.9k the detectors learnt from")
     p.add_argument("--detector", action="append", required=True, help="a best/ folder (several: one panel each)")
     p.add_argument("--threshold", type=float, default=None, help="score cut-off (default: each detector's own)")
     p.add_argument("--calib", type=int, default=0, help="1: apply the detector's box_calib.json (CBVD-5's habit)")
@@ -273,7 +280,7 @@ def main(argv=None):
     for v in vids:
         items += [(n, (lambda im=im: im), None) for n, im in video_frames(v, args.every_sec, args.max)]
     if args.cbvd:
-        items += cbvd_items(args.cbvd)
+        items += cbvd_items(args.cbvd, args.cbvd_split)
     if not items:
         sys.exit("no pictures or videos found")
     annotated = sum(a is not None for _, _, a in items)
@@ -321,7 +328,7 @@ def main(argv=None):
         for c in cards[args.max:]:                 # all were drawn to find the worst; only these are kept
             os.remove(os.path.join(args.out, "img", c["file"]))
         cards = cards[:args.max]
-    title = "Detector boxes - " + ", ".join(args.src + ([f"CBVD-5 val ({args.cbvd})"] if args.cbvd else []))
+    title = "Detector boxes - " + ", ".join(args.src + ([f"CBVD-5 {args.cbvd_split} ({args.cbvd})"] if args.cbvd else []))
     write_html(args.out, cards, totals, title)
     with open(os.path.join(args.out, "summary.json"), "w", encoding="utf-8") as fh:
         json.dump({"sources": args.src, "cbvd": args.cbvd, "detectors": args.detector, "threshold": args.threshold,
