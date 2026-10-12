@@ -26,6 +26,14 @@ weights = "/workspace/lora-runs/detector/best"   # RT-DETRv2 (cowbench/detector.
 # tiles = true                                   # whole frame + square tiles: far cows ~1.8x wider, ~3x
 #                                                  the detector's work; default: as it was trained
 
+[zone]                          # where cameras work at all - far cows are not tried
+min_box_pct = 0.0               # boxes smaller than this % of the frame are dropped before tracking:
+                                # no posture, no identity, no NaN for them (0.6 = 0.6% of the frame)
+min_box_side_px = 0             # and/or: the box's short side in pixels of the kept frame (frame_width)
+                                # herd.py eval-det prints a sweep and a suggested value for each
+blank_excluded = true           # grey out each camera's `exclude` polygons before the detector
+                                # (per camera, any of these three can be set again to override)
+
 [tracker]
 iou = 0.3
 max_age_s = 5
@@ -71,6 +79,10 @@ folder = "training_cache"       # next to the store unless absolute
 id = "cam1"
 url = "rtsp://user:password@10.0.0.11:554/stream1"
 mask = [[0.0, 0.0], [0.55, 0.0], [0.55, 1.0], [0.0, 1.0]]
+# optional: a part of the view to grey out before the detector (one polygon or a list),
+# for what the size cut does not catch - e.g. a neighbour's pen behind a rail
+# exclude = [[0.0, 0.0], [1.0, 0.0], [1.0, 0.15], [0.0, 0.15]]
+# min_box_pct = 0.4              # this camera's own size cut, if it differs
 
 [[cameras]]
 id = "cam2"

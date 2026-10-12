@@ -38,6 +38,7 @@ scaffold that switches on with the barn's footage (section 8).
 |---|---|---|
 | Find the cows in a frame | RT-DETRv2 detector (`cowbench/detector.py`, class `Live`) | works; on CBVD-5 finds 74% of cows (51% of the far ones), see section 6 |
 | Cameras overlap | a mask per camera in the config: a cow counts where her box centre is (`common.in_mask`) | works |
+| Far cows are not tried at all | working zone (`common.in_zone`): boxes under `[zone] min_box_pct` (% of the frame) / `min_box_side_px` are dropped before tracking; optional `exclude` polygons are greyed out before the detector | works; `eval-det` suggests both cuts (section 4.0) |
 | Follow a cow between frames | `pipeline.Tracker` (box overlap, once a second) | works |
 | Posture and activity every second | `model.FrameHeads` on the DINOv2 vector of the crop (`pipeline.Camera.second`) | works; error 2.4–2.6% posture, 17–19% activity (on annotated boxes) |
 | A 7 s, 25 fps burst a minute, cameras in turn | `pipeline.Camera.burst`, `step_burst` | works, tested with 5 cameras (section 6) |
@@ -103,6 +104,41 @@ Why it is built this way:
 
 ## 4. The models one by one
 
+### 4.0 Working zone — far cows are not tried
+
+A bigger detector did not fix far cows: in a side view they are a few dozen pixels,
+too small to find reliably, read a posture from or identify. So the system does not
+try. The cut is the box's size — it works for any camera and angle, with no line to
+draw:
+
+- `[zone] min_box_pct` — boxes smaller than this percentage of the frame are dropped
+  before tracking (0.6 = 0.6% of the frame);
+- `[zone] min_box_side_px` — and/or boxes whose short side is under this many pixels
+  of the kept frame (`frame_width`, Full HD by default): what a crop has to go on;
+- both can be set again per camera; a dropped box never becomes a track, a posture,
+  an identity or a NaN (counted as `boxes_outside_zone` in the camera stats);
+- optional per camera `exclude` polygons, greyed out before the detector, for what
+  size alone does not catch (a neighbour's pen behind a rail);
+- the camera `mask` (box centre) as before: which camera owns which floor.
+
+Reports show observed minutes, so time a cow spent too far from every camera is "not
+observed", not NaN.
+
+How to choose the cut: `herd.py eval-det` prints two sweeps — by % of the frame and by
+short side in pixels. Each drops the smallest cows step by step (a tenth more at each
+step) and shows the share still covered, the detector's recall on them and the error of
+the whole path, and suggests the smallest cut at which the detector finds
+`--target-recall` (90%) of the cows left. `--min-box-pct` / `--min-box-side-px` then
+score that zone: cows outside it are neither missed nor wrong. A cow is scored only if
+clearly inside (1.25x the % cut, 1.12x the pixel cut), so one just over the line whose
+detected box is a little smaller is not counted as missed.
+
+To see it: `python herd/show_zone.py --root /workspace/cbvd5 --clip 371 --ts 5
+--min-box-pct 0.8 [--detector D]` draws a frame with every cow kept (green) or dropped
+as too small (orange; red for an `exclude` zone), above the frame the detector actually
+gets; `--config barn.toml --camera cam1 --image cam1.jpg` shows a barn camera's own
+zone.
+
 ### 4.1 Detector (`cowbench/detector.py`)
 
 RT-DETRv2 (a ResNet-50 CNN + a transformer), fine-tuned on the CBVD-5 boxes. Returns
@@ -118,6 +154,25 @@ cow boxes with a score. Settings that matter:
   It trains the deeper R101 backbone by default (`PekingU/rtdetr_v2_r101vd`, ~76M
   parameters, Apache-2.0, never tried before); `DET_MODEL=PekingU/rtdetr_v2_r50vd`
   trains the R50 (~42M) used so far, for a like-for-like comparison.
+
+RF-DETR (Roboflow; sizes N/S/M/L are Apache-2.0, XL/2XL are not) can replace
+RT-DETRv2: `DET_ARCH=rfdetr bash herd/run_pod.sh detector` (`cowbench/rfdetr_det.py`)
+trains it on the same CBVD-5 boxes and held-out clips and writes a `best/` folder the
+rest of the system loads like any detector (`detector.Live` reads `"kind": "rfdetr"`
+from `det_train_meta.json`). Its backbone is DINOv2 too, but it does not replace the
+frame encoder below: the detector's features are tuned to find boxes at frame
+resolution, where a far cow is a few patches, while the encoder sees each cow at
+224x224.
+
+**Box calibration.** CBVD-5's annotators drew boxes with a margin, the detector draws
+them tight: for a small far cow the margin alone pushes the overlap under 0.5, so a
+cow the detector found counts as missed, and the frame heads (trained on annotated
+crops) get tighter crops than they learnt on. `herd.py calibrate --detector D`
+measures, on the detector's own held-out train clips (never val), the median ratio of
+the annotation's box to the detector's and the shift of its centre, per size of box,
+and writes `<detector>/box_calib.json`; `detector.Live` applies it to every box from
+then on (pipeline, keys, eval-det, show_zone). `run_pod.sh` does it in step 7
+(`CALIB=1`); `eval-det --calib 0` scores the raw boxes for comparison.
 
 ### 4.2 Frame encoder — DINOv2-S (`model.FrameEncoder`)
 
@@ -222,6 +277,7 @@ Knobs (`NAME=value bash herd/run_pod.sh`):
 | `MOTION` | 1 | motion rhythm for rumination |
 | `QUALITY` | 1 | frame quality taught directly on spoilt frames |
 | `DET_KEYS` | 1 | frame heads also learn on the detector's boxes |
+| `CALIB` | 1 | calibrate the detector's boxes to the annotation's habit first (section 4.1) |
 | `GRID` | 2 | DINOv2 patch grid (4: finer, features 3.4x larger) |
 | `MARGIN` | 0.1 | context around the box in the crop (0.5 was worse: neighbouring cows) |
 | `MAX_ERROR` | 0.01 | error budget for NaN |
@@ -250,7 +306,8 @@ bash herd/run_pod.sh stop
 | `train --features F --out R [--pos 1 --motion 1 --quality 1 --det-keys 1] [--extra-train ...]` | training (runs eval at the end) |
 | `eval --features F --out R [--extra-val ...]` | evaluate again |
 | `abstain --features F --run R` | NaN model |
-| `eval-det --run R [--tiles 1] [--threshold t]` | the whole path on the detector's boxes, threshold sweep |
+| `calibrate --detector D` | the detector's boxes reshaped to the annotation's habit (`box_calib.json`) |
+| `eval-det --run R [--tiles 1] [--threshold t] [--min-box-pct p] [--min-box-side-px n]` | the whole path on the detector's boxes, threshold sweep, size sweeps for the working zone |
 | `stress --model M --detector D` | load test |
 | `run --config barn.toml` | run in the barn |
 | `report --config barn.toml csv\|alerts\|verdict\|alert-stats\|daily` | reports |
@@ -316,6 +373,8 @@ be checked on the barn's data.
      this camera alone (0–1 coordinates). Every patch of floor must be in exactly one
      mask;
    - `[model] checkpoint`, `[detector] weights` (and `threshold` from `eval-det`);
+   - the working zone: `[zone] min_box_pct` and/or `min_box_side_px` (from `eval-det`'s
+     size sweeps), section 4.0;
    - `[store] path` — where the SQLite file, the gallery and the cache go.
 2. Run: `python herd/herd.py run --config barn.toml`. For recorded files instead of
    RTSP: `--start 2026-10-07T06:00` and `url` = the file's path.
@@ -477,6 +536,7 @@ model sees fine detail: coat pattern, the jaw.
 | `stress.py` | load test |
 | `barn_dataset.py` | the barn cache, the track sheet, building the identity training set |
 | `show_crops.py` | a picture of what the model sees (boxes, crops, a burst) |
+| `show_zone.py` | a picture of the working zone: which cows are kept, which are not tried |
 | `run_pod.sh` | everything on a GPU pod with one command |
 | `config.example.toml` | example barn config |
 | `tests/` | `python herd/tests/run_all.py` |

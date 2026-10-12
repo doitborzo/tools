@@ -38,7 +38,8 @@ import time
 
 import numpy as np
 
-from common import ACTIVITIES, POSTURES, crop, device, in_mask, interpolate_box, iou, load_config
+from common import (ACTIVITIES, POSTURES, blank_excluded, crop, device, in_zone, interpolate_box, iou,
+                    load_config)
 from motion import motion_features
 
 
@@ -268,6 +269,18 @@ class Camera:
             while self.buffer and ts - self.buffer[0][0] > self.buffer_s:
                 self.buffer.popleft()
 
+    def blank(self, img):
+        """The far zone greyed out before the detector (camera `exclude`)."""
+        return blank_excluded(img, self.cam.get("exclude")) if self.cam.get("blank_excluded", True) else img
+
+    def zone(self, boxes, img):
+        """Boxes in the camera's working zone; the rest (far, too small, another
+        camera's floor) are dropped here and never tracked or identified."""
+        h, w = img.shape[:2]
+        keep = [b for b in boxes if in_zone(b, self.cam, w, h)]
+        self.stats["boxes_outside_zone"] += len(boxes) - len(keep)
+        return keep
+
     def frames(self):
         with self.buf_lock:
             return list(self.buffer)
@@ -307,7 +320,7 @@ class Camera:
     # one frame a second
     def second(self, ts, img):
         start = time.time()
-        boxes = [b for b in self.models.detect(img, urgent=True, kind="second_detect") if in_mask(b, self.mask)]
+        boxes = self.zone(self.models.detect(self.blank(img), urgent=True, kind="second_detect"), img)
         with self.trk_lock:
             tracked = self.tracker.update(ts, boxes)
         if tracked:
@@ -329,11 +342,11 @@ class Camera:
         step = max(1, int(round(len(frames) / (self.burst_s * self.burst_det_fps))))
         sampled = frames[::step]
         t = time.perf_counter()
-        detections = self.models.detect_many([img for _, img in sampled], kind="burst_detect")
+        detections = self.models.detect_many([self.blank(img) for _, img in sampled], kind="burst_detect")
         part["detect"] += time.perf_counter() - t
         chains = []                                       # [{t: box}]
-        for (ts, _), found in zip(sampled, detections):
-            boxes = [b for b in found if in_mask(b, self.mask)]
+        for (ts, img), found in zip(sampled, detections):
+            boxes = self.zone(found, img)
             used = set()
             for ch in chains:
                 last_t = max(ch)

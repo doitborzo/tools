@@ -21,6 +21,9 @@
 #                                 the first herd runs used (~42M); DET_TAG=fhd_r101 (fhd_r50 for r50vd).
 #                                 The first detector's own settings, only the backbone swapped:
 #                                 DET_SIZE=960 DET_ZOOM=0 DET_TILES=0 DET_SELECT=f1 DET_TAG=r101_960
+#                                 DET_ARCH=rfdetr: RF-DETR instead (DINOv2 backbone; cowbench/rfdetr_det.py),
+#                                 RF_SIZE=large|medium|small|nano, DET_RES (input side), DET_EPOCHS=30
+#                                 -> WORK/herd/detector_rfdetr_<size>; installs rfdetr[train] if missing
 #
 # Every step resumes: features are written clip by clip, so a rerun after a
 # crash continues where it stopped. Knobs:
@@ -35,6 +38,8 @@
 #   QUALITY=1         frame quality taught directly: stretches of every burst spoilt
 #                     (degrade.py: another cow in front, mud, blur, dark) and encoded (step 6,
 #                     GPU), the quality head learns to weigh them down; 0: without
+#   CALIB=1           step 7 first calibrates the detector's boxes to the annotation's habit
+#                     (herd.py calibrate -> <detector>/box_calib.json, used everywhere after)
 #   DET_KEYS=1        the frame heads also learn on the detector's boxes (+ jittered annotated
 #                     boxes), so they answer as well on what the barn gives them (step 6)
 #   POS=0             1: the heads also get where the cow is in the frame (fixed cameras: the
@@ -68,6 +73,16 @@ SESSION=herd
 DATASET_URL="https://www.kaggle.com/api/v1/datasets/download/fandaoerji/cbvd-5cow-behavior-video-dataset"
 export HF_HOME="$WORK/hf-cache"
 
+# A detector / stress session stays open after its job (to read the output); one
+# whose job has finished does not block a new start - it is closed here.
+busy() {
+    tmux has-session -t "=$1" 2>/dev/null || return 1
+    if tmux capture-pane -p -t "=$1:" -S -200 | grep -q "\[$2 finished\]"; then
+        tmux kill-session -t "=$1"; return 1
+    fi
+    return 0
+}
+
 # The trained RT-DETRv2: DET if set; else the newest finished one under WORK
 # (best/ next to train_done - a newer detector_fhd wins over the LoRA runs'
 # one); else any best/; nothing printed and status 1 if none.
@@ -90,7 +105,9 @@ case "${1:-}" in
           [ -n "$LOG" ] || { echo "no log yet in $WORK/herd"; exit 1; }
           echo "following $LOG"
           exec tail -n 100 -F "$LOG" ;;
-    stop) tmux kill-session -t "=$SESSION" 2>/dev/null && echo stopped || echo "not running"; exit 0 ;;
+    stop) # stop | stop detector | stop stress
+          case "${2:-}" in detector) S=herd-det ;; stress) S=herd-stress ;; *) S="$SESSION" ;; esac
+          tmux kill-session -t "=$S" 2>/dev/null && echo "stopped $S" || echo "$S not running"; exit 0 ;;
     stress)
         [ -n "${RUN_SET:-}" ] || RUN="$(basename "$(dirname "$(ls -t "$WORK"/herd/*/model.pt 2>/dev/null | head -1)")")"
         MODEL="$WORK/herd/$RUN/model.pt"
@@ -103,35 +120,52 @@ case "${1:-}" in
         mkdir -p "$SOUT"
         cmd="$(printf '%q ' "$VENV/bin/python" "$HERE/herd.py" stress --model "$MODEL" --detector "$DET" \
                --root "$DATA" --cameras "${CAMERAS:-5}" --duration "${DURATION:-300}" --out "$SOUT")"
-        tmux has-session -t =herd-stress 2>/dev/null && { echo "already running: tmux attach -t herd-stress"; exit 1; }
+        busy herd-stress stress && { echo "a stress test is still running: tmux attach -t herd-stress, or bash $0 stop stress"; exit 1; }
         env -u TMUX tmux new-session -d -s herd-stress -x 200 -y 50 \
             "export HF_HOME=$(printf '%q' "$HF_HOME"); $cmd 2>&1 | tee $(printf '%q' "$SOUT/log.txt"); echo '[stress finished]'; exec bash"
         echo "Started in tmux session 'herd-stress' (model $MODEL).  log: tail -F $SOUT/log.txt"
         echo "result: $SOUT/stress_herd_${CAMERAS:-5}cam.md"
         exit 0 ;;
     detector)
-        DET_MODEL="${DET_MODEL:-PekingU/rtdetr_v2_r101vd}"
-        DET_TAG="${DET_TAG:-fhd_$(echo "$DET_MODEL" | sed -n 's/.*_\(r[0-9]*\)vd$/\1/p')}"
-        DOUT="$WORK/herd/detector_${DET_TAG}"
+        [ -x "$VENV/bin/python" ] && [ -f "$DATA/annotations/ava_train_v2.1.csv" ] || {
+            echo "no environment or CBVD-5 yet: run 'bash $0' once first (steps 1-2 set them up)"; exit 1; }
+        q() { printf '%q ' "$@"; }
+        if [ "${DET_ARCH:-rtdetr}" = "rfdetr" ]; then
+            # RF-DETR (DINOv2 backbone, Apache-2.0 sizes): cowbench/rfdetr_det.py
+            RF_SIZE="${RF_SIZE:-large}"
+            DET_TAG="${DET_TAG:-rfdetr_$RF_SIZE}"
+            DOUT="$WORK/herd/detector_${DET_TAG}"
+            export PATH="$HOME/.local/bin:$PATH"
+            "$VENV/bin/python" -c "import rfdetr, pytorch_lightning" 2>/dev/null || \
+                uv pip install --python "$VENV/bin/python" "rfdetr[train]"
+            train="$(q "$VENV/bin/python" "$REPO/cowbench/rfdetr_det.py" train --root "$DATA" --out "$DOUT" \
+                       --size "$RF_SIZE" --epochs "${DET_EPOCHS:-30}" --batch "${DET_BATCH:-8}" \
+                       --tiles "${DET_TILES:-0}" --select "${DET_SELECT:-f1}" \
+                       ${DET_RES:+--resolution "$DET_RES"})"
+        else
+            DET_MODEL="${DET_MODEL:-PekingU/rtdetr_v2_r101vd}"
+            DET_TAG="${DET_TAG:-fhd_$(echo "$DET_MODEL" | sed -n 's/.*_\(r[0-9]*\)vd$/\1/p')}"
+            DOUT="$WORK/herd/detector_${DET_TAG}"
+            train="$(q "$VENV/bin/python" "$REPO/cowbench/detector.py" train --root "$DATA" --out "$DOUT" \
+                       --model "$DET_MODEL" --size "${DET_SIZE:-1088}" --zoom "${DET_ZOOM:-0.5}" --tiles "${DET_TILES:-1}" --select "${DET_SELECT:-f2}" \
+                       --epochs "${DET_EPOCHS:-24}" --batch "${DET_BATCH:-8}")"
+        fi
         mkdir -p "$DOUT"
         LAST="$(basename "$(dirname "$(ls -t "$WORK"/herd/*/model.pt 2>/dev/null | head -1)")" 2>/dev/null || true)"
-        q() { printf '%q ' "$@"; }
-        train="$(q "$VENV/bin/python" "$REPO/cowbench/detector.py" train --root "$DATA" --out "$DOUT" \
-                   --model "$DET_MODEL" --size "${DET_SIZE:-1088}" --zoom "${DET_ZOOM:-0.5}" --tiles "${DET_TILES:-1}" --select "${DET_SELECT:-f2}" \
-                   --epochs "${DET_EPOCHS:-24}" --batch "${DET_BATCH:-8}")"
         evald=""
         if [ -n "$LAST" ] && [ -f "$WORK/herd/$LAST/model.pt" ]; then
             evald="&& $(q "$VENV/bin/python" "$HERE/herd.py" eval-det --run "$WORK/herd/$LAST" --detector "$DOUT/best" \
                        --root "$DATA" --out "$WORK/herd/$LAST/eval-val-det-${DET_TAG}")"
         fi
-        tmux has-session -t =herd-det 2>/dev/null && { echo "already running: tmux attach -t herd-det"; exit 1; }
+        busy herd-det detector && { echo "a detector is still training: tmux attach -t herd-det (Ctrl+B D to leave),"
+                                    echo "or stop it: bash $0 stop detector"; exit 1; }
         env -u TMUX tmux new-session -d -s herd-det -x 200 -y 50 \
             "export HF_HOME=$(printf '%q' "$HF_HOME"); ( $train $evald ) 2>&1 | tee -a $(printf '%q' "$DOUT/log.txt"); echo '[detector finished]'; exec bash"
         echo "Started in tmux session 'herd-det' -> $DOUT/best.  log: tail -F $DOUT/log.txt"
         [ -n "$evald" ] && echo "then eval-det of $LAST with it -> $WORK/herd/$LAST/eval-val-det-${DET_TAG}/eval_det.json"
         exit 0 ;;
     "") ;;
-    *) echo "usage: $0 [log|stop|stress|detector]"; exit 2 ;;
+    *) echo "usage: $0 [log|stop [detector|stress]|stress|detector]"; exit 2 ;;
 esac
 
 if [ -z "${HERD_IN_TMUX:-}" ]; then
@@ -139,7 +173,7 @@ if [ -z "${HERD_IN_TMUX:-}" ]; then
     if tmux has-session -t "=$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     mkdir -p "$WORK/herd"
     knobs=""
-    for v in WORK RUN EPOCHS ENCODER GRID MAX_ERROR MARGIN POS MOTION DET DET_KEYS QUALITY; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
+    for v in WORK RUN EPOCHS ENCODER GRID MAX_ERROR MARGIN POS MOTION DET DET_KEYS QUALITY CALIB; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env HERD_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/run_pod.sh"); echo; echo '[run_pod.sh finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log   ($LOG)"
@@ -214,6 +248,9 @@ USE_KEYS=0
 if [ "$DET_KEYS" = "1" ]; then
     if D6="$(find_det)"; then
         echo "detector: $D6"
+        if [ "${CALIB:-1}" = "1" ]; then     # its boxes reshaped to the annotation's habit (box_calib.json)
+            "$PY" herd.py calibrate --detector "$D6" --root "$DATA"
+        fi
         "$PY" herd.py keys --root "$DATA" --out "$FEAT" --split train --detector "$D6"
         USE_KEYS=1
     else
