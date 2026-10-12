@@ -212,6 +212,15 @@ def cmd_train(args):
               lr=args.lr, output_dir=run_dir)
     if args.resolution:
         kw["resolution"] = args.resolution
+    # a run stopped half-way (Ctrl+C, a lost pod) goes on from its last finished epoch: rfdetr writes
+    # rf/last.ckpt (weights, optimiser, schedule, epoch) after every epoch; --fresh starts over
+    last = os.path.join(run_dir, "last.ckpt")
+    if os.path.exists(last):
+        if args.fresh:
+            shutil.rmtree(run_dir)
+        else:
+            kw["resume"] = last
+            print(f"[rfdetr] continuing a stopped run from {last}", flush=True)
     print(f"[rfdetr] training {SIZES[args.size]} for {args.epochs} epochs -> {run_dir}", flush=True)
     model.train(**kw)
     ckpt = next((os.path.join(run_dir, n) for n in ("checkpoint_best_total.pth", "checkpoint_best_ema.pth",

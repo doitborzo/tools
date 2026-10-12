@@ -213,6 +213,11 @@ and `_ft` in the tag:
 
     EXTRA=zenodo,mmcows DET_INIT=/workspace/herd/detector_rfdetr_large/best DET_ARCH=rfdetr bash herd/run_pod.sh detector
 
+A stopped RF-DETR run (Ctrl+C, `stop detector`, a lost pod) goes on from its last
+finished epoch when the same command is run again: rfdetr writes `rf/last.ckpt`
+after every epoch (`--fresh` starts over). To start a run with other data from a
+stopped one instead, point `DET_INIT` at its `rf/checkpoint_best_total.pth`.
+
 CBVD-5 stays in the training set, so the detector does not forget it while it learns
 the new sets; it is ~2.5x quicker than training afresh. Compare both ways with
 `eval_extra.json` and eval-det.
