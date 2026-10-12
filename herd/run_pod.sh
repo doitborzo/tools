@@ -7,6 +7,7 @@
 #   bash herd/run_pod.sh          start in tmux session "herd"
 #   bash herd/run_pod.sh log      follow the log
 #   bash herd/run_pod.sh stop
+#   bash herd/run_pod.sh setup    only the environment and CBVD-5 (steps 1-2), e.g. a new pod for "detector"
 #   bash herd/run_pod.sh stress   one GPU in real time: a burst alone, then CAMERAS (5) cameras at
 #                                 1 fps + a 7 s burst a minute each (tmux "herd-stress", ~7 min);
 #                                 RUN= the model (default: the newest run), DET= the detector's best/,
@@ -201,16 +202,17 @@ case "${1:-}" in
         echo "Started in tmux session 'herd-det' -> $DOUT/best.  log: tail -F $DOUT/log.txt"
         [ -n "$evald" ] && echo "then eval-det of $LAST with it -> $WORK/herd/$LAST/eval-val-det-${DET_TAG}/eval_det.json"
         exit 0 ;;
+    setup) SETUP_ONLY=1 ;;   # steps 1-2 only (environment + CBVD-5), e.g. on a new pod before "detector"
     "") ;;
-    *) echo "usage: $0 [log|stop [detector|stress]|stress|detector]"; exit 2 ;;
+    *) echo "usage: $0 [log|stop [detector|stress]|stress|detector|setup]"; exit 2 ;;
 esac
 
 if [ -z "${HERD_IN_TMUX:-}" ]; then
     command -v tmux >/dev/null || { apt-get update -qq && apt-get install -y -qq tmux; }
-    if tmux has-session -t "=$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
+    if busy "$SESSION" run_pod.sh; then echo "already running: bash $0 log"; exit 1; fi
     mkdir -p "$WORK/herd"
     knobs=""
-    for v in WORK RUN EPOCHS ENCODER GRID MAX_ERROR MARGIN POS MOTION DET DET_KEYS QUALITY CALIB; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
+    for v in WORK RUN EPOCHS ENCODER GRID MAX_ERROR MARGIN POS MOTION DET DET_KEYS QUALITY CALIB SETUP_ONLY; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env HERD_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/run_pod.sh"); echo; echo '[run_pod.sh finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log   ($LOG)"
@@ -256,6 +258,7 @@ if [ ! -f "$DATA/annotations/ava_train_v2.1.csv" ] || [ ! -d "$DATA/labelframes"
     rm -rf "$DATA/_x"
 fi
 echo "keyframes: $(find "$DATA/labelframes" -name '*.jpg' | wc -l), videos: $(find "$DATA/videos" -name '*.mp4' | wc -l)"
+[ -z "${SETUP_ONLY:-}" ] || { echo; echo "setup done: environment + CBVD-5 ready (bash $0 detector ... next)"; exit 0; }
 
 cd "$HERE"
 step "3/10  Stage A: frame vectors (DINOv2, frozen) - train"
