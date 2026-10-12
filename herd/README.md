@@ -35,6 +35,7 @@ SQLite (seconds, bursts) -> track -> cow from confirmed bursts -> per-cow days
 | NaN | a small model of p(right) from similarity, margin to the next cow, frame quality, cow size; cut-off so that ≤1% of answers are wrong |
 | New cows (no RFID) | unknown bursts are pooled; tracks are grouped; a group seen often becomes `new-<date>-<n>`; first start enrols the herd this way. Tuesday 10:00 starts a change-over; cows unseen 48 h after it retire. `names.json` (optional) maps ids to ear tags for reports |
 | Overlapping cameras | each camera's mask covers only the floor it owns; a cow counts where her box centre is |
+| Far cows | not tried: boxes under `[zone] min_box_pct` (% of the frame) or `min_box_side_px` are dropped before tracking; `eval-det` suggests both cuts; optional `exclude` polygons are greyed out before the detector |
 | Cameras do not see everything | reports carry observed minutes and shares, not just hours |
 
 Open, kept as settings until known: lameness labels (`[lameness] enabled = false`),

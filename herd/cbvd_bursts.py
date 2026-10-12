@@ -367,6 +367,7 @@ def cmd_keys(args):
     meta_path = os.path.join(out_dir, "keys_aug_meta.json")
     det = det_mod.Live(args.detector, args.det_threshold, tiles=args.det_tiles)
     made_with = {"detector": os.path.abspath(args.detector), "threshold": det.threshold, "tiles": det.tiles,
+                 "calib": det.calib,
                  "match_iou": args.match_iou, "jitter": args.jitter}
     if os.path.exists(out_path) and os.path.exists(meta_path) and not args.fresh:
         if json.load(open(meta_path, encoding="utf-8")) == made_with:

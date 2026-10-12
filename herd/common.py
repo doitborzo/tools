@@ -47,6 +47,13 @@ DEFAULTS = {
     "store": {"path": "herd.sqlite"},
     # the barn's bursts kept for training identity on the barn's own cows (barn_dataset.py)
     "training_cache": {"enabled": False, "every_n": 10, "folder": "training_cache", "max_gb": 200},
+    # Where a camera works at all. Far cows are too small to identify or to read a
+    # posture from (CBVD-5: the smallest quarter is found half the time), and with
+    # overlapping cameras the far floor of one is the near floor of another - so
+    # they are not tried: boxes under these sizes are dropped, and a camera's
+    # `exclude` polygons (the far zone) are greyed out before the detector sees the
+    # frame. Per camera the same keys override these. herd.py eval-det suggests values.
+    "zone": {"min_box_pct": 0.0, "min_box_side_px": 0, "blank_excluded": True},
     "cameras": [],
 }
 
@@ -66,7 +73,10 @@ def load_config(path=None):
             cfg = _merge(DEFAULTS, tomllib.load(fh))
     for cam in cfg["cameras"]:
         cam.setdefault("mask", [])
+        cam.setdefault("exclude", [])
         cam.setdefault("name", cam.get("id"))
+        for k, v in cfg["zone"].items():
+            cam.setdefault(k, v)
     return cfg
 
 
@@ -103,6 +113,61 @@ def in_mask(box, mask):
     cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
     polys = mask if isinstance(mask[0][0], (list, tuple)) else [mask]
     return any(in_polygon(cx, cy, p) for p in polys)
+
+
+def _polys(mask):
+    if not mask:
+        return []
+    return mask if isinstance(mask[0][0], (list, tuple)) else [mask]
+
+
+def big_enough(box, w, h, min_area=0.0, min_side_px=0):
+    """A box (0-1) large enough to work on: area as a share of the frame, and its
+    short side in pixels of a w x h frame (what the crop will have to go on)."""
+    bw, bh = box[2] - box[0], box[3] - box[1]
+    return bw * bh >= min_area and min(bw * w, bh * h) >= min_side_px
+
+
+def zone_min_area(cam):
+    """The size cut as a share of the frame: min_box_pct (percent) or the older min_box_area."""
+    pct = cam.get("min_box_pct") or 0.0
+    return pct / 100.0 if pct else (cam.get("min_box_area") or 0.0)
+
+
+def in_zone(box, cam, w, h):
+    """The camera's working zone: its mask (box centre), outside its exclude
+    polygons (box centre), and big enough. A cow outside it is not tried at all."""
+    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    if any(in_polygon(cx, cy, p) for p in _polys(cam.get("exclude"))):
+        return False
+    return in_mask(box, cam.get("mask")) and big_enough(box, w, h, zone_min_area(cam),
+                                                          cam.get("min_box_side_px", 0))
+
+
+_BLANK_CACHE = {}
+
+
+def blank_excluded(img, exclude, fill=114):
+    """The frame with the exclude polygons greyed out, for the detector only: a
+    far cow it never sees is never a box, a track or a NaN. Crops are still cut
+    from the untouched frame."""
+    polys = _polys(exclude)
+    if not polys:
+        return img
+    import numpy as np
+    h, w = img.shape[:2]
+    key = (h, w, json.dumps(polys))
+    m = _BLANK_CACHE.get(key)
+    if m is None:
+        from PIL import Image, ImageDraw
+        pil = Image.new("L", (w, h), 0)
+        d = ImageDraw.Draw(pil)
+        for p in polys:
+            d.polygon([(x * w, y * h) for x, y in p], fill=1)
+        m = _BLANK_CACHE[key] = np.asarray(pil, bool)
+    out = img.copy()
+    out[m] = fill
+    return out
 
 
 def interpolate_box(keys, t):

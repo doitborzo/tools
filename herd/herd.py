@@ -9,6 +9,7 @@ Training (on CBVD-5 today, on the barn's own footage later):
     herd.py train                           temporal transformer + all heads on those vectors
     herd.py eval                            val scores + cowbench-format results
     herd.py eval-det --run R                the same on the detector's boxes: detector misses count
+    herd.py calibrate --detector D          the detector's boxes reshaped to the annotation's habit
     herd.py abstain                         the NaN model and its cut-off
 
 Running:
@@ -72,6 +73,9 @@ def main():
     if cmd in ("train", "eval"):
         import train
         return train.main([cmd] + argv)
+    if cmd == "calibrate":
+        import calib_boxes
+        return calib_boxes.main(argv)
     if cmd == "eval-det":
         import eval_det
         return eval_det.main(argv)

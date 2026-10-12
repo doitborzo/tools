@@ -41,3 +41,17 @@ def test_detector_tiles_zoom_nms():
     # the left tile's half cow at its cut is dropped; the same cow from the right tile merges with the whole frame's
     assert len([b for b in out if b[0] > 0.9]) == 1
     assert len(out) == 4                                           # frame centre + one per tile + the edge cow
+
+
+def test_box_calibration_fit_and_apply():
+    import detector as d
+    from calib_boxes import fit
+    tight = lambda g, s: [((g[0] + g[2]) - (g[2] - g[0]) * s) / 2, ((g[1] + g[3]) - (g[3] - g[1]) * s) / 2,
+                          ((g[0] + g[2]) + (g[2] - g[0]) * s) / 2, ((g[1] + g[3]) + (g[3] - g[1]) * s) / 2]
+    gts = [[0.1 * k % 0.8, 0.2, 0.1 * k % 0.8 + 0.05 + 0.01 * k, 0.5] for k in range(1, 60)]
+    cal = fit([(tight(g, 0.8), g) for g in gts])
+    assert all(abs(b["sx"] - 1.25) < 1e-6 and abs(b["sy"] - 1.25) < 1e-6 for b in cal["buckets"])
+    g = gts[10]
+    back = d.calibrate_box(tight(g, 0.8), cal)
+    assert max(abs(a - b) for a, b in zip(back, g)) < 1e-3
+    assert d.calibrate_box([0.1, 0.1, 0.2, 0.2], None) == [0.1, 0.1, 0.2, 0.2]
