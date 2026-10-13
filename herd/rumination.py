@@ -236,8 +236,13 @@ def _save_seq(path, emb, times, labels, postures, seen, wins, motion, meta):
              label=np.asarray(labels, np.int8), posture=np.asarray(postures, np.int8),
              seen=np.asarray(seen, bool), windows=np.asarray([w[:2] for w in wins], np.float32).reshape(-1, 2),
              win_label=np.asarray([w[2:4] for w in wins], np.int8).reshape(-1, 2),
-             motion=np.asarray(motion, np.float32).reshape(len(wins), -1), meta=json.dumps(meta))
+             motion=np.asarray(motion, np.float32).reshape(len(wins), _motion_dim()), meta=json.dumps(meta))
     os.replace(path + ".part.npz", path)
+
+
+def _motion_dim():
+    import motion as motion_mod
+    return motion_mod.DIM
 
 
 def _motion(crops, times, seen, wins):
