@@ -8,7 +8,8 @@
 #   3. the usual test - the detector on fully boxed frames: the valid frames of the public sets
 #      (SETS=zenodo,mmcows,opencows; only valid is downloaded), every detector unpacked side by
 #      side (extra_det.py eval), and a gallery of each set's worst frames for DET (show-dets)
-#   4. the stress test - detector -> DINOv2 -> transformer on CAMERAS cameras in real time:
+#   4. the stress test - detector -> DINOv2 -> transformer on CAMERAS cameras in real time
+#      (several counts, e.g. CAMERAS="5 10 15 20", run one after another: where this GPU stops):
 #      the barn's own videos when VIDEOS=<folder>, else CBVD-5's 50 val clips (248 MB, played as
 #      cameras only; their labels are not scored)
 #   5. a summary (GPU, recall / precision per set and detector, keeps up or not) and
@@ -19,7 +20,7 @@
 #   bash herd/test_pod.sh stop
 #
 # Knobs: WORK=/workspace  RUN=run9  DET=<best/ for the stress test and the galleries> (default: newest)
-#        SETS=zenodo,mmcows,opencows  GALLERY=1  VIDEOS=<folder of videos>  CAMERAS=5
+#        SETS=zenodo,mmcows,opencows  GALLERY=1  VIDEOS=<folder of videos>  CAMERAS=5 (or "5 10 15")
 #        DURATION=300 (s measured)  THRESHOLD (default: the detector's own)
 #        TESTS="detector stress" (one of them to run only it)
 
@@ -98,7 +99,8 @@ if [ -z "${DET:-}" ]; then
 fi
 [ -n "$DET" ] && [ -f "$DET/det_train_meta.json" ] || { echo "!! no detector best/ under $H (DET=<it>)"; exit 1; }
 DTAG="$(basename "$(dirname "$DET")")"
-echo "tests     $TESTS; stress: ${CAMERAS:-5} cameras, ${DURATION:-300} s${VIDEOS:+, videos from $VIDEOS}"
+CAMS="${CAMERAS:-5}"
+echo "tests     $TESTS; stress: ${CAMS// /, } cameras, ${DURATION:-300} s each${VIDEOS:+, videos from $VIDEOS}"
 echo "model     $H/$RUN/model.pt"
 echo "detector  $DET  (stress test, galleries)"
 echo "all detectors here: $(cd "$H" && ls -d detector_*/best 2>/dev/null | tr '\n' ' ')"
@@ -117,7 +119,7 @@ fi
 cd "$HERE"
 EOUT="$H/test_eval_extra_${GTAG}.json"
 GOUT="$H/test_galleries_${GTAG}"
-SOUT="$H/stress_${RUN}_${DTAG}_${GTAG}_${CAMERAS:-5}cam_${STAMP}"     # one folder per run: no older result mixes in
+SOUT="$H/stress_${RUN}_${DTAG}_${GTAG}_${STAMP}"     # one folder per run: no older result mixes in
 thr=(); [ -n "${THRESHOLD:-}" ] && thr=(--threshold "$THRESHOLD")
 
 if [[ " $TESTS " == *" detector "* ]]; then
@@ -135,7 +137,7 @@ if [[ " $TESTS " == *" detector "* ]]; then
 fi
 
 if [[ " $TESTS " == *" stress "* ]]; then
-    step "Stress test: ${CAMERAS:-5} cameras, ${DURATION:-300} s"
+    step "Stress test: ${CAMS// /, } cameras, ${DURATION:-300} s each"
     if [ -n "${VIDEOS:-}" ]; then
         src=(--videos "$VIDEOS")
     else
@@ -145,9 +147,16 @@ if [[ " $TESTS " == *" stress "* ]]; then
         src=(--root "$WORK/cbvd5" --no-detector-check)
     fi
     mkdir -p "$SOUT"
-    # exit 1 means "does not keep up" - a result, not a failure of the script
-    "$PY" herd.py stress --model "$H/$RUN/model.pt" --detector "$DET" "${src[@]}" \
-        --cameras "${CAMERAS:-5}" --duration "${DURATION:-300}" --out "$SOUT" "${thr[@]}" || true
+    first=1
+    for n in $CAMS; do
+        echo; echo "--- $n cameras"
+        # the burst-alone part is the same for every count: once is enough
+        alone=(); [ "$first" = 1 ] || alone=(--alone 0)
+        # exit 1 means "does not keep up" - a result, not a failure of the script
+        "$PY" herd.py stress --model "$H/$RUN/model.pt" --detector "$DET" "${src[@]}" "${alone[@]}" \
+            --cameras "$n" --duration "${DURATION:-300}" --out "$SOUT" "${thr[@]}" || true
+        first=0
+    done
 fi
 
 step "Summary"

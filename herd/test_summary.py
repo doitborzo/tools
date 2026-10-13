@@ -27,7 +27,25 @@ def main(argv=None):
                                  f"{a['precision']:.1%} | {b['recall']:.1%} | "
                                  f"{m['best_f1']['f1']:.3f} ({m['best_f1_threshold']}) |")
         lines.append("")
-    for f in sorted(glob.glob(os.path.join(sout, "*.md"))):
+    runs = []
+    for f in glob.glob(os.path.join(sout, "stress_herd_*cam.json")):
+        with open(f, encoding="utf-8") as fh:
+            L = json.load(fh).get("live")
+        if L:
+            runs.append(L)
+    if runs:
+        # every camera count side by side: where this GPU stops keeping up
+        lines += ["## Stress test: cameras side by side", "",
+                  "| cameras | keeps up | ticks done | tick lag p99, s | bursts done | burst ready -> done max, s "
+                  "| GPU busy | cameras estimate (20% free) |", "|---|---|---|---|---|---|---|---|"]
+        for L in sorted(runs, key=lambda r: r["cameras"]):
+            lines.append(f"| {L['cameras']} | {'yes' if L['keeps_up'] else 'NO'} | {L['ticks_done']} of "
+                         f"{L['ticks_expected']} | {L['tick_lag_s'].get('p99', '-')} | {L['bursts_done']} of "
+                         f"{L['bursts_due']} | {L['burst_late_s'].get('max', '-')} | {L['gpu_busy_share']:.0%} | "
+                         f"{L['cameras_max_estimate']} |")
+        lines.append("")
+    for f in sorted(glob.glob(os.path.join(sout, "*.md")),
+                    key=lambda f: int("".join(c for c in os.path.basename(f) if c.isdigit()) or 0)):
         with open(f, encoding="utf-8") as fh:
             lines += [f"## Stress test ({os.path.basename(f)})", "", fh.read(), ""]
     text = "\n".join(lines)
