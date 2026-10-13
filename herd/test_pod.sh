@@ -78,7 +78,18 @@ step "Models from the uploaded archive"
 for a in ${MODELS:-$(ls -t "$WORK"/herd_models_*.tgz 2>/dev/null | head -1)}; do
     [ -f "$a" ] || continue
     echo "unpacking $a"
-    tar -xzf "$a" -C "$WORK"
+    # an archive repacked elsewhere (e.g. on Windows) may wrap everything in a folder of its own:
+    # unpack aside, find herd/ at whatever depth, and merge it (and hf-cache/) into WORK
+    U="$WORK/_unpack"
+    rm -rf "$U" && mkdir -p "$U"
+    tar -xzf "$a" -C "$U"
+    top="$(find "$U" -maxdepth 4 -type d -name herd -print -quit)"
+    [ -n "$top" ] || { echo "!! no herd/ folder in $a"; exit 1; }
+    top="$(dirname "$top")"
+    for d in herd hf-cache; do
+        [ -d "$top/$d" ] && { mkdir -p "$WORK/$d"; cp -a "$top/$d/." "$WORK/$d/"; }
+    done
+    rm -rf "$U"
 done
 [ -f "$H/$RUN/model.pt" ] || { echo "!! no $H/$RUN/model.pt - upload herd_models_*.tgz to $WORK (or RUN=<run>)"; exit 1; }
 if [ -z "${DET:-}" ]; then
