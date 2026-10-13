@@ -174,6 +174,61 @@ and writes `<detector>/box_calib.json`; `detector.Live` applies it to every box 
 then on (pipeline, keys, eval-det, show_zone). `run_pod.sh` does it in step 7
 (`CALIB=1`); `eval-det --calib 0` scores the raw boxes for comparison.
 
+**Public cow boxes (`cowbench/extra_det.py`).** Three more sets can join RF-DETR's
+training, all downloaded on the pod itself (`fetch` reads the zips through HTTP Range
+requests and takes only the frames it needs; a small zip is downloaded whole):
+
+| set | licence | view | what it adds |
+|---|---|---|---|
+| `zenodo` (HAMK, Zenodo 20426189) | CC BY 4.0 | angled barn camera, 11 videos | 769 frames, ~8.7k whole-cow boxes, crowded stalls |
+| `mmcows` (Purdue, MmCows) | CC BY-NC-SA 4.0 | 4 high cameras over one pen, 4480x2800 | one day, a frame per 2 min per camera (`MM_EVERY=8`): ~2.5k frames, whole-cow boxes, day and night |
+| `opencows` (Bristol, OpenCows2020) | UK Non-Commercial Government Licence | straight down: indoor walkway, drone over a field | 3.7k real frames; boxes are the body **without the head**, cows cut by the frame edge often unboxed |
+
+Two are non-commercial: fine for herd as a research system, not for a product. Each
+set is split into train / valid without neighbouring frames on both sides (zenodo by
+video, mmcows by hour, opencows by its authors' fold 0) and stored as COCO (one
+class, `cow`), images at most 1920 px on the longer side.
+
+    EXTRA=zenodo,mmcows DET_ARCH=rfdetr bash herd/run_pod.sh detector
+    EXTRA=zenodo,mmcows,opencows DET_ARCH=rfdetr bash herd/run_pod.sh detector   # then compare
+
+This downloads the sets to `WORK/extra_det`, trains `detector_rfdetr_large_<sets>`
+(train = CBVD-5 + the sets' train; the checkpoint is chosen on CBVD-5's held-out clips
++ the sets' valid; the threshold on CBVD-5 alone), scores it and every other
+`detector_*/best` on each set's valid frames (`WORK/extra_det/eval_extra.json`: recall
+and precision at IoU 0.5 and 0.3 at the detector's own threshold, best F1), calibrates
+its boxes to CBVD-5's habit and runs eval-det on CBVD-5 val. Keep the new detector only
+if CBVD-5 val holds up and the other sets improve; opencows' head-less boxes may make
+the boxes shorter, which is why it is tried separately. `EXTRA_MAX=N` caps the train
+frames taken from each set.
+
+On a new pod, `bash herd/run_pod.sh setup` first (the environment and CBVD-5 only,
+steps 1-2), then copy the earlier detector's whole `best/` folder back
+(`checkpoint.pth`, `det_train_meta.json`, `box_calib.json`).
+
+**Seeing the boxes.** `herd.py show-dets --src <folder / pictures / videos> --detector
+<best/> [--detector <another best/>]` draws every box on every picture into one HTML
+gallery (`<out>/index.html`); with an annotation beside the pictures (COCO
+`_annotations.coco.json`, or YOLO `.txt` beside them / in `labels/`) found, boxes
+disagreeing, missed and extra are coloured as in eval-det, `--pick worst` shows the
+pictures with the most misses and extras first, `--cbvd <root>` takes CBVD-5 val.
+
+**Fine-tuning a detector trained before.** `DET_INIT=<its best/>` starts RF-DETR from
+that detector's weights instead of rfdetr's COCO ones (same size; its input side is
+kept), with fewer epochs and a lower learning rate (`DET_EPOCHS=12`, `DET_LR=5e-5`),
+and `_ft` in the tag:
+
+    EXTRA=zenodo,mmcows DET_INIT=/workspace/herd/detector_rfdetr_large/best DET_ARCH=rfdetr bash herd/run_pod.sh detector
+
+A stopped RF-DETR run (Ctrl+C, `stop detector`, a lost pod) goes on from its last
+finished epoch when the same command is run again: rfdetr writes `rf/last.ckpt`
+after every epoch (`--fresh` starts over). To start a run with other data from a
+stopped one instead, point `DET_INIT` at its `rf/checkpoint_best_total.pth`.
+
+CBVD-5 stays in the training set, so the detector does not forget it while it learns
+the new sets; it is ~2.5x quicker than training afresh. Compare both ways with
+`eval_extra.json` and eval-det.
+
 ### 4.2 Frame encoder — DINOv2-S (`model.FrameEncoder`)
 
 Frozen. Turns a 224x224 crop into a vector: CLS + the patch tokens pooled over a
@@ -293,6 +348,12 @@ DET_SIZE=960 DET_ZOOM=0 DET_TILES=0 DET_SELECT=f1 DET_TAG=r101_960 bash herd/run
 bash herd/run_pod.sh stress      # 5 cameras in real time on one GPU (~7 min)
 CAMERAS=20 RUN=run7 bash herd/run_pod.sh stress
 bash herd/run_pod.sh stop
+bash herd/run_pod.sh setup       # a new pod: the environment and CBVD-5 only
+bash herd/test_pod.sh            # a new pod: upload herd_models_*.tgz to WORK, then the detectors on the
+                                 # public sets' fully boxed valid frames + galleries, and the stress test
+                                 # (VIDEOS=<barn videos>, else CBVD-5's val clips as cameras), a summary
+bash herd/export_pod.sh          # three archives in WORK/export: models (detectors' best/, RUN's
+                                 # model.pt + abstain.json, DINOv2 from the HF cache), results, galleries
 ```
 
 ### 5.3 Single commands (`python herd/herd.py ...`)
@@ -448,6 +509,10 @@ cut-off is strict.
 
 **Why:** the detector is trained on CBVD-5 (side view). From above, cows look
 different, though they overlap less.
+
+A first step needs no labelling: `EXTRA=...` (section 4.1) adds public sets taken
+from above or at a steep angle (MmCows, OpenCows2020). Labelled barn frames are still
+the only fair test of the barn's own cameras.
 
 **How to finish:**
 
