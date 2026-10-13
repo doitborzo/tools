@@ -331,14 +331,27 @@ def extract_cvb(data, out, enc, args):
             continue
         have = {int(re.search(r"img_(\d+)", f).group(1)): os.path.join(fdir, f) for f in os.listdir(fdir)
                 if f.endswith(".jpg")}
-        need = sorted({n for tr in todo.values() for n, _, _ in tr if n in have})
-        imgs = dict(zip(need, pool.map(lambda n: np.asarray(Image.open(have[n]).convert("RGB")), need)))
+        by_frame = collections.defaultdict(list)                   # frame -> [(track, box)]
+        for tid, tr in todo.items():
+            for n, b, _ in tr:
+                if n in have:
+                    by_frame[n].append((tid, b))
+
+        def crops_of_frame(n):
+            # a 1080p frame is read, its cows cut out and the frame let go: memory is the crops only
+            img = np.asarray(Image.open(have[n]).convert("RGB"))
+            return n, {tid: crop(img, b, args.crop, args.margin) for tid, b in by_frame[n]}
+
+        cut = collections.defaultdict(dict)                        # track -> frame -> crop
+        for n, got in pool.map(crops_of_frame, sorted(by_frame)):
+            for tid, c in got.items():
+                cut[tid][n] = c
         group = "_".join(clip.split("_")[1:5])                     # the camera and the recording
         for tid, tr in todo.items():
-            tr = [x for x in tr if x[0] in imgs]
+            tr = [x for x in tr if x[0] in cut[tid]]
             if len(tr) < 2:
                 continue
-            crops = np.stack(list(pool.map(lambda x: crop(imgs[x[0]], x[1], args.crop, args.margin), tr)))
+            crops = np.stack([cut[tid][n] for n, _, _ in tr])
             times = np.array([(n - 1) / 30.0 for n, _, _ in tr], np.float32)
             lp = [label_of("cvb", b) for _, _, b in tr]
             labels = np.array([c for c, _ in lp])
