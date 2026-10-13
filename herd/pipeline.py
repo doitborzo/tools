@@ -238,6 +238,24 @@ class Models:
 
 # ------------------------------------------------------------------- camera
 
+def link_chains(stamped, iou_thr):
+    """A burst's detections [(t, [boxes])] in time order -> chains [{t: box}]: each box goes to the
+    chain whose last box overlaps it most (IoU >= iou_thr), the rest start chains of their own."""
+    chains = []
+    for ts, boxes in stamped:
+        used = set()
+        for ch in chains:
+            last_t = max(ch)
+            cands = [(iou(ch[last_t], b), j) for j, b in enumerate(boxes) if j not in used]
+            if cands:
+                v, j = max(cands)
+                if v >= iou_thr:
+                    ch[ts] = boxes[j]
+                    used.add(j)
+        chains += [{ts: b} for j, b in enumerate(boxes) if j not in used]
+    return chains
+
+
 _CROP_POOL = None
 
 
@@ -367,19 +385,8 @@ class Camera:
         t = time.perf_counter()
         detections = self.models.detect_many([self.blank(img) for _, img in sampled], kind="burst_detect")
         part["detect"] += time.perf_counter() - t
-        chains = []                                       # [{t: box}]
-        for (ts, img), found in zip(sampled, detections):
-            boxes = self.zone(found, img)
-            used = set()
-            for ch in chains:
-                last_t = max(ch)
-                cands = [(iou(ch[last_t], b), j) for j, b in enumerate(boxes) if j not in used]
-                if cands:
-                    v, j = max(cands)
-                    if v >= self.cfg["tracker"]["iou"]:
-                        ch[ts] = boxes[j]
-                        used.add(j)
-            chains += [{ts: b} for j, b in enumerate(boxes) if j not in used]
+        chains = link_chains([(ts, self.zone(found, img)) for (ts, img), found in zip(sampled, detections)],
+                             self.cfg["tracker"]["iou"])
         size = self.models.crop_size
         cows = crops_n = rum_yes = 0
         rum_p = []

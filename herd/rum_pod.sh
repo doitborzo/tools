@@ -9,6 +9,13 @@
 #   4. train: the transformer twice - frames only (WORK/rum/model) and frames + motion rhythm
 #      (WORK/rum/model_motion) - and a summary of both on the held-out recordings
 #
+#   bash herd/rum_pod.sh e2e      the whole system on CVB's val clips (tmux "herd-rum"): raw 1080p frames ->
+#                                 detector (DET=<best/>) -> chains -> crops -> DINOv2 -> the transformer on
+#                                 7 s bursts, against the annotation (rumination.py e2e): the model alone,
+#                                 the cows the detector found, and the whole system with its misses.
+#                                 Fetches CVB's val frames again if extract deleted them (~1.5 GB).
+#                                 RUM_MODEL (default WORK/rum/model_motion/rumination.pt), TILES=1 for
+#                                 the small far cows of a pasture, E2E_STRIDE=3.5 (a burst every N s)
 #   bash herd/rum_pod.sh          start in tmux "herd-rum"
 #   bash herd/rum_pod.sh log      follow it
 #   bash herd/rum_pod.sh stop
@@ -27,8 +34,9 @@ SESSION=herd-rum
 case "${1:-}" in
     log)  exec tail -n 100 -F "$LOG" ;;
     stop) tmux kill-session -t "=$SESSION" 2>/dev/null && echo "stopped $SESSION" || echo "$SESSION not running"; exit 0 ;;
+    e2e)  E2E=1 ;;
     "")   ;;
-    *)    echo "usage: $0 [log|stop]"; exit 2 ;;
+    *)    echo "usage: $0 [log|stop|e2e]"; exit 2 ;;
 esac
 
 if [ -z "${HERD_RUM_IN_TMUX:-}" ]; then
@@ -42,7 +50,7 @@ if [ -z "${HERD_RUM_IN_TMUX:-}" ]; then
     fi
     mkdir -p "$R"
     knobs=""
-    for v in WORK SOURCES CVB_STEP CVB_CLEAN EPOCHS MOTION; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
+    for v in WORK SOURCES CVB_STEP CVB_CLEAN EPOCHS MOTION E2E DET RUM_MODEL TILES E2E_STRIDE; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env HERD_RUM_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/rum_pod.sh"); echo; echo '[rumination finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log   ($LOG)"
@@ -60,6 +68,20 @@ export PATH="$HOME/.local/bin:$PATH"
 step "Environment (run_pod.sh step 1)"
 HERD_IN_TMUX=1 SETUP_ONLY=env WORK="$WORK" RUN=setup bash "$HERE/run_pod.sh"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
+
+if [ -n "${E2E:-}" ]; then
+    step "Whole system on CVB val: detector -> DINOv2 -> transformer"
+    [ -n "${DET:-}" ] && [ -f "$DET/det_train_meta.json" ] || { echo "!! DET=<the detector's best/> needed"; exit 1; }
+    RUM_MODEL="${RUM_MODEL:-$R/model_motion/rumination.pt}"
+    [ -f "$RUM_MODEL" ] || { echo "!! no $RUM_MODEL (RUM_MODEL=<rumination.pt>)"; exit 1; }
+    if grep -qs '"kind": *"rfdetr"' "$DET/det_train_meta.json"; then
+        "$PY" -c "import rfdetr" 2>/dev/null || uv pip install --python "$PY" rfdetr
+    fi
+    "$PY" "$HERE/rumination.py" fetch --data "$R" --sources cvb --cvb-split val --cvb-step "${CVB_STEP:-2}"
+    "$PY" "$HERE/rumination.py" e2e --data "$R" --model "$RUM_MODEL" --detector "$DET" \
+        --stride "${E2E_STRIDE:-3.5}" ${TILES:+--tiles "$TILES"}
+    exit 0
+fi
 
 step "Fetch ($SOURCES)"
 "$PY" "$HERE/rumination.py" fetch --data "$R" --sources "$SOURCES" --cvb-step "${CVB_STEP:-2}"

@@ -134,7 +134,7 @@ def fetch_kaggle(dest, workers=8, limit=0):
         json.dump({"clips": len(names), "url": KAGGLE_URL}, fh)
 
 
-def fetch_cvb(dest, workers=48, limit=0, step=1):
+def fetch_cvb(dest, workers=48, limit=0, step=1, split=None):
     """CVB's annotations, its train / val lists and the frames (every step-th) of every clip.
     225k single JPEGs: the store's signed links (valid 48 h) are used directly, many at a time."""
     out = os.path.join(dest, "cvb")
@@ -151,6 +151,15 @@ def fetch_cvb(dest, workers=48, limit=0, step=1):
     with open(lst) as fh:
         files = json.load(fh)
     clips = sorted({f["name"].split("/")[1] for f in files if f["name"].startswith("raw_frames/")})
+    if split:                                        # e.g. val only, for the whole-system test
+        lists = [f for f in files if f["name"].endswith(f"{split}_set_tasklist.csv")]
+        if lists:
+            p = os.path.join(out, lists[0]["name"])
+            if not os.path.exists(p):
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                _get(lists[0]["url"], p)
+            want = {c.strip() for c in open(p).read().replace("\n", ",").split(",") if c.strip()}
+            clips = [c for c in clips if c in want]
     if limit:
         clips = clips[::max(1, len(clips) // limit)][:limit]
     keep = set(clips)
@@ -184,7 +193,7 @@ def cmd_fetch(args):
         if s == "kaggle":
             fetch_kaggle(args.data, limit=args.limit)
         elif s == "cvb":
-            fetch_cvb(args.data, limit=args.limit, step=args.cvb_step)
+            fetch_cvb(args.data, limit=args.limit, step=args.cvb_step, split=args.cvb_split)
         else:
             sys.exit(f"unknown source {s}")
 
@@ -579,9 +588,183 @@ def cmd_train(args):
     return 0
 
 
+# -------------------------------------------------------- the whole system
+
+def load_rumination(path, dev):
+    import torch
+    from model import TemporalModel
+    rk = torch.load(path, map_location=dev, weights_only=False)
+    m = TemporalModel(rk["in_dim"], **rk["kw"]).to(dev).eval()
+    m.load_state_dict(rk["state"])
+    return m, rk
+
+
+def _box_at(track, n):
+    """A GT track [(frame, box, behaviour)] -> its box at frame n (the nearest annotated frame)."""
+    return min(track, key=lambda x: abs(x[0] - n))[1]
+
+
+def cmd_e2e(args):
+    """CVB's val clips through the barn's own chain: raw frames -> detector (burst_detect_fps a second)
+    -> boxes linked into chains (pipeline.link_chains) -> boxes for every frame -> crops -> DINOv2
+    -> the rumination transformer on the 7 s burst. Each annotated cow of a burst (its label as in
+    training) is matched to a chain (IoU >= 0.3 at mid-burst). Scored three ways:
+      oracle   the same model on the annotation's boxes - the model alone
+      found    the cows the detector found, on its boxes
+      system   every annotated cow: one the detector missed counts as "not ruminating"; a chain on no
+               annotated cow that says "ruminating" is a false alarm"""
+    import torch
+    import detect as detect_mod
+    import detector as det_mod
+    from cbvd_bursts import encode
+    from common import DEFAULTS, crop, interpolate_box
+    from model import FrameEncoder
+    from motion import motion_features
+    from PIL import Image
+    from pipeline import link_chains
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, rk = load_rumination(args.model, dev)
+    feats_meta, thr = rk["features"], (args.rum_threshold if args.rum_threshold is not None else rk["threshold"])
+    enc = FrameEncoder(feats_meta["encoder"], feats_meta["grid"]).to(dev).eval()
+    det = det_mod.Live(args.detector, args.threshold, tiles=args.tiles)
+    det_fps, link_iou = DEFAULTS["sampling"]["burst_detect_fps"], DEFAULTS["tracker"]["iou"]
+    size, margin = feats_meta["crop"], feats_meta["margin"]
+
+    def rumination_p(crops, times, valid):
+        x = torch.from_numpy(encode(enc, crops).astype(np.float32)).to(dev).unsqueeze(0)
+        t = torch.from_numpy(np.asarray(times, np.float32) - times[0]).to(dev).unsqueeze(0)
+        v = torch.from_numpy(np.asarray(valid, bool)).to(dev).unsqueeze(0)
+        mot = None
+        if model.motion_dim:
+            m, ok = motion_features(np.stack(crops), np.asarray(times) - times[0], valid)
+            mot = torch.from_numpy(m if ok else np.zeros_like(m)).to(dev).unsqueeze(0)
+        with torch.no_grad():
+            return float(torch.sigmoid(model(x, t, v, motion=mot)["rumination"])[0])
+
+    splits = cvb_split(args.data)
+    anns = sorted(glob.glob(os.path.join(args.data, "cvb", "annotations", "*", "annotations", "instances_default.json")))
+    anns = [a for a in anns if splits.get(a.split(os.sep)[-3]) == "val"
+            and os.path.isdir(os.path.join(args.data, "cvb", "raw_frames", a.split(os.sep)[-3]))]
+    if args.limit:
+        anns = anns[:args.limit]
+    if not anns:
+        sys.exit("no CVB val clip with frames: rumination.py fetch --sources cvb --cvb-split val")
+    print(f"[e2e] {len(anns)} CVB val clips; detector {det.name} (threshold {det.threshold}, tiles {det.tiles}); "
+          f"rumination threshold {thr}", flush=True)
+    rows, extras, det_ms = [], [], []
+    for k, ap in enumerate(anns, 1):
+        clip = ap.split(os.sep)[-3]
+        fdir = os.path.join(args.data, "cvb", "raw_frames", clip)
+        have = sorted((int(re.search(r"img_(\d+)", f).group(1)), os.path.join(fdir, f))
+                      for f in os.listdir(fdir) if f.endswith(".jpg"))
+        with open(ap) as fh:
+            tracks = cvb_tracks(json.load(fh))
+        times_all = np.array([(n - 1) / 30.0 for n, _ in have])
+        end = times_all[-1]
+        starts = list(np.arange(0.0, max(0.0, end - args.burst_s) + 1e-6, args.stride)) or [0.0]
+        cache = {}
+
+        def frame(n):
+            if n not in cache:
+                cache[n] = np.asarray(Image.open(dict(have)[n]).convert("RGB"))
+            return cache[n]
+
+        for s0 in starts:
+            fr = [(n, (n - 1) / 30.0) for n, _ in have if s0 <= (n - 1) / 30.0 < s0 + args.burst_s]
+            if len(fr) < 10:
+                continue
+            step = max(1, int(round(len(fr) / (args.burst_s * det_fps))))
+            sampled = fr[::step]
+            t = time.perf_counter()
+            found = det.many([Image.fromarray(frame(n)) for n, _ in sampled])
+            det_ms.append((time.perf_counter() - t) * 1000 / len(sampled))
+            chains = link_chains([(ts, [c["bbox"] for c in f]) for (_, ts), f in zip(sampled, found)], link_iou)
+            chains = [ch for ch in chains if len(ch) >= max(2, 0.5 * len(sampled))]
+            ts_all = [ts for _, ts in fr]
+            mid_n, mid_t = fr[len(fr) // 2]
+            # the annotated cows of this burst, labelled as in training
+            gts = []
+            for tid, tr in tracks.items():
+                inb = [x for x in tr if s0 <= (x[0] - 1) / 30.0 < s0 + args.burst_s]
+                if len(inb) < 2:
+                    continue
+                lp = [label_of("cvb", b) for _, _, b in inb]
+                w = windows(np.array([(n - 1) / 30.0 for n, _, _ in inb]), np.array([c for c, _ in lp]),
+                            np.array([p for _, p in lp]), length=args.burst_s + 1e-3)
+                if not w:
+                    continue
+                gts.append({"track": tid, "label": w[0][2], "box": _box_at(inb, mid_n), "frames": inb})
+            chain_mid = [interpolate_box(ch, mid_t) for ch in chains]
+            pairs = detect_mod.match(chain_mid, [g["box"] for g in gts], 0.3)
+            by_gt = {j: i for i, j, _ in pairs}
+            for j, g in enumerate(gts):
+                row = {"clip": clip, "start": round(float(s0), 2), "track": g["track"], "label": CLASSES[g["label"]],
+                       "ruminating": g["label"] == 0}
+                # oracle: the annotation's own boxes
+                gb = {(n - 1) / 30.0: b for n, b, _ in g["frames"]}
+                seen_n = {n for n, _, _ in g["frames"]}
+                valid = [n in seen_n for n, _ in fr]          # the frames the annotation boxes her in
+                crops = [crop(frame(n), interpolate_box(gb, ts), size, margin) for n, ts in fr]
+                row["p_oracle"] = rumination_p(crops, ts_all, valid)
+                if j in by_gt:
+                    ch = chains[by_gt[j]]
+                    lo, hi = min(ch), max(ch)
+                    valid = [lo - 0.5 <= ts <= hi + 0.5 for ts in ts_all]
+                    crops = [crop(frame(n), interpolate_box(ch, ts), size, margin) for n, ts in fr]
+                    row["p"] = rumination_p(crops, ts_all, valid)
+                else:
+                    row["p"] = None                  # the detector missed this cow in this burst
+                rows.append(row)
+            for i, ch in enumerate(chains):
+                if i in {a for a, _, _ in pairs}:
+                    continue
+                lo, hi = min(ch), max(ch)
+                valid = [lo - 0.5 <= ts <= hi + 0.5 for ts in ts_all]
+                crops = [crop(frame(n), interpolate_box(ch, ts), size, margin) for n, ts in fr]
+                extras.append({"clip": clip, "start": round(float(s0), 2), "p": rumination_p(crops, ts_all, valid)})
+        print(f"\r  {k}/{len(anns)} clips, {len(rows)} cow-bursts", end="", flush=True)
+    print(flush=True)
+
+    y = np.array([r["ruminating"] for r in rows])
+    found = np.array([r["p"] is not None for r in rows])
+    p_or = np.array([r["p_oracle"] for r in rows])
+    p_det = np.array([r["p"] if r["p"] is not None else 0.0 for r in rows])
+    res = {"clips": len(anns), "cow_bursts": len(rows), "ruminating": int(y.sum()), "threshold": thr,
+           "detector": os.path.abspath(args.detector), "detector_threshold": det.threshold, "tiles": det.tiles,
+           "detector_ms_per_frame": round(float(np.median(det_ms)), 1) if det_ms else None,
+           "found_share": float(found.mean()), "found_share_ruminating": float(found[y].mean()) if y.any() else None,
+           "oracle": scores(p_or, y, thr),
+           "found": scores(p_det[found], y[found], thr),
+           "system": scores(p_det, y, thr)}
+    fa = sum(e["p"] >= thr for e in extras)
+    s_ = res["system"]["at_threshold"]
+    tp, fp = s_["tp"], s_["fp"] + fa
+    pr = tp / (tp + fp) if tp + fp else 0.0
+    res["system_with_extra_chains"] = {"extra_chains": len(extras), "false_alarms": int(fa), "precision": pr,
+                                       "recall": s_["recall"],
+                                       "f1": 2 * pr * s_["recall"] / (pr + s_["recall"]) if pr + s_["recall"] else 0.0}
+    out = args.out or os.path.join(os.path.dirname(os.path.abspath(args.model)), "e2e_cvb.json")
+    with open(out, "w") as fh:
+        json.dump({**res, "rows": rows, "extras": extras}, fh, indent=1)
+    print(f"\n[e2e] {res['cow_bursts']} annotated cow-bursts ({res['ruminating']} ruminating), detector found "
+          f"{res['found_share']:.1%} of them ({(res['found_share_ruminating'] or 0):.1%} of the ruminating ones)")
+    print(f"{'':28s} {'precision':>9s} {'recall':>7s} {'F1':>6s} {'AUC':>6s}")
+    for name, key in (("model on annotated boxes", "oracle"), ("found cows, detector boxes", "found"),
+                      ("system (misses = not rum.)", "system")):
+        a = res[key]["at_threshold"]
+        auc = res[key]["auc"]
+        print(f"{name:28s} {a['precision']:9.1%} {a['recall']:7.1%} {a['f1']:6.3f} "
+              f"{('%6.3f' % auc) if auc is not None else '     -'}")
+    w = res["system_with_extra_chains"]
+    print(f"{'system + extra chains':28s} {w['precision']:9.1%} {w['recall']:7.1%} {w['f1']:6.3f}"
+          f"   ({w['false_alarms']} of {w['extra_chains']} chains on no annotated cow said ruminating)")
+    print(f"-> {out}")
+    return 0
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("stage", choices=("fetch", "extract", "train"))
+    p.add_argument("stage", choices=("fetch", "extract", "train", "e2e"))
     p.add_argument("--data", default="/workspace/rum")
     p.add_argument("--feat", default=None, help="extract: where to write (default <data>/feat); train: where to read")
     p.add_argument("--out", default=None)
@@ -590,6 +773,14 @@ def main(argv=None):
     p.add_argument("--cvb-step", type=int, default=2,
                    help="fetch: every N-th CVB frame (2: 15 fps, plenty for ~1 Hz chewing, half the 225k files)")
     p.add_argument("--cvb-clean", action="store_true", help="extract: delete a CVB clip's frames once done")
+    p.add_argument("--cvb-split", default=None, help="fetch: only this CVB split's frames (val: for e2e)")
+    p.add_argument("--model", default=None, help="e2e: rumination.pt")
+    p.add_argument("--detector", default=None, help="e2e: the detector's best/")
+    p.add_argument("--threshold", type=float, default=None, help="e2e: detector threshold (default its own)")
+    p.add_argument("--tiles", type=int, default=None, help="e2e: 1 whole frame + tiles (small far cows)")
+    p.add_argument("--rum-threshold", type=float, default=None, help="e2e: rumination threshold (default the model's)")
+    p.add_argument("--burst-s", type=float, default=7.0)
+    p.add_argument("--stride", type=float, default=3.5, help="e2e: a burst every N s of a clip")
     p.add_argument("--encoder", default="facebook/dinov2-small")
     p.add_argument("--grid", type=int, default=2)
     p.add_argument("--crop", type=int, default=224)
@@ -607,6 +798,10 @@ def main(argv=None):
     if args.stage == "extract":
         args.out = args.out or args.feat
         return cmd_extract(args)
+    if args.stage == "e2e":
+        if not args.model or not args.detector:
+            sys.exit("e2e needs --model <rumination.pt> --detector <best/>")
+        return cmd_e2e(args)
     if args.stage == "train":
         args.out = args.out or os.path.join(args.data, "model" + ("_motion" if args.motion else ""))
         return cmd_train(args)

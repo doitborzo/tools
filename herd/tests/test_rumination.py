@@ -78,3 +78,11 @@ def test_train_on_synthetic_sequences():
         ev = json.load(open(os.path.join(out, "eval.json")))
         assert ev["val"]["all"]["best"]["f1"] > 0.9
         assert os.path.exists(os.path.join(out, "rumination.pt"))
+
+
+def test_link_chains_as_the_barn():
+    from pipeline import link_chains
+    a, b = [0.1, 0.1, 0.3, 0.4], [0.6, 0.1, 0.8, 0.4]
+    shift = lambda x, d: [x[0] + d, x[1], x[2] + d, x[3]]
+    ch = link_chains([(0.0, [a, b]), (0.2, [shift(b, 0.01), shift(a, 0.01)]), (0.4, [shift(a, 0.02)])], 0.3)
+    assert len(ch) == 2 and sorted(len(c) for c in ch) == [2, 3]
