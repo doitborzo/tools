@@ -349,6 +349,8 @@ bash herd/run_pod.sh stress      # 5 cameras in real time on one GPU (~7 min)
 CAMERAS=20 RUN=run7 bash herd/run_pod.sh stress
 bash herd/run_pod.sh stop
 bash herd/run_pod.sh setup       # a new pod: the environment and CBVD-5 only
+bash herd/test_pod.sh            # a new pod: upload herd_models_*.tgz (+ herd_results_*.tgz) to WORK, then
+                                 # environment + CBVD-5, eval-det and the stress test on this GPU, a summary
 bash herd/export_pod.sh          # three archives in WORK/export: models (detectors' best/, RUN's
                                  # model.pt + abstain.json, DINOv2 from the HF cache), results, galleries
 ```
