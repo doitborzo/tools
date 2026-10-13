@@ -547,7 +547,7 @@ def cmd_train(args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             sched.step()
-            tot += float(loss)
+            tot += loss.item()
         ev, _ = evaluate(model, va, bool(args.motion), 0.5)
         f1s = [ev[s]["best"]["f1"] for s in ev if s != "all"]
         score = float(np.mean(f1s))                       # each source counts the same
