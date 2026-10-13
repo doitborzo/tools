@@ -1,25 +1,31 @@
 #!/usr/bin/env bash
-# A new pod, a trained herd: how good and how fast on this GPU (e.g. an RTX 2000 Ada, 16 GB).
+# A new pod, a trained herd: how good the detector is and how fast the whole chain runs on this GPU
+# (e.g. an RTX 2000 Ada, 16 GB). CBVD-5's labels are not used: its frames leave cows unboxed.
 #
-#   1. the environment and CBVD-5 (run_pod.sh's steps 1-2; CBVD-5 is downloaded here)
-#   2. the models from the archives export_pod.sh made, uploaded to WORK:
-#        herd_models_*.tgz   detectors' best/, RUN's model.pt + abstain.json, DINOv2 (hf-cache)
-#        herd_results_*.tgz  (optional) RUN's eval-val/results.jsonl: eval-det then also scores
-#                            the annotated boxes, for comparison
-#   3. the usual test: eval-det on CBVD-5 val (detector -> DINOv2 -> transformer, every threshold)
-#   4. the stress test: one burst alone, then CAMERAS cameras in real time (herd.py stress)
-#   5. a summary (GPU, detector, error, recall, keeps up or not) and herd_test_<gpu>_<date>.tgz
+#   1. the environment (run_pod.sh step 1)
+#   2. the models from herd_models_*.tgz (export_pod.sh) uploaded to WORK:
+#      the detectors' best/, RUN's model.pt + abstain.json, DINOv2 (hf-cache)
+#   3. the usual test - the detector on fully boxed frames: the valid frames of the public sets
+#      (SETS=zenodo,mmcows,opencows; only valid is downloaded), every detector unpacked side by
+#      side (extra_det.py eval), and a gallery of each set's worst frames for DET (show-dets)
+#   4. the stress test - detector -> DINOv2 -> transformer on CAMERAS cameras in real time:
+#      the barn's own videos when VIDEOS=<folder>, else CBVD-5's 50 val clips (248 MB, played as
+#      cameras only; their labels are not scored)
+#   5. a summary (GPU, recall / precision per set and detector, keeps up or not) and
+#      WORK/export/herd_test_<gpu>_<date>.tgz
 #
 #   bash herd/test_pod.sh          start in tmux "herd-test"
 #   bash herd/test_pod.sh log      follow it
 #   bash herd/test_pod.sh stop
 #
-# Knobs: WORK=/workspace  RUN=run9  DET=<a best/ folder> (default: the newest detector unpacked)
-#        CAMERAS=5  DURATION=300 (s measured)  THRESHOLD (default: the detector's own)
-#        TESTS="eval stress" (one of them to run only it)
+# Knobs: WORK=/workspace  RUN=run9  DET=<best/ for the stress test and the galleries> (default: newest)
+#        SETS=zenodo,mmcows,opencows  GALLERY=1  VIDEOS=<folder of videos>  CAMERAS=5
+#        DURATION=300 (s measured)  THRESHOLD (default: the detector's own)
+#        TESTS="detector stress" (one of them to run only it)
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(dirname "$HERE")"
 WORK="${WORK:-/workspace}"
 RUN="${RUN:-run9}"
 H="$WORK/herd"
@@ -44,7 +50,9 @@ if [ -z "${HERD_TEST_IN_TMUX:-}" ]; then
     fi
     mkdir -p "$H"
     knobs=""
-    for v in WORK RUN DET CAMERAS DURATION THRESHOLD TESTS MODELS; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
+    for v in WORK RUN DET CAMERAS DURATION THRESHOLD TESTS MODELS SETS GALLERY VIDEOS; do
+        knobs+="$v=$(printf '%q' "${!v:-}") "
+    done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env HERD_TEST_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/test_pod.sh"); echo; echo '[test finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log   ($LOG)"
@@ -54,20 +62,20 @@ fi
 mkdir -p "$H"
 exec > >(tee -a "$LOG") 2>&1
 step() { echo; echo "=== $*   [$(date '+%F %T')]"; }
-TESTS="${TESTS:-eval stress}"
-VENV="$H/.venv"
-PY="$VENV/bin/python"
-DATA="$WORK/cbvd5"
+TESTS="${TESTS:-detector stress}"
+SETS="${SETS:-zenodo,mmcows,opencows}"
+XDIR="$WORK/extra_det"
+PY="$H/.venv/bin/python"
 export PATH="$HOME/.local/bin:$PATH"
+STAMP="$(date +%Y%m%d_%H%M)"
 
 step "GPU"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || { echo "!! no GPU"; exit 1; }
 GPU="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 GTAG="$(echo "$GPU" | tr -c 'A-Za-z0-9' '_' | tr -s _ | sed 's/^_//; s/_$//')"
 
-step "Models from the uploaded archives"
-for a in ${MODELS:-$(ls -t "$WORK"/herd_models_*.tgz 2>/dev/null | head -1)} \
-         $(ls -t "$WORK"/herd_results_*.tgz 2>/dev/null | head -1); do
+step "Models from the uploaded archive"
+for a in ${MODELS:-$(ls -t "$WORK"/herd_models_*.tgz 2>/dev/null | head -1)}; do
     [ -f "$a" ] || continue
     echo "unpacking $a"
     tar -xzf "$a" -C "$WORK"
@@ -79,13 +87,13 @@ if [ -z "${DET:-}" ]; then
 fi
 [ -n "$DET" ] && [ -f "$DET/det_train_meta.json" ] || { echo "!! no detector best/ under $H (DET=<it>)"; exit 1; }
 DTAG="$(basename "$(dirname "$DET")")"
-echo "model    $H/$RUN/model.pt"
-echo "detector $DET"
-echo "detectors here: $(cd "$H" && ls -d detector_*/best 2>/dev/null | tr '\n' ' ')"
+echo "model     $H/$RUN/model.pt"
+echo "detector  $DET  (stress test, galleries)"
+echo "all detectors here: $(cd "$H" && ls -d detector_*/best 2>/dev/null | tr '\n' ' ')"
 
-step "Environment and CBVD-5 (run_pod.sh steps 1-2)"
-HERD_IN_TMUX=1 SETUP_ONLY=1 WORK="$WORK" RUN=setup bash "$HERE/run_pod.sh"
-if grep -q '"kind": *"rfdetr"' "$DET/det_train_meta.json"; then
+step "Environment (run_pod.sh step 1)"
+HERD_IN_TMUX=1 SETUP_ONLY=env WORK="$WORK" RUN=setup bash "$HERE/run_pod.sh"
+if grep -qs '"kind": *"rfdetr"' "$H"/detector_*/best/det_train_meta.json; then
     "$PY" -c "import rfdetr" 2>/dev/null || uv pip install --python "$PY" rfdetr
 fi
 export HF_HOME="$WORK/hf-cache"
@@ -95,48 +103,49 @@ fi
 "$PY" -c "import torch; p = torch.cuda.get_device_properties(0); print(f'torch {torch.__version__}, {p.name}, {p.total_memory / 2**30:.1f} GB, bf16 {torch.cuda.is_bf16_supported()}')"
 
 cd "$HERE"
-EOUT="$H/$RUN/eval-val-det-${DTAG}-${GTAG}"
+EOUT="$H/test_eval_extra_${GTAG}.json"
+GOUT="$H/test_galleries_${GTAG}"
 SOUT="$H/stress_${RUN}_${DTAG}_${GTAG}"
 thr=(); [ -n "${THRESHOLD:-}" ] && thr=(--threshold "$THRESHOLD")
 
-if [[ " $TESTS " == *" eval "* ]]; then
-    step "Usual test: eval-det on CBVD-5 val ($DTAG)"
-    "$PY" herd.py eval-det --run "$H/$RUN" --detector "$DET" --root "$DATA" --out "$EOUT" "${thr[@]}"
+if [[ " $TESTS " == *" detector "* ]]; then
+    step "Usual test: the detectors on the public sets' valid frames ($SETS)"
+    "$PY" "$REPO/cowbench/extra_det.py" fetch --dest "$XDIR" --sources "$SETS" --splits valid
+    dets=()
+    for b in "$H"/detector_*/best; do [ -f "$b/det_train_meta.json" ] && dets+=(--detector "$b"); done
+    "$PY" "$REPO/cowbench/extra_det.py" eval --data "$XDIR" --sources "$SETS" "${dets[@]}" --out "$EOUT"
+    if [ "${GALLERY:-1}" != "0" ]; then
+        for s in ${SETS//,/ }; do
+            "$PY" herd.py show-dets --src "$XDIR/$s/valid" --detector "$DET" --pick worst --max 100 \
+                --out "$GOUT/$s" "${thr[@]}"
+        done
+    fi
 fi
+
 if [[ " $TESTS " == *" stress "* ]]; then
     step "Stress test: ${CAMERAS:-5} cameras, ${DURATION:-300} s"
+    if [ -n "${VIDEOS:-}" ]; then
+        src=(--videos "$VIDEOS")
+    else
+        if [ ! -f "$WORK/cbvd5/annotations/ava_val_v2.1.csv" ] || [ -z "$(ls "$WORK"/cbvd5/videos/videos/*.mp4 2>/dev/null | head -1)" ]; then
+            "$PY" "$REPO/cowbench/extra_det.py" cbvd-videos --dest "$WORK/cbvd5"
+        fi
+        src=(--root "$WORK/cbvd5" --no-detector-check)
+    fi
     mkdir -p "$SOUT"
-    "$PY" herd.py stress --model "$H/$RUN/model.pt" --detector "$DET" --root "$DATA" \
-        --cameras "${CAMERAS:-5}" --duration "${DURATION:-300}" --out "$SOUT" "${thr[@]}"
+    # exit 1 means "does not keep up" - a result, not a failure of the script
+    "$PY" herd.py stress --model "$H/$RUN/model.pt" --detector "$DET" "${src[@]}" \
+        --cameras "${CAMERAS:-5}" --duration "${DURATION:-300}" --out "$SOUT" "${thr[@]}" || true
 fi
 
 step "Summary"
-SUM="$H/test_summary_${GTAG}_$(date +%Y%m%d_%H%M).md"
-"$PY" - "$GPU" "$DET" "$EOUT/eval_det.json" "$SOUT" "$SUM" <<'EOF'
-import glob, json, os, sys
-gpu, det, ev, sout, out = sys.argv[1:]
-lines = [f"# herd test on {gpu}", "", f"detector: `{det}`", ""]
-if os.path.exists(ev):
-    e = json.load(open(ev))
-    q, d = e["detector_quality"]["iou0.5"], e["on_detector_boxes"]
-    best = min(e["threshold_sweep"], key=lambda r: r["exact_error"])
-    lines += ["## Usual test (CBVD-5 val)", "",
-              f"- at the detector's threshold {e['threshold']}: recall {q['recall']:.1%}, precision {q['precision']:.1%} (IoU 0.5)",
-              f"- whole-path error {d['exact_error']:.1%} (posture {d['posture_error']:.1%}, activity {d['activity_error']:.1%}),"
-              f" on found cows {d['exact_error_found_cows']:.1%}",
-              f"- best threshold {best['threshold']}: error {best['exact_error']:.1%}, on found cows {best['exact_error_found_cows']:.1%}",
-              f"- detector {e['detector_quality'].get('ms_per_frame_p50')} ms a frame (p50)"]
-    if e.get("on_annotated_boxes"):
-        lines.append(f"- on the annotated boxes: error {e['on_annotated_boxes']['exact_error']:.1%}")
-    lines.append("")
-for f in sorted(glob.glob(os.path.join(sout, "*.md"))):
-    lines += [f"## Stress test ({os.path.basename(f)})", "", open(f, encoding="utf-8").read(), ""]
-open(out, "w", encoding="utf-8").write("\n".join(lines))
-print("\n".join(lines))
-EOF
+SUM="$H/test_summary_${GTAG}_${STAMP}.md"
+"$PY" "$HERE/test_summary.py" "$GPU" "$DET" "$EOUT" "$SOUT" "$SUM"
 mkdir -p "$WORK/export"
-T="$WORK/export/herd_test_${GTAG}_$(date +%Y%m%d_%H%M).tgz"
-(cd "$WORK" && tar -czf "$T" $(for p in "$SUM" "$EOUT" "$SOUT" "$LOG"; do [ -e "$p" ] && echo "${p#$WORK/}"; done))
+T="$WORK/export/herd_test_${GTAG}_${STAMP}.tgz"
+parts=()
+for p in "$SUM" "$EOUT" "$GOUT" "$SOUT" "$LOG"; do [ -e "$p" ] && parts+=("${p#"$WORK"/}"); done
+(cd "$WORK" && tar -czf "$T" "${parts[@]}")
 echo
 echo "summary: $SUM"
 echo "archive: $T   (scp -P <port> root@<ip>:$T .)"

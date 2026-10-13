@@ -26,6 +26,8 @@ authors' own fold 0 (opencows), so neighbouring frames never land on both sides.
 
     python cowbench/extra_det.py fetch --dest /workspace/extra_det --sources zenodo,mmcows,opencows
     python cowbench/extra_det.py eval  --data /workspace/extra_det --detector /workspace/herd/detector_rfdetr_large/best
+    python cowbench/extra_det.py fetch --dest /workspace/extra_det --splits valid     # a test pod: valid only
+    python cowbench/extra_det.py cbvd-videos --dest /workspace/cbvd5   # CBVD-5's val clips only, for the stress test
 """
 
 from __future__ import annotations
@@ -79,9 +81,15 @@ class RemoteZip:
         self.zip = zipfile.ZipFile(io.BufferedReader(_RangeFile(self), buffer_size=1 << 20))
 
     def _resolve(self):
-        req = urllib.request.Request(self.url, method="HEAD", headers=UA)
-        with urllib.request.urlopen(req, timeout=60) as r:
-            self.size, self.direct = int(r.headers["Content-Length"]), r.url   # after redirects
+        try:
+            req = urllib.request.Request(self.url, method="HEAD", headers=UA)
+            with urllib.request.urlopen(req, timeout=60) as r:
+                self.size, self.direct = int(r.headers["Content-Length"]), r.url   # after redirects
+        except urllib.error.HTTPError:
+            # some servers (Kaggle) answer HEAD with 404: one byte by GET, the size from Content-Range
+            req = urllib.request.Request(self.url, headers={**UA, "Range": "bytes=0-0"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                self.size, self.direct = int(r.headers["Content-Range"].split("/")[1]), r.url
 
     def get(self, start, end):
         """Bytes start..end (inclusive). Retries; a signed redirect that ran out is followed afresh."""
@@ -314,7 +322,7 @@ def write_coco(folder, items):
     return len(images), len(anns)
 
 
-def fetch(name, dest, every=8, max_side=1920, workers=8, fresh=False, limit=0):
+def fetch(name, dest, every=8, max_side=1920, workers=8, fresh=False, limit=0, splits=("train", "valid")):
     out = os.path.join(dest, name)
     done = os.path.join(out, "source.json")
     if os.path.exists(done) and not fresh:
@@ -331,6 +339,13 @@ def fetch(name, dest, every=8, max_side=1920, workers=8, fresh=False, limit=0):
     else:
         cv = next((n for n in names if n.endswith("10-fold-CV.json")), None)
         plan = plan_opencows(set(names), json.loads(rz.read(cv)) if cv else {})
+    if set(splits) != {"train", "valid"}:
+        # e.g. only valid, for a test pod: done.json is then written for what was fetched only
+        plan = [p for p in plan if p[0] in splits]
+        done = os.path.join(out, f"source_{'_'.join(splits)}.json")
+        if os.path.exists(done) and not fresh:
+            print(f"[extra] {name} ({', '.join(splits)}): done already ({out})")
+            return out
     if limit and len(plan) > limit:             # a trial: frames spread over the whole plan
         plan = plan[::len(plan) // limit][:limit]
     for split in ("train", "valid"):
@@ -366,19 +381,57 @@ def fetch(name, dest, every=8, max_side=1920, workers=8, fresh=False, limit=0):
     print(flush=True)
     counts = {}
     for split, it in items.items():
-        counts[split] = dict(zip(("images", "cows"), write_coco(os.path.join(out, split), it)))
+        if split in splits:                    # a split not fetched keeps what an earlier fetch wrote
+            counts[split] = dict(zip(("images", "cows"), write_coco(os.path.join(out, split), it)))
     meta = {"name": name, **src, "every": every if name == "mmcows" else None, "max_side": max_side,
             "frames_without_boxes_left_out": empty, **counts}
     with open(done, "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2)
-    print(f"[extra] {name}: train {counts['train']['images']} frames / {counts['train']['cows']} cows, "
-          f"valid {counts['valid']['images']} / {counts['valid']['cows']} -> {out}  ({src['licence']})")
+    print(f"[extra] {name}: " + ", ".join(f"{k} {v['images']} frames / {v['cows']} cows" for k, v in counts.items())
+          + f" -> {out}  ({src['licence']})")
     return out
 
 
 def cmd_fetch(args):
     for name in _sources(args.sources):
-        fetch(name, args.dest, args.every, args.max_side, args.workers, args.fresh, args.limit)
+        fetch(name, args.dest, args.every, args.max_side, args.workers, args.fresh, args.limit,
+              tuple(x.strip() for x in args.splits.split(",") if x.strip()))
+
+
+CBVD_URL = "https://www.kaggle.com/api/v1/datasets/download/fandaoerji/cbvd-5cow-behavior-video-dataset"
+
+
+def cmd_cbvd_videos(args):
+    """Only CBVD-5's val clips (and the annotation files that list them) from its 11.6 GB zip: the
+    stress test plays them as cameras; nothing is scored against their labels."""
+    dest = args.data
+    rz = RemoteZip(CBVD_URL)
+    names = rz.names()
+    csvs = [n for n in names if re.match(r"(.*/)?annotations/ava_(val|train)_v2\.1\.csv$", n)
+            and "mini" not in n]
+    os.makedirs(os.path.join(dest, "annotations"), exist_ok=True)
+    for n in csvs:
+        with open(os.path.join(dest, "annotations", os.path.basename(n)), "wb") as fh:
+            fh.write(rz.read(n))
+    val = {line.split(",")[0] for line in open(os.path.join(dest, "annotations", "ava_val_v2.1.csv"))
+           if line.strip()}
+    vids = [n for n in names if re.match(r"(.*/)?videos/videos/[^/]+\.mp4$", n)
+            and os.path.splitext(os.path.basename(n))[0] in val]
+    out = os.path.join(dest, "videos", "videos")
+    os.makedirs(out, exist_ok=True)
+
+    def one(n):
+        path = os.path.join(out, os.path.basename(n))
+        if not os.path.exists(path):
+            with open(path + ".part", "wb") as fh:
+                fh.write(rz.read(n))
+            os.replace(path + ".part", path)
+
+    with cf.ThreadPoolExecutor(args.workers) as ex:
+        for k, _ in enumerate(ex.map(one, vids), 1):
+            print(f"\r  {k}/{len(vids)} val clips", end="", flush=True)
+    print(flush=True)
+    print(f"[cbvd-videos] {len(vids)} val clips -> {out} (annotation files in {dest}/annotations)")
 
 
 def _sources(s):
@@ -459,7 +512,7 @@ def cmd_eval(args):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("stage", choices=("fetch", "eval"))
+    p.add_argument("stage", choices=("fetch", "eval", "cbvd-videos"))
     p.add_argument("--dest", "--data", dest="data", default="/workspace/extra_det")
     p.add_argument("--sources", default="zenodo,mmcows,opencows")
     p.add_argument("--every", type=int, default=8, help="mmcows: every N-th 15 s frame per camera")
@@ -467,6 +520,7 @@ def main(argv=None):
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--fresh", action="store_true")
     p.add_argument("--limit", type=int, default=0, help="fetch: a trial with this many frames per source")
+    p.add_argument("--splits", default="train,valid", help="fetch: valid only for a test pod")
     p.add_argument("--detector", action="append", default=[], help="eval: a best/ folder (several allowed)")
     p.add_argument("--calib", type=int, default=0, help="eval: 1 applies the detector's CBVD-5 box calibration")
     p.add_argument("--max-frames", type=int, default=600, help="eval: at most this many valid frames per source")
@@ -475,6 +529,8 @@ def main(argv=None):
     if args.stage == "fetch":
         args.dest = args.data
         cmd_fetch(args)
+    elif args.stage == "cbvd-videos":
+        cmd_cbvd_videos(args)
     else:
         if not args.detector:
             sys.exit("eval needs --detector <best/>")

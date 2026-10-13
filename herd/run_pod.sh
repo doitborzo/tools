@@ -248,6 +248,8 @@ if ! ready; then
 fi
 "$PY" -c "import torch; print('torch', torch.__version__, torch.cuda.get_device_name(0))"
 
+[ "${SETUP_ONLY:-}" = "env" ] && { echo; echo "setup done: environment ready"; exit 0; }
+
 step "2/10  CBVD-5 with its videos"
 # The LoRA runs only needed keyframes; bursts are cut from the 10 s, 25 fps clips.
 if [ ! -f "$DATA/annotations/ava_train_v2.1.csv" ] || [ ! -d "$DATA/labelframes" ] || [ ! -d "$DATA/videos/videos" ]; then

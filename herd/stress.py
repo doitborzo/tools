@@ -511,6 +511,9 @@ def main(argv=None):
     p.add_argument("--det-tiles", type=int, default=None, help="1: detector on the whole frame + tiles (~3x its work)")
     p.add_argument("--config", default=None, help="a barn TOML (optional): sampling, model, detector")
     p.add_argument("--root", default="/workspace/cbvd5")
+    p.add_argument("--videos", default=None,
+                   help="a folder of any videos to play as the cameras instead of CBVD-5's val clips "
+                        "(the detector check on annotated keyframes is then skipped)")
     p.add_argument("--cameras", type=int, default=5)
     p.add_argument("--duration", type=float, default=300, help="seconds measured")
     p.add_argument("--warmup", type=float, default=30)
@@ -525,10 +528,20 @@ def main(argv=None):
     p.add_argument("--keep", action="store_true", help="keep the store and gallery of an earlier test")
     args = p.parse_args(argv)
 
-    clips = busiest_clips(args.root)
-    if not clips:
-        sys.exit(f"no CBVD-5 val videos under {args.root}")
-    print(f"[stress] {len(clips)} val clips with video, up to {clips[0][1]} cows in a keyframe", flush=True)
+    if args.videos:
+        # any videos (the barn's own clips): the load test needs pictures, not labels
+        exts = (".mp4", ".avi", ".mkv", ".mov")
+        clips = [(os.path.join(r, f), 0) for r, _, fs in sorted(os.walk(args.videos)) for f in sorted(fs)
+                 if f.lower().endswith(exts)]
+        if not clips:
+            sys.exit(f"no videos under {args.videos}")
+        args.no_detector_check = True              # nothing annotated to check the detector against
+        print(f"[stress] {len(clips)} videos from {args.videos}", flush=True)
+    else:
+        clips = busiest_clips(args.root)
+        if not clips:
+            sys.exit(f"no CBVD-5 val videos under {args.root}")
+        print(f"[stress] {len(clips)} val clips with video, up to {clips[0][1]} cows in a keyframe", flush=True)
     cfg, models, shared, store = build(args)
     res = {"model": cfg["model"]["checkpoint"], "detector": cfg["detector"]["weights"],
            "detector_device": getattr(models.detector, "device", "?"),
