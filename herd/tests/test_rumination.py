@@ -32,6 +32,9 @@ def test_windows_agree_and_seen():
     assert r.windows(t, lab, post, hidden) == []
     short = r.windows(np.arange(100) / 25.0, np.zeros(100, int), np.full(100, -1))
     assert len(short) == 1 and short[0][2] == 0 and short[0][3] == -1
+    for n in (160, 170, 174, 175, 176):                          # 6.4-7.0 s: no gap between the two cases
+        w = r.windows(np.arange(n) / 25.0, np.zeros(n, int), np.zeros(n, int))
+        assert len(w) >= 1, n
 
 
 def test_cvb_tracks():

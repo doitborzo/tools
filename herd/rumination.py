@@ -200,7 +200,7 @@ def windows(times, labels, postures, seen=None, length=WINDOW_S, stride=STRIDE_S
     if len(times) == 0:
         return []
     out, t0, end = [], float(times[0]), float(times[-1])
-    if end - t0 < length * 0.9:                          # a short sequence: one window over all of it
+    if end - t0 < length:                                # a short sequence: one window over all of it
         starts = [t0]
         length = end - t0 + 1e-6
     else:
