@@ -352,6 +352,7 @@ bash herd/run_pod.sh setup       # a new pod: the environment and CBVD-5 only
 bash herd/test_pod.sh            # a new pod: upload herd_models_*.tgz to WORK, then the detectors on the
                                  # public sets' fully boxed valid frames + galleries, and the stress test
                                  # (VIDEOS=<barn videos>, else CBVD-5's val clips as cameras), a summary
+bash herd/rum_pod.sh             # rumination without CBVD-5: Kaggle + CVB -> DINOv2 every frame -> transformer
 bash herd/export_pod.sh          # three archives in WORK/export: models (detectors' best/, RUN's
                                  # model.pt + abstain.json, DINOv2 from the HF cache), results, galleries
 ```
@@ -558,6 +559,25 @@ hurts them less.
 **How to finish:** label rumination on the barn's footage (7 s pieces: ruminating /
 not; CVAT can do it as an activity) and fine-tune. If the jaw is not visible from
 above, feed a larger crop of the head and neck instead of the whole cow.
+
+**A rumination model without CBVD-5 (`herd/rumination.py`, `bash herd/rum_pod.sh`).**
+DINOv2-S embeds every frame of a cow's crop (the barn's own encoder settings: CLS +
+2 x 2 patch pool, 224 px, margin 0.1); a temporal transformer (`model.TemporalModel`,
+real times, so the chewing rhythm is never stretched) reads 7 s of them and says
+ruminating or not, the behaviour (rumination, feeding, drinking, resting, moving,
+other) and the posture. It learns on two sets at once:
+
+| set | where | what | labels |
+|---|---|---|---|
+| Kaggle "Beef Cattle Behavior" | barn, 1 camera, 6 cows, day + night | 4,337 clips of one cow, 10 s, 25 fps, 224 px | ruminate 1,544, lie 1,362, stand 638, eat 546, drink 247 |
+| CSIRO CVB (CC BY-NC-SA 4.0) | pasture | 502 clips, 15 s, 30 fps, 1080p, every cow boxed and tracked | 11 behaviours per frame, ruminating standing / lying among them |
+
+Validation never shares a recording with training (Kaggle: recording
+00000000514000000 and every 5th short sequence; CVB: its authors' lists). Two
+variants are trained, frames only and frames + the motion rhythm (motion.py), and
+compared per set (`WORK/rum/model*/eval.json`). CVB's cows are small (boxes ~70 px
+in 1080p), so its crops are upscaled; its 225k single frames are the slow download
+(`CVB_STEP=2` takes 15 fps).
 
 ### 8.6 Coat colour and NaN
 
