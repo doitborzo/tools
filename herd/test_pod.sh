@@ -98,6 +98,7 @@ if [ -z "${DET:-}" ]; then
 fi
 [ -n "$DET" ] && [ -f "$DET/det_train_meta.json" ] || { echo "!! no detector best/ under $H (DET=<it>)"; exit 1; }
 DTAG="$(basename "$(dirname "$DET")")"
+echo "tests     $TESTS; stress: ${CAMERAS:-5} cameras, ${DURATION:-300} s${VIDEOS:+, videos from $VIDEOS}"
 echo "model     $H/$RUN/model.pt"
 echo "detector  $DET  (stress test, galleries)"
 echo "all detectors here: $(cd "$H" && ls -d detector_*/best 2>/dev/null | tr '\n' ' ')"
@@ -116,7 +117,7 @@ fi
 cd "$HERE"
 EOUT="$H/test_eval_extra_${GTAG}.json"
 GOUT="$H/test_galleries_${GTAG}"
-SOUT="$H/stress_${RUN}_${DTAG}_${GTAG}"
+SOUT="$H/stress_${RUN}_${DTAG}_${GTAG}_${CAMERAS:-5}cam_${STAMP}"     # one folder per run: no older result mixes in
 thr=(); [ -n "${THRESHOLD:-}" ] && thr=(--threshold "$THRESHOLD")
 
 if [[ " $TESTS " == *" detector "* ]]; then
