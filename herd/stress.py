@@ -157,6 +157,8 @@ def build(args):
     cfg = copy.deepcopy(load_config(args.config))
     cfg["model"]["checkpoint"] = args.model or cfg["model"]["checkpoint"]
     cfg["detector"]["weights"] = args.detector or cfg["detector"]["weights"]
+    if args.rumination:
+        cfg["model"]["rumination"] = args.rumination     # rumination.py's model decides rumination
     if args.threshold is not None:
         cfg["detector"]["threshold"] = args.threshold
     if args.det_tiles is not None:
@@ -428,7 +430,10 @@ def fmt(d, k="p50", unit="", dd=2):
 def markdown(res):
     a, L, D = res.get("alone"), res.get("live"), res.get("detector_check")
     out = [f"# herd: one GPU, {L['cameras'] if L else '-'} cameras", "",
-           f"- model: `{res['model']}`", f"- detector: `{res['detector']}` on {res['detector_device']}"
+           f"- model: `{res['model']}`",
+           "- rumination model: " + (f"`{res['rumination_model']}`" if res.get("rumination_model")
+                                      else "the herd model's own head"),
+           f"- detector: `{res['detector']}` on {res['detector_device']}"
            + (", whole frame + tiles" if res.get("detector_tiles") else ""),
            f"- GPU: {res.get('gpu_name') or '-'}", ""]
     if D:
@@ -506,7 +511,9 @@ def markdown(res):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", default=None, help="herd checkpoint (model.pt)")
-    p.add_argument("--detector", default=None, help="RT-DETRv2 best/ folder")
+    p.add_argument("--detector", default=None, help="the detector's best/ folder (RT-DETRv2 or RF-DETR)")
+    p.add_argument("--rumination", default=None, help="rumination.py's rumination.pt (Kaggle + CVB): it decides "
+                                                       "rumination on every burst, as in the barn")
     p.add_argument("--threshold", type=float, default=None, help="detector score cut-off (eval-det's sweep picks one)")
     p.add_argument("--det-tiles", type=int, default=None, help="1: detector on the whole frame + tiles (~3x its work)")
     p.add_argument("--config", default=None, help="a barn TOML (optional): sampling, model, detector")
@@ -544,6 +551,7 @@ def main(argv=None):
         print(f"[stress] {len(clips)} val clips with video, up to {clips[0][1]} cows in a keyframe", flush=True)
     cfg, models, shared, store = build(args)
     res = {"model": cfg["model"]["checkpoint"], "detector": cfg["detector"]["weights"],
+           "rumination_model": cfg["model"].get("rumination") or None,
            "detector_device": getattr(models.detector, "device", "?"),
            "detector_tiles": bool(getattr(models.detector, "tiles", False)),
            "burst_seconds": cfg["sampling"]["burst_seconds"], "clips": len(clips),
