@@ -296,6 +296,73 @@ It is fitted on the dev clips (spoilt bursts included, when they have been made)
 cut-off is set so that at most `MAX_ERROR` (1% by default) of the answers given are
 wrong. "Not sure" is a NaN in the reports.
 
+### 4.8 One cow, one track across cameras (`mct.py`, `[mct]`)
+
+Without it each camera has its own IoU tracker: a cow walking from one camera to the
+next gets a new track, and the two tracks are joined only if the gallery names both.
+What holds even without `[mct]`:
+
+- **seen together = two cows.** Tracks one camera sees in the same second, and the
+  chains of one burst, are written to `cannot_link`. A burst's cows are matched to the
+  gallery together (best assignment, no cow twice), and a cow confirmed on one track
+  is held by it for `claim_s` (120 s): another track seen at the same time gets her
+  only with a burst surer by `claim_steal_margin` (0.08), else the next cow
+  (`claim-kept` events).
+- **new cows** are grouped by average linkage of whole tracks, never joining two
+  tracks seen together; with `max_cows` set (the herd's size) no new ids are made at
+  the limit — the bursts wait (`held_back_herd_full` in the nightly event).
+- a cow's split profile can be merged into another by an alias (`cow_aliases`;
+  `store.alias_cow` / `unalias_cow`, reversible); reports follow the aliases.
+
+With `[mct] enabled = true` one `GlobalTracker` serves all cameras. Every box gets a
+**frame id** (`FrameHeads.id`, one small head over the frame vector, taught by
+`herd.py frame-id --features F --out RUN` to point each frame at its own burst's
+fingerprint; the rest of the model is frozen and the old file is kept as
+`model.pre_frame_id.pt`). A box gets its global track (`gid`):
+
+1. from the same camera — IoU with the frame id (`w_iou`), and a cow hidden for up to
+   `reacquire_s` comes back near where she was if her frame id matches (`reacquire_sim`);
+2. from a neighbour (`neighbours` = pairs of cameras with shared floor) — a cow the
+   neighbour saw in the last `handover_s`, by frame id ≥ `handover_min_sim` and
+   `handover_margin` ahead of the next cow (otherwise a new track: two look-alikes are
+   not guessed). `handover_zone` (per camera, optional) is where that may happen;
+3. through a portal (`[[mct.portals]]`: a blind passage `from` → `to` taking `min_s` to
+   `max_s`) — at `handover_min_sim + portal_extra_sim`;
+4. otherwise a new `gid`.
+
+Each camera then tracks in its `tracking_mask` (overlapping its neighbours; default
+its `mask`) but writes seconds and bursts only for boxes in its own `mask`, so a cow in
+an overlap is counted once, under one track. Across cameras `cannot_link` is added only
+for `disjoint` pairs (cameras with no shared floor): without a floor map, one cow in an
+overlap is seen by two cameras at once. Handovers are logged in `track_handovers`.
+`frame-id` prints the frame-to-frame cosines (same cow p10 / two cows p90–p99):
+`handover_min_sim` and `reacquire_sim` go between them. Not yet: a floor map
+(homography from measured floor points) with a Kalman filter, a nightly merge of split
+profiles, cross-camera positives in training.
+
+**Checking it — MmCows** (`mct_eval.py`, `mct_pod.sh`): four synchronised cameras over
+one pen of 16 cows, a frame a second (7/25 12:00–15:00), each cow's number in every
+camera every 15 s. `bash herd/mct_pod.sh` (tmux `herd-mct`): the frame id head if the
+model has none (`FEATURES=` CBVD-5 train features, or `FRAME_ID=1` to fetch CBVD-5 and
+extract them), then `fetch` (`MINUTES=60`, up to 180), `embed` (GPU) and `score`:
+
+| measure | what it says |
+|---|---|
+| `idf1_camera` | IDF1 within each camera (one track per cow per camera) |
+| `idf1_global` | IDF1 over all cameras together — one track per cow across cameras |
+| `tracks_per_cow`, `id_switches_per_cow_hour` | how often a cow's track breaks |
+| `cross_cam_same_track` | a cow seen by two cameras at once: share on one track |
+| `false_merges` | two different cows on one track at the same second |
+| `false_cannot_link` | track pairs marked "two cows" that are one cow |
+| `enroll` | new cows from the tracks (7 s pseudo-bursts of frame ids), with and without `cannot_link`: cows made of 16, ids per cow, purity |
+
+The trackers compared: `iou` (the system without `[mct]`), `cam` (GlobalTracker per
+camera), `mct` (all four cameras neighbours), with the frame id (`fid/…`) and with
+DINOv2's CLS (`dino/…`, needs no training), and `mct@<s>` for a sweep of
+`handover_min_sim`. The 1 s frames show the neighbouring pens too; each camera is
+limited to its pen (the hull of its labelled cows), as a barn camera to its mask.
+MmCows is CC BY-NC-SA 4.0 — non-commercial.
+
 ---
 
 ## 5. Training on the pod (CBVD-5)
@@ -437,7 +504,11 @@ be checked on the barn's data.
    - `[model] checkpoint`, `[detector] weights` (and `threshold` from `eval-det`);
    - the working zone: `[zone] min_box_pct` and/or `min_box_side_px` (from `eval-det`'s
      size sweeps), section 4.0;
-   - `[store] path` — where the SQLite file, the gallery and the cache go.
+   - `[store] path` — where the SQLite file, the gallery and the cache go;
+   - `[identity] max_cows` — the herd's size (no new ids beyond it);
+   - several cameras over one herd: `[mct]` (section 4.8) — after `herd.py frame-id`,
+     `enabled = true`, `neighbours`, a `tracking_mask` per camera reaching into the
+     neighbour's floor, `portals` for blind passages.
 2. Run: `python herd/herd.py run --config barn.toml`. For recorded files instead of
    RTSP: `--start 2026-10-07T06:00` and `url` = the file's path.
 3. In the first days the gallery enrols the herd by itself (`new-<date>-<n>`). For ear
@@ -615,6 +686,8 @@ model sees fine detail: coat pattern, the jaw.
 | `abstain.py` | NaN model |
 | `gallery.py` | the cows: k-means centres, matching, enrolment, Tuesday, night |
 | `pipeline.py` | real time: cameras, detector, tracker, bursts, cache |
+| `mct.py` | one track per cow across cameras (GlobalTracker) |
+| `mct_eval.py`, `mct_pod.sh` | that tracker scored on MmCows' four cameras |
 | `store.py` | SQLite: seconds, bursts, events, alerts, verdicts |
 | `report.py` | days per cow, CSV, alerts, verdicts |
 | `eval_det.py` | the whole path on the detector's boxes, threshold sweep |
@@ -633,7 +706,10 @@ Store tables (`store.py`):
 - `bursts` — track and burst: the gallery's decision (`state`, `cow`, `sim`, `margin`,
   `p`), `rumination_p`, `ruminating`, burst posture and activity, lameness, frame
   quality;
-- `events` — enrolments, retirements, change-overs, nightly rebuilds;
+- `events` — enrolments, retirements, change-overs, nightly rebuilds, `claim-kept`;
+- `cannot_link` — track pairs seen at the same time (two cows); `cow_aliases` — one
+  cow's split profile merged into another; `track_handovers` — a track passed between
+  cameras (`overlap` / `portal`, with the frame id similarity);
 - `alerts`, `verdicts` — alerts and the vet's answers.
 
 ---

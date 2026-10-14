@@ -278,3 +278,46 @@ def test_frame_id_training_points_frames_at_their_burst():
         assert os.path.exists(os.path.join(run, "model.pre_frame_id.pt"))
         old, _ = mdl.HerdModel.load(os.path.join(run, "model.pre_frame_id.pt"))
         assert not old.frame_id
+
+
+def test_mct_eval_scores_one_track_across_cameras():
+    """Four cows under two cameras (the second sees the pen mirrored), labelled every 15 s: the per-camera
+    IoU tracker cannot join the cameras, mct must; cows hidden for a few seconds come back by frame id."""
+    import json as js
+    import mct_eval
+    rng = np.random.default_rng(10)
+    cows = {c: _unit(rng.normal(size=32)) for c in (1, 2, 3, 4)}
+    with tempfile.TemporaryDirectory() as d:
+        js.dump({"cams": ["cam_1", "cam_2"], "start_ts": 0, "end_ts": 300, "step": 1}, open(os.path.join(d, "meta.json"), "w"))
+        os.makedirs(os.path.join(d, "emb"))
+        for cam in ("cam_1", "cam_2"):
+            os.makedirs(os.path.join(d, "labels", cam))
+            T, N, B, F = [], [], [], []
+            for ts in range(300):
+                rows = []
+                for c, v in cows.items():
+                    x = 0.15 + 0.2 * (c - 1) + 0.03 * np.sin(ts / 40 + c)
+                    y = 0.5 + 0.2 * np.cos(ts / 50 + c)
+                    if cam == "cam_2":
+                        x = 1 - x
+                    box = [x - 0.06, y - 0.08, x + 0.06, y + 0.08]
+                    rows.append((c, box))
+                    hidden = cam == "cam_1" and c == 2 and 100 <= ts < 107
+                    if not hidden:
+                        B.append(box), F.append(_near(v, rng, 0.05))
+                T.append(ts), N.append(sum(1 for c, _ in rows if not (cam == "cam_1" and c == 2 and 100 <= ts < 107)))
+                if ts % 15 == 0:
+                    with open(os.path.join(d, "labels", cam, f"{1690304400 + ts}_12-00-00.txt"), "w") as fh:
+                        for c, b in rows:
+                            fh.write(f"{c} {(b[0] + b[2]) / 2} {(b[1] + b[3]) / 2} {b[2] - b[0]} {b[3] - b[1]}\n")
+            np.savez(os.path.join(d, "emb", f"{cam}.npz"), ts=np.array(T) + 1690304400, n=np.array(N),
+                     boxes=np.array(B, np.float32), cls=np.array(F, np.float16), fid=np.array(F, np.float16))
+        mct_eval.main(["score", "--data", d, "--min-bursts", "3", "--sweep", "0.6"])
+        r = js.load(open(os.path.join(d, "mct_eval.json")))
+        assert r["iou"]["cross_cam_same_track"] == 0.0 and r["iou"]["idf1_global"] < 0.7
+        m = r["fid/mct"]
+        assert m["cross_cam_same_track"] > 0.95 and m["idf1_global"] > 0.95, m
+        assert m["false_merges"] == 0 and m["false_cannot_link"] == 0
+        assert r["fid/cam"]["tracks_per_cow"] < r["iou"]["tracks_per_cow"]      # the hidden cow comes back
+        e = m["enroll"]["with_cannot_link"]
+        assert e["cows_made"] == 4 and e["purity"] == 1.0
