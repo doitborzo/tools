@@ -23,6 +23,7 @@
 #        SETS=zenodo,mmcows,opencows  GALLERY=1  VIDEOS=<folder of videos>  CAMERAS=5 (or "5 10 15")
 #        DURATION=300 (s measured)  THRESHOLD (default: the detector's own)
 #        TESTS="detector stress" (one of them to run only it)
+#        RUM_MODEL=<rumination.pt> (rumination.py, Kaggle + CVB): it decides rumination in the stress test
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,7 +52,7 @@ if [ -z "${HERD_TEST_IN_TMUX:-}" ]; then
     fi
     mkdir -p "$H"
     knobs=""
-    for v in WORK RUN DET CAMERAS DURATION THRESHOLD TESTS MODELS SETS GALLERY VIDEOS; do
+    for v in WORK RUN DET CAMERAS DURATION THRESHOLD TESTS MODELS SETS GALLERY VIDEOS RUM_MODEL; do
         knobs+="$v=$(printf '%q' "${!v:-}") "
     done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
@@ -101,7 +102,7 @@ fi
 DTAG="$(basename "$(dirname "$DET")")"
 CAMS="${CAMERAS:-5}"
 echo "tests     $TESTS; stress: ${CAMS// /, } cameras, ${DURATION:-300} s each${VIDEOS:+, videos from $VIDEOS}"
-echo "model     $H/$RUN/model.pt"
+echo "model     $H/$RUN/model.pt${RUM_MODEL:+   rumination: $RUM_MODEL}"
 echo "detector  $DET  (stress test, galleries)"
 echo "all detectors here: $(cd "$H" && ls -d detector_*/best 2>/dev/null | tr '\n' ' ')"
 
@@ -147,13 +148,14 @@ if [[ " $TESTS " == *" stress "* ]]; then
         src=(--root "$WORK/cbvd5" --no-detector-check)
     fi
     mkdir -p "$SOUT"
+    rum=(); [ -n "${RUM_MODEL:-}" ] && rum=(--rumination "$RUM_MODEL")
     first=1
     for n in $CAMS; do
         echo; echo "--- $n cameras"
         # the burst-alone part is the same for every count: once is enough
         alone=(); [ "$first" = 1 ] || alone=(--alone 0)
         # exit 1 means "does not keep up" - a result, not a failure of the script
-        "$PY" herd.py stress --model "$H/$RUN/model.pt" --detector "$DET" "${src[@]}" "${alone[@]}" \
+        "$PY" herd.py stress --model "$H/$RUN/model.pt" --detector "$DET" "${src[@]}" "${alone[@]}" "${rum[@]}" \
             --cameras "$n" --duration "${DURATION:-300}" --out "$SOUT" "${thr[@]}" || true
         first=0
     done

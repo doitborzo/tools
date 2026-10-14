@@ -18,6 +18,8 @@ frame_width = 1920              # Full HD kept as it comes (wider frames are sca
 
 [model]
 checkpoint = "/workspace/herd/run1/model.pt"     # abstain.json next to it is picked up
+# rumination = "/workspace/rum/model/rumination.pt"  # rumination.py's model (Kaggle + CVB): decides
+#                                                  # rumination in place of the herd model's head
 
 [detector]
 weights = "/workspace/lora-runs/detector/best"   # RT-DETRv2 (cowbench/detector.py)
