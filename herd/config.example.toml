@@ -77,6 +77,25 @@ every_n = 10                    # 60 cows, a burst a minute each: ~360 of ~3600 
 max_gb = 200                    # stop keeping when the folder reaches this
 folder = "training_cache"       # next to the store unless absolute
 
+[mct]                           # one track per cow across cameras (mct.py) - off until the model has
+enabled = false                 # its frame id head: herd.py frame-id --out <run> (prints the cosines
+                                # handover_min_sim / reacquire_sim go between)
+neighbours = []                 # camera pairs with a band of shared floor: [["cam1", "cam2"], ["cam2", "cam3"]]
+disjoint = []                   # pairs that share no floor at all: cows seen by both at once are two cows
+handover_s = 2.5                # a neighbour's cow seen this recently may be passed on
+handover_min_sim = 0.5          # frame id vs the track's running average, and at least
+handover_margin = 0.05          # this much above the next candidate (else a new track)
+reacquire_s = 10.0              # a cow hidden this long is taken back near where she was ...
+reacquire_sim = 0.7             # ... if her frame id is this close
+# a blind passage between two cameras: a cow lost by `from` min_s..max_s ago may come out in `to`
+# [[mct.portals]]
+# from = "cam2"
+# to = "cam5"
+# min_s = 5
+# max_s = 60
+# exit = [[0.8, 0.0], [1.0, 0.0], [1.0, 1.0], [0.8, 1.0]]   # optional: where she leaves `from`
+# entry = [[0.0, 0.0], [0.2, 0.0], [0.2, 1.0], [0.0, 1.0]]  # optional: where she enters `to`
+
 # One block per camera. The cameras look down and partly overlap: draw each
 # mask (0-1 frame coordinates, one polygon or a list of them) over the floor
 # that camera alone owns, so every patch of floor is in exactly one mask.
@@ -84,6 +103,10 @@ folder = "training_cache"       # next to the store unless absolute
 id = "cam1"
 url = "rtsp://user:password@10.0.0.11:554/stream1"
 mask = [[0.0, 0.0], [0.55, 0.0], [0.55, 1.0], [0.0, 1.0]]
+# with [mct] enabled: where it follows cows, reaching into the neighbour's floor (default: mask);
+# cows are still counted only in mask. handover_zone (optional): where a neighbour's cow may come in
+# tracking_mask = [[0.0, 0.0], [0.75, 0.0], [0.75, 1.0], [0.0, 1.0]]
+# handover_zone = [[0.45, 0.0], [0.75, 0.0], [0.75, 1.0], [0.45, 1.0]]
 # optional: a part of the view to grey out before the detector (one polygon or a list),
 # for what the size cut does not catch - e.g. a neighbour's pen behind a rail
 # exclude = [[0.0, 0.0], [1.0, 0.0], [1.0, 0.15], [0.0, 0.15]]

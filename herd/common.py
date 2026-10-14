@@ -61,6 +61,13 @@ DEFAULTS = {
     # `exclude` polygons (the far zone) are greyed out before the detector sees the
     # frame. Per camera the same keys override these. herd.py eval-det suggests values.
     "zone": {"min_box_pct": 0.0, "min_box_side_px": 0, "blank_excluded": True},
+    # one track per cow across cameras (mct.py), off by default: needs a model with the frame id
+    # head (herd.py frame-id). Cameras then track in their `tracking_mask` (overlapping the
+    # neighbours') and still count only in their `mask`.
+    "mct": {"enabled": False, "neighbours": [], "disjoint": [], "portals": [],
+            "w_iou": 0.65, "ema": 0.2,
+            "reacquire_s": 10.0, "reacquire_sim": 0.7, "reacquire_dist": 0.15,
+            "handover_s": 2.5, "handover_min_sim": 0.5, "handover_margin": 0.05, "portal_extra_sim": 0.08},
     "cameras": [],
 }
 
@@ -141,13 +148,17 @@ def zone_min_area(cam):
     return pct / 100.0 if pct else (cam.get("min_box_area") or 0.0)
 
 
-def in_zone(box, cam, w, h):
+def in_zone(box, cam, w, h, tracking=False):
     """The camera's working zone: its mask (box centre), outside its exclude
-    polygons (box centre), and big enough. A cow outside it is not tried at all."""
+    polygons (box centre), and big enough. A cow outside it is not tried at all.
+
+    tracking: the zone it tracks in (mct.py) - its `tracking_mask`, which may reach into the
+    neighbours' floor, so a cow is followed across the overlap; what it counts stays in_mask."""
     cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
     if any(in_polygon(cx, cy, p) for p in _polys(cam.get("exclude"))):
         return False
-    return in_mask(box, cam.get("mask")) and big_enough(box, w, h, zone_min_area(cam),
+    mask = (cam.get("tracking_mask") or cam.get("mask")) if tracking else cam.get("mask")
+    return in_mask(box, mask) and big_enough(box, w, h, zone_min_area(cam),
                                                           cam.get("min_box_side_px", 0))
 
 

@@ -104,3 +104,177 @@ def test_report_follows_cow_aliases():
         assert report.track_map(store) == {"trk": "A"}
         store.unalias_cow("new-1")
         assert report.track_map(store) == {"trk": "new-1"}
+
+
+# ------------------------------------------------------------------ stage B: one track across cameras
+
+def _mct_cfg(cams, **mct):
+    cfg = _cfg()
+    cfg["cameras"] = [dict({"id": c, "mask": []}, **extra) for c, extra in cams]
+    cfg["mct"].update(mct)
+    return cfg
+
+
+def _box(cx, cy=0.5, s=0.1):
+    return [cx - s, cy - s, cx + s, cy + s]
+
+
+def test_overlap_hands_a_cow_on_and_keeps_two_apart():
+    import mct
+    rng = np.random.default_rng(3)
+    A, B = _unit(rng.normal(size=64)), _unit(rng.normal(size=64))
+    gt = mct.GlobalTracker(_mct_cfg([("cam1", {}), ("cam2", {})], neighbours=[["cam1", "cam2"]]))
+    g = None
+    for k in range(5):                                       # A walks right in cam1
+        g1 = gt.update("cam1", float(k), [{"box": _box(0.5 + 0.08 * k), "emb": _near(A, rng)}])[0]
+        assert g is None or g1 == g
+        g = g1
+    # the overlap: cam2 sees her at its left edge while cam1 still has her, and B beside her
+    out = gt.update("cam2", 4.0, [{"box": _box(0.12), "emb": _near(A, rng)}, {"box": _box(0.5), "emb": _near(B, rng)}])
+    assert out[0] == g and out[1] != g
+    for k in range(5, 8):                                    # cam1 has lost her; cam2 follows by IoU
+        out = gt.update("cam2", float(k), [{"box": _box(0.12 + 0.05 * (k - 4)), "emb": _near(A, rng)}])
+        assert out[0] == g
+    assert gt.stats["overlap"] == 1
+
+
+def test_handover_refuses_a_look_alike_pair():
+    import mct
+    rng = np.random.default_rng(4)
+    A = _unit(rng.normal(size=64))
+    A2 = _unit(A + 0.02 * rng.normal(size=64))             # two cows the frame id cannot tell apart
+    gt = mct.GlobalTracker(_mct_cfg([("cam1", {}), ("cam2", {})], neighbours=[["cam1", "cam2"]]))
+    ga, gb = gt.update("cam1", 0.0, [{"box": _box(0.8, 0.3), "emb": A}, {"box": _box(0.8, 0.7), "emb": A2}])
+    out = gt.update("cam2", 1.0, [{"box": _box(0.1, 0.5), "emb": _near(A, rng, 0.01)}])
+    assert out[0] not in (ga, gb) and gt.stats["overlap_ambiguous"] == 1
+
+
+def test_portal_bridges_a_blind_passage_in_its_time_window():
+    import mct
+    rng = np.random.default_rng(5)
+    A = _unit(rng.normal(size=64))
+    cfg = _mct_cfg([("cam1", {}), ("cam3", {})],
+                   portals=[{"from": "cam1", "to": "cam3", "min_s": 5, "max_s": 30, "exit": [[0.7, 0], [1, 0], [1, 1], [0.7, 1]]}])
+    gt = mct.GlobalTracker(cfg)
+    g = gt.update("cam1", 0.0, [{"box": _box(0.85), "emb": A}])[0]
+    assert gt.update("cam3", 2.0, [{"box": _box(0.2), "emb": _near(A, rng)}])[0] != g      # too soon
+    gt2 = mct.GlobalTracker(cfg)
+    g = gt2.update("cam1", 0.0, [{"box": _box(0.85), "emb": A}])[0]
+    assert gt2.update("cam3", 12.0, [{"box": _box(0.2), "emb": _near(A, rng)}])[0] == g
+    gt3 = mct.GlobalTracker(cfg)
+    g = gt3.update("cam1", 0.0, [{"box": _box(0.85), "emb": A}])[0]
+    assert gt3.update("cam3", 45.0, [{"box": _box(0.2), "emb": _near(A, rng)}])[0] != g    # too late
+
+
+def test_reacquire_after_a_short_hide():
+    import mct
+    rng = np.random.default_rng(6)
+    A = _unit(rng.normal(size=64))
+    gt = mct.GlobalTracker(_mct_cfg([("cam1", {})]))
+    g = gt.update("cam1", 0.0, [{"box": _box(0.5), "emb": A}])[0]
+    gt.update("cam1", 1.0, [])
+    # back 7 s later (past max_age_s), a little further on: the same cow by her frame id
+    assert gt.update("cam1", 8.0, [{"box": _box(0.58), "emb": _near(A, rng, 0.02)}])[0] == g
+    assert gt.stats["reacquired"] == 1
+
+
+def test_disjoint_cameras_add_cannot_link():
+    import mct
+    rng = np.random.default_rng(7)
+    got = []
+    gt = mct.GlobalTracker(_mct_cfg([("cam1", {}), ("cam4", {})], disjoint=[["cam1", "cam4"]]),
+                           apart=lambda pairs, ts: got.extend(pairs))
+    a = gt.update("cam1", 10.0, [{"box": _box(0.5), "emb": _unit(rng.normal(size=8))}])[0]
+    b = gt.update("cam4", 10.2, [{"box": _box(0.5), "emb": _unit(rng.normal(size=8))}])[0]
+    assert (b, a) in got or (a, b) in got
+
+
+class _FakeModels:
+    """What Camera._second_global asks of the models: crops, encoder and frame heads, ids set by the test."""
+    crop_size, margin = 16, 0.1
+
+    def __init__(self):
+        self.ids = {}
+
+    def detect(self, img, **kw):
+        return self.boxes
+
+    def encode(self, crops, **kw):
+        return None
+
+    def frame_heads(self, feats, boxes, with_id=False, **kw):
+        n = len(boxes)
+        pp, pa = np.tile([0.9, 0.1], (n, 1)), np.tile([0.1, 0.1, 0.8], (n, 1))
+        return pp, pa, [self.ids[round((b[0] + b[2]) / 2, 2)] for b in boxes]
+
+
+def test_overlap_counts_every_second_once():
+    """Two cameras over one floor, each owning a half (mask) and tracking all of it (tracking_mask):
+    one cow walking across is one track and one row a second, whichever camera owns her."""
+    import mct
+    import pipeline
+    from store import Store
+    rng = np.random.default_rng(8)
+    A = _unit(rng.normal(size=64))
+    left, right = [[0, 0], [0.5, 0], [0.5, 1], [0, 1]], [[0.5, 0], [1, 0], [1, 1], [0.5, 1]]
+    whole = [[0, 0], [1, 0], [1, 1], [0, 1]]
+    # both cameras see the same floor in the same frame coordinates (the simplest overlap)
+    cams = [("cam1", {"mask": left, "tracking_mask": whole}), ("cam2", {"mask": right, "tracking_mask": whole})]
+    cfg = _mct_cfg(cams, enabled=True, neighbours=[["cam1", "cam2"]])
+    cfg["cameras"] = [dict(c, min_box_pct=0.0, min_box_side_px=0) for c in cfg["cameras"]]
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(os.path.join(d, "s.sqlite"))
+        shared = pipeline.SharedGallery(_gallery(d, {}), store, cfg, 0.0)
+        models = _FakeModels()
+        glob = mct.GlobalTracker(cfg, store, shared.separate)
+        cams_ = [pipeline.Camera(c, i, 2, cfg, models, shared, store, 0.0) for i, c in enumerate(cfg["cameras"])]
+        for c in cams_:
+            c.glob = glob
+        img = np.zeros((64, 64, 3), np.uint8)
+        for k in range(10):
+            cx = round(0.15 + 0.08 * k, 2)
+            models.boxes = [_box(cx)]
+            models.ids = {cx: _near(A, rng, 0.03)}
+            for c in cams_:
+                c.second(float(k), img)
+        rows = store.query("SELECT cam, track, ts FROM seconds ORDER BY ts")
+        assert [r[2] for r in rows] == [float(k) for k in range(10)]            # one row a second
+        assert len({r[1] for r in rows}) == 1                                   # one track
+        assert {r[0] for r in rows} == {"cam1", "cam2"}                          # owned by each in turn
+
+
+def test_frame_id_training_points_frames_at_their_burst():
+    import json as js
+    import model as mdl
+    import train
+    rng = np.random.default_rng(9)
+    dim, T = 24, 30
+    with tempfile.TemporaryDirectory() as d:
+        feat, run = os.path.join(d, "features"), os.path.join(d, "run")
+        tr = os.path.join(feat, "train")
+        os.makedirs(tr), os.makedirs(run)
+        js.dump({"dim": dim, "encoder": "x", "grid": 2, "crop": 224, "margin": 0.1}, open(os.path.join(tr, "meta.json"), "w"))
+        rows = []
+        for clip in range(10):
+            cows = rng.normal(size=(4, dim)) * 2
+            bf = np.stack([c + rng.normal(size=(T, dim)) * 0.7 for c in cows]).astype(np.float16)
+            bt = np.tile(np.arange(T, dtype=np.float32) / 25, (4, 1))
+            np.savez(os.path.join(tr, f"{clip}.npz"), burst_feats=bf, burst_times=bt, key_feats=np.zeros((0, dim), np.float16))
+            rows += [{"kind": "burst", "clip": str(clip), "i": i, "posture": 0, "activity": 2, "rumination": 0,
+                      "area": 0.05, "uids": []} for i in range(4)]
+            rows.append({"kind": "clip_done", "clip": str(clip)})
+        with open(os.path.join(tr, "index.jsonl"), "w") as fh:
+            fh.writelines(js.dumps(r) + "\n" for r in rows)
+        import torch
+        torch.manual_seed(0)
+        m = mdl.HerdModel(dim, d=32, layers=1, heads=2)
+        m.save(os.path.join(run, "model.pt"), {"crop_s": 0.5, "epoch": 1, "features": {"dim": dim},
+                                                 "dev_clips": ["0", "1"], "rum_threshold": 0.5})
+        train.main(["frame-id", "--features", feat, "--out", run, "--epochs", "8", "--P", "8", "--seed", "0"])
+        ev = js.load(open(os.path.join(run, "eval_frame_id.json")))
+        assert ev["frame_to_burst_top1_clip"] >= 0.8, ev
+        m2, ck = mdl.HerdModel.load(os.path.join(run, "model.pt"))
+        assert m2.frame_id and ck["dev_clips"] == ["0", "1"] and "frame_id" in ck
+        assert os.path.exists(os.path.join(run, "model.pre_frame_id.pt"))
+        old, _ = mdl.HerdModel.load(os.path.join(run, "model.pre_frame_id.pt"))
+        assert not old.frame_id

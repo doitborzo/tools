@@ -731,9 +731,155 @@ def cmd_eval(args):
     print(f"[eval] cowbench format: python cowbench/cowbench.py --out {os.path.join(args.out, 'eval-val')} score")
 
 
+# ---------------------------------------------------------------- frame id
+
+def frame_id_loss(z, fps, z_burst, fp_ident, temperature):
+    """Frames (N, D) of bursts z_burst against the batch's fingerprints (B, D): each frame's positives
+    are the fingerprints of its burst's identity (with barn data, every burst of that cow)."""
+    import torch
+    logp = (z @ fps.t() / temperature).log_softmax(1)
+    ident = torch.as_tensor(fp_ident, device=z.device)
+    pos = (ident[z_burst].unsqueeze(1) == ident.unsqueeze(0)).float()
+    return -(logp * pos).sum(1).div(pos.sum(1)).mean()
+
+
+def frame_id_eval(model, split, fps, k=4, seed=0):
+    """Every burst's k frames (random, fixed) -> frame id; how often the nearest fingerprint is the
+    frame's own burst's, among the bursts of its clip (the cows a camera sees at once) and among all;
+    and the mean cosine to its own fingerprint (what mct.py's thresholds stand on)."""
+    import torch
+    rng = np.random.default_rng(seed)
+    T = split.burst_feats.shape[1]
+    rows, owner = [], []
+    for i in range(len(split.bursts)):
+        for f in rng.choice(T, min(k, T), replace=False):
+            rows.append(split.burst_feats[i, f])
+            owner.append(i)
+    owner = np.array(owner)
+    model.eval()
+    with torch.no_grad():
+        z = torch.cat([model.frame(torch.from_numpy(np.stack(rows[j:j + 4096])).float().to(device()))["id"]
+                       for j in range(0, len(rows), 4096)]).cpu().numpy()
+    sim = z @ fps.T
+    own = sim[np.arange(len(owner)), owner]
+    clip = np.array([b["clip"] for b in split.bursts])
+    same = clip[owner][:, None] == clip[None, :]
+    ident = split.identity
+    top_all = ident[sim.argmax(1)] == ident[owner]
+    top_clip = ident[np.where(same, sim, -2).argmax(1)] == ident[owner]
+    other = np.where(same & (ident[None, :] != ident[owner][:, None]), sim, -2).max(1)
+    has_other = other > -2
+    # frame against frame - what mct.py compares (a frame id against a track's running average):
+    # the same cow (frames of one burst) and two cows seen together (one clip), for its thresholds
+    ff = z @ z.T
+    same_b = (owner[:, None] == owner[None, :]) & ~np.eye(len(owner), dtype=bool)
+    diff_c = (clip[owner][:, None] == clip[owner][None, :]) & (ident[owner][:, None] != ident[owner][None, :])
+    pct = lambda a, q: float(np.percentile(a, q)) if a.size else None
+    return {"frames": int(len(owner)), "frame_to_burst_top1_all": float(top_all.mean()),
+            "frame_to_burst_top1_clip": float(top_clip.mean()), "cos_own": float(own.mean()),
+            "cos_own_p10": float(np.percentile(own, 10)),
+            "cos_best_other_in_clip": float(other[has_other].mean()) if has_other.any() else None,
+            "frame_frame_same_cow_p10": pct(ff[same_b], 10), "frame_frame_same_cow_p50": pct(ff[same_b], 50),
+            "frame_frame_other_cow_p90": pct(ff[diff_c], 90), "frame_frame_other_cow_p99": pct(ff[diff_c], 99)}
+
+
+def cmd_frame_id(args):
+    """One frame -> the burst's fingerprint, for mct.py: the frame heads get an id head, taught to
+    point each frame at its own burst's fingerprint (InfoNCE against the other bursts of the batch).
+    Everything else is frozen - fingerprints, gallery and abstain.json stay as they were. The old
+    model.pt is kept as model.pre_frame_id.pt."""
+    import shutil
+
+    import torch
+    from model import HerdModel
+    path = os.path.join(args.out, "model.pt")
+    model, ck = HerdModel.load(path, map_location=device())
+    if not model.frame_id:
+        new = HerdModel(model.in_dim, **dict(model.kw, frame_id=True))
+        missing, unexpected = new.load_state_dict(model.state_dict(), strict=False)
+        assert not unexpected and all(k.startswith("frame.id.") for k in missing), (missing, unexpected)
+        model = new
+    model.to(device())
+    rng = random.Random(args.seed)
+    torch.manual_seed(args.seed)
+    tr_dir = os.path.join(args.features, "train")
+    dev_clips = set(ck["dev_clips"])
+    train = Split(tr_dir, set(clips_of(tr_dir)) - dev_clips)
+    dev = Split(tr_dir, dev_clips)
+    for folder in args.extra_train or []:
+        train.extend(Split(folder))
+    T = train.burst_times.shape[1] / FPS
+    print(f"[frame-id] fingerprints of {len(train.bursts)} train / {len(dev.bursts)} dev bursts "
+          f"(the temporal model, frozen)", flush=True)
+    fp_tr = embed(model, train, list(range(len(train.bursts))), T, {i: 0.0 for i in range(len(train.bursts))})["fingerprint"]
+    fp_dev = embed(model, dev, list(range(len(dev.bursts))), T, {i: 0.0 for i in range(len(dev.bursts))})["fingerprint"]
+    model.requires_grad_(False)
+    model.frame.id.requires_grad_(True)
+    opt = torch.optim.AdamW(model.frame.id.parameters(), lr=args.lr, weight_decay=0.05)
+    per_epoch = max(1, len(train.bursts) // args.P)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, args.lr, total_steps=args.epochs * per_epoch, pct_start=0.05)
+    sampler = identity_sampler(train, args.P, rng) if len(set(train.identity.tolist())) < len(train.bursts) \
+        else pk_sampler(train, args.P, rng)
+    nb = train.burst_feats.shape[1]
+    best, best_state, since_best = -1.0, None, 0
+    for epoch in range(args.epochs):
+        model.frame.id.train()
+        losses = []
+        for _ in range(per_epoch):
+            ids = next(sampler)
+            frames, owner = [], []
+            for k, i in enumerate(ids):
+                for f in rng.sample(range(nb), min(args.frames_per_burst, nb)):
+                    frames.append(train.burst_feats[i, f])
+                    owner.append(k)
+            if train.deg_idx is not None and args.degrade_p:
+                # a spoilt frame (another cow in front, mud, blur, dark) still points at its own cow
+                for k, i in enumerate(ids):
+                    d = np.where(train.deg_idx[i] >= 0)[0]
+                    if len(d) and rng.random() < args.degrade_p:
+                        f = int(rng.choice(d))
+                        frames.append(train.deg_feats[i][f])
+                        owner.append(k)
+            z = model.frame(torch.from_numpy(np.stack(frames)).float().to(device()))["id"]
+            fps = torch.from_numpy(fp_tr[ids]).float().to(device())
+            loss = frame_id_loss(z, fps, torch.as_tensor(owner, device=device()), train.identity[ids],
+                                 args.temperature)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            sched.step()
+            losses.append(float(loss.detach()))
+        m = frame_id_eval(model, dev, fp_dev)
+        print(f"[frame-id] epoch {epoch + 1}/{args.epochs}  loss {np.mean(losses):.3f}  dev frame -> own burst "
+              f"top-1 in clip {m['frame_to_burst_top1_clip']:.1%}, all {m['frame_to_burst_top1_all']:.1%}, "
+              f"cos own {m['cos_own']:.2f} (p10 {m['cos_own_p10']:.2f}) vs best other in clip "
+              f"{m['cos_best_other_in_clip'] or 0:.2f}", flush=True)
+        since_best += 1
+        if m["frame_to_burst_top1_clip"] > best:
+            best, since_best = m["frame_to_burst_top1_clip"], 0
+            best_state = {k: v.detach().clone() for k, v in model.frame.id.state_dict().items()}
+            best_m = dict(m, epoch=epoch + 1)
+        if since_best >= args.patience:
+            break
+    model.frame.id.load_state_dict(best_state)
+    backup = os.path.join(args.out, "model.pre_frame_id.pt")
+    if not os.path.exists(backup):
+        shutil.copy2(path, backup)
+    extra = {k: v for k, v in ck.items() if k not in ("in_dim", "kw", "state")}
+    extra["frame_id"] = best_m
+    model.save(path, extra)
+    write_json(os.path.join(args.out, "eval_frame_id.json"), best_m)
+    print(f"[frame-id] best epoch {best_m['epoch']}: top-1 in clip {best:.1%} -> {path} "
+          f"(previous model: {backup})", flush=True)
+    f = lambda k: "n/a" if best_m.get(k) is None else f"{best_m[k]:.2f}"
+    print(f"[frame-id] frame vs frame cosine: same cow p10 {f('frame_frame_same_cow_p10')} / median "
+          f"{f('frame_frame_same_cow_p50')}, two cows seen together p90 {f('frame_frame_other_cow_p90')} / p99 "
+          f"{f('frame_frame_other_cow_p99')} - [mct] handover_min_sim and reacquire_sim go between them", flush=True)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("stage", choices=("train", "eval"))
+    p.add_argument("stage", choices=("train", "eval", "frame-id"))
     p.add_argument("--features", default="/workspace/herd/features")
     p.add_argument("--out", default="/workspace/herd/run1")
     p.add_argument("--epochs", type=int, default=40)
@@ -763,9 +909,14 @@ def main(argv=None):
                    help="eval: barn feature folders (barn_dataset.py) - re-ID across tracks / days")
     p.add_argument("--motion", type=int, default=0,
                    help="1: the burst's rhythm (motion.py) to rumination and activity; needs herd.py motion")
+    p.add_argument("--frames-per-burst", type=int, default=4, help="frame-id: frames of each burst per step")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
-    {"train": cmd_train, "eval": cmd_eval}[args.stage](args)
+    if args.stage == "frame-id":
+        # its own defaults where train's do not fit: few epochs, one small head
+        args.epochs = args.epochs if "--epochs" in (argv or sys.argv) else 15
+        args.lr = args.lr if "--lr" in (argv or sys.argv) else 1e-3
+    {"train": cmd_train, "eval": cmd_eval, "frame-id": cmd_frame_id}[args.stage](args)
 
 
 if __name__ == "__main__":

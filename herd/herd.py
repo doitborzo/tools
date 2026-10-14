@@ -8,6 +8,7 @@ Training (on CBVD-5 today, on the barn's own footage later):
     herd.py degrade  --split train|val      spoilt burst frames (occlusion, mud, blur, dark), for --quality
     herd.py train                           temporal transformer + all heads on those vectors
     herd.py eval                            val scores + cowbench-format results
+    herd.py frame-id --out R                one frame -> its burst's fingerprint (mct.py tracks by it)
     herd.py eval-det --run R                the same on the detector's boxes: detector misses count
     herd.py calibrate --detector D          the detector's boxes reshaped to the annotation's habit
     herd.py show-dets --src DIR --detector D  every box a detector draws on a folder / video, as an HTML gallery
@@ -71,7 +72,7 @@ def main():
     if cmd in ("motion", "keys", "degrade"):
         import cbvd_bursts
         return cbvd_bursts.main([cmd] + argv)
-    if cmd in ("train", "eval"):
+    if cmd in ("train", "eval", "frame-id"):
         import train
         return train.main([cmd] + argv)
     if cmd == "calibrate":

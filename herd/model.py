@@ -78,9 +78,13 @@ class FrameHeads(nn.Module):
     """Posture and activity from one frame vector: the once-a-second path,
     which has no burst to look at."""
 
-    def __init__(self, in_dim, hidden=256, n_posture=2, n_activity=3, use_pos=False):
+    def __init__(self, in_dim, hidden=256, n_posture=2, n_activity=3, use_pos=False, frame_id=False):
         super().__init__()
         self.body = nn.Sequential(nn.LayerNorm(in_dim), nn.Linear(in_dim, hidden), nn.GELU(), nn.Dropout(0.1))
+        # One frame -> a vector in the burst fingerprint's space (train.py frame-id: taught to point
+        # at its own burst's fingerprint): what mct.py tracks a cow by every second, across cameras.
+        self.id = nn.Sequential(nn.LayerNorm(in_dim), nn.Linear(in_dim, 2 * hidden), nn.GELU(),
+                                nn.Linear(2 * hidden, ID_DIM)) if frame_id else None
         # Where the cow is in the frame (box centre and size). Cameras do not
         # move, so "at the feed barrier" is a place in the picture - context a
         # tight crop does not have and a wide crop pays for with the neighbours.
@@ -92,7 +96,10 @@ class FrameHeads(nn.Module):
         h = self.body(x)
         if self.pos is not None and pos is not None:
             h = h + self.pos(pos)
-        return {"posture": self.posture(h), "activity": self.activity(h)}
+        out = {"posture": self.posture(h), "activity": self.activity(h)}
+        if self.id is not None:
+            out["id"] = F.normalize(self.id(x), dim=-1)
+        return out
 
 
 class TemporalModel(nn.Module):
@@ -152,12 +159,16 @@ class TemporalModel(nn.Module):
 
 
 class HerdModel(nn.Module):
-    def __init__(self, in_dim, use_pos=False, **kw):
+    def __init__(self, in_dim, use_pos=False, frame_id=False, **kw):
         super().__init__()
         self.in_dim = in_dim
-        self.kw = dict(kw, use_pos=use_pos)
-        self.frame = FrameHeads(in_dim, use_pos=use_pos)
+        self.kw = dict(kw, use_pos=use_pos, frame_id=frame_id)
+        self.frame = FrameHeads(in_dim, use_pos=use_pos, frame_id=frame_id)
         self.temporal = TemporalModel(in_dim, use_pos=use_pos, **kw)
+
+    @property
+    def frame_id(self):
+        return self.frame.id is not None
 
     @property
     def motion_dim(self):

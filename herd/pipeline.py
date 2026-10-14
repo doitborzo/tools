@@ -18,6 +18,9 @@ nothing is analysed at 25 fps except bursts:
 
 Cameras see the barn from above and partly overlap: each camera's mask (in
 config) covers only the floor it owns, so a cow is counted by one camera.
+With [mct] enabled each camera tracks in its wider tracking_mask and one
+GlobalTracker (mct.py) gives a cow one track across cameras by her frame id;
+seconds and bursts are still written only by the camera whose mask owns her.
 
     python pipeline.py --config barn.toml                     # live, RTSP urls in config
     python pipeline.py --config barn.toml --start 2026-10-07T06:00:00   # files, as recorded at that time
@@ -38,7 +41,7 @@ import time
 
 import numpy as np
 
-from common import (ACTIVITIES, POSTURES, blank_excluded, crop, device, in_zone, interpolate_box, iou,
+from common import (ACTIVITIES, POSTURES, blank_excluded, crop, device, in_mask, in_zone, interpolate_box, iou,
                     load_config)
 from motion import motion_features
 
@@ -201,12 +204,16 @@ class Models:
                 self._sync()
         return torch.cat(out) if out else torch.zeros((0, self.encoder.out_dim), device=self.dev)
 
-    def frame_heads(self, feats, boxes, urgent=True, kind="heads"):
+    def frame_heads(self, feats, boxes, urgent=True, kind="heads", with_id=False):
+        """Posture and activity per box; with_id also the frame id (None without the head)."""
         from model import box_pos
         with self.gpu(urgent, kind), self.torch.no_grad():
             pos = self.torch.tensor([box_pos(b) for b in boxes], device=self.dev).float()
             o = self.model.frame(feats, pos)
-            return o["posture"].softmax(-1).cpu().numpy(), o["activity"].softmax(-1).cpu().numpy()
+            pp, pa = o["posture"].softmax(-1).cpu().numpy(), o["activity"].softmax(-1).cpu().numpy()
+            if not with_id:
+                return pp, pa
+            return pp, pa, (o["id"].float().cpu().numpy() if "id" in o else [None] * len(boxes))
 
     def burst(self, feats, times, valid, boxes, motion=None, urgent=False, kind="temporal"):
         from model import box_pos
@@ -299,6 +306,7 @@ class Camera:
         self.stats = collections.Counter()
         self.timings = None          # a list to record every tick and burst into (stress.py)
         self.cache = None            # barn_dataset.TrainingCache, when [training_cache] enabled
+        self.glob = None             # mct.GlobalTracker, when [mct] enabled: one track per cow across cameras
 
     def push(self, ts, frame_rgb):
         h, w = frame_rgb.shape[:2]
@@ -318,7 +326,7 @@ class Camera:
         """Boxes in the camera's working zone; the rest (far, too small, another
         camera's floor) are dropped here and never tracked or identified."""
         h, w = img.shape[:2]
-        keep = [b for b in boxes if in_zone(b, self.cam, w, h)]
+        keep = [b for b in boxes if in_zone(b, self.cam, w, h, tracking=self.glob is not None)]
         self.stats["boxes_outside_zone"] += len(boxes) - len(keep)
         return keep
 
@@ -362,6 +370,8 @@ class Camera:
     def second(self, ts, img):
         start = time.time()
         boxes = self.zone(self.models.detect(self.blank(img), urgent=True, kind="second_detect"), img)
+        if self.glob is not None:
+            return self._second_global(ts, img, boxes, start)
         with self.trk_lock:
             tracked = self.tracker.update(ts, boxes)
         if len(tracked) > 1 and hasattr(self.gallery, "together"):
@@ -377,6 +387,36 @@ class Camera:
         self.stats["seconds"] += 1
         self.stats["cow_seconds"] += len(tracked)
         self._time("second", ts, start=start, end=time.time(), cows=len(tracked))
+
+    def _second_global(self, ts, img, boxes, start):
+        """The second with mct.py: every box in the tracking zone is encoded first, its frame id
+        carries the cow from camera to camera; only the boxes this camera owns (its mask) are
+        counted, so a cow in an overlap is one row, under one track, whichever camera sees her."""
+        rows, owned_n = [], 0
+        if boxes:
+            feats = self.models.encode(crops_of([(img, b) for b in boxes], self.models.crop_size, self.models.margin),
+                                       urgent=True, kind="second_encode")
+            pp, pa, ids = self.models.frame_heads(feats, boxes, with_id=True)
+            gids = self.glob.update(self.id, ts, [{"box": b, "emb": e} for b, e in zip(boxes, ids)])
+            if len(gids) > 1 and hasattr(self.gallery, "together"):
+                self.gallery.together(gids, ts)                     # one camera, one second: all different
+            for gid, b, p, a in zip(gids, boxes, pp, pa):
+                if in_mask(b, self.mask):
+                    rows.append((self.id, gid, ts, *b, POSTURES[int(p.argmax())], ACTIVITIES[int(a.argmax())],
+                                 float(p[POSTURES.index("lying")])))
+            owned_n = len(rows)
+            if rows:
+                self.store.seconds(rows)
+        self.stats["seconds"] += 1
+        self.stats["cow_seconds"] += owned_n
+        self.stats["cow_seconds_tracked_not_owned"] += len(boxes) - owned_n
+        self._time("second", ts, start=start, end=time.time(), cows=owned_n)
+
+    def _track_of(self, ts, box):
+        if self.glob is not None:
+            return self.glob.track_at(self.id, ts, box)
+        with self.trk_lock:
+            return self.tracker.track_at(ts, box)
 
     # 7 s at 25 fps
     def burst(self, t0, frames):
@@ -398,8 +438,9 @@ class Camera:
                 continue
             times = sorted(ch)
             mid = times[len(times) // 2]
-            with self.trk_lock:
-                tid = self.tracker.track_at(mid, ch[mid]) or f"{self.id}-burst-{int(t0)}-{times[0]:.0f}"
+            if self.glob is not None and not in_mask(ch[mid], self.mask):
+                continue                                  # tracked here, counted by the camera that owns it
+            tid = self._track_of(mid, ch[mid]) or f"{self.id}-burst-{int(t0)}-{times[0]:.0f}"
             valid = np.array([times[0] - 0.5 <= ts <= times[-1] + 0.5 for ts, _ in frames])
             boxes = [interpolate_box(ch, ts) for ts, _ in frames]
             t = time.perf_counter()
@@ -493,6 +534,15 @@ class SharedGallery:
             if self._pending_links and (len(self._pending_links) >= 500 or ts - self._last_flush >= 60):
                 self.store.add_cannot_link(self._pending_links, ts)
                 self._pending_links, self._last_flush = [], ts
+
+    def separate(self, pairs, ts):
+        """Pairs of tracks seen at the same moment (cameras with no floor in common): two cows each."""
+        with self.lock:
+            for a, b in pairs:
+                k = (min(a, b), max(a, b))
+                if a != b and k not in self.cannot_link:
+                    self.cannot_link.add(k)
+                    self._pending_links.append(k)
 
     def apart(self, a, b):
         return a != b and (min(a, b), max(a, b)) in self.cannot_link
@@ -617,6 +667,14 @@ def run(cfg, start=None, models=None, max_wall_s=None):
     models = models or Models(cfg)
     cams = [Camera(c, i, len(cfg["cameras"]), cfg, models, shared, store, start_ts)
             for i, c in enumerate(cfg["cameras"])]
+    if cfg["mct"]["enabled"]:
+        from mct import GlobalTracker
+        if not models.model.frame_id:
+            print("[run] [mct] enabled, but the model has no frame id head (herd.py frame-id --out <run>): "
+                  "cows are followed by their boxes within a camera only", flush=True)
+        glob = GlobalTracker(cfg, store, shared.separate)
+        for cam in cams:
+            cam.glob = glob
     if cfg["training_cache"]["enabled"]:
         from barn_dataset import TrainingCache
         meta = dict(models.features_meta, dim=models.features_meta.get("dim") or models.encoder.out_dim)
