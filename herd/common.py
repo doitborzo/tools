@@ -38,7 +38,14 @@ DEFAULTS = {
     "detector": {"weights": "", "threshold": None, "tiles": None},   # None: as the detector was trained
     "tracker": {"iou": 0.3, "max_age_s": 5},
     "identity": {"prototypes_per_cow": 6, "history_days": 7, "max_error": 0.01,
-                 "new_cow_similarity": 0.55, "new_cow_min_bursts": 20, "retire_after_hours": 48},
+                 "new_cow_similarity": 0.55, "new_cow_min_bursts": 20, "retire_after_hours": 48,
+                 # the herd's size (0: no limit): at it, no new ids are made - unknown bursts wait in the pool
+                 "max_cows": 0,
+                 # nightly merge of one cow's split profiles (gallery.deduplicate)
+                 "merge_similarity": 0.68, "merge_max_conflict_rate": 0.005,
+                 # a cow's claim by a track holds this long; a track seen at the same time
+                 # elsewhere takes it only with a clearly better burst
+                 "claim_s": 120.0, "claim_steal_margin": 0.08},
     "lameness": {"enabled": False},
     "alerts": {"baseline_days": 7, "min_baseline_days": 3, "min_observed_minutes": 120,
                "mad_z": 3.0, "rumination_drop": 0.20, "lying_directions": ["low", "high"],

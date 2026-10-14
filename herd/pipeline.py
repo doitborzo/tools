@@ -364,6 +364,8 @@ class Camera:
         boxes = self.zone(self.models.detect(self.blank(img), urgent=True, kind="second_detect"), img)
         with self.trk_lock:
             tracked = self.tracker.update(ts, boxes)
+        if len(tracked) > 1 and hasattr(self.gallery, "together"):
+            self.gallery.together([tid for tid, _ in tracked], ts)     # one camera, one second: all different
         if tracked:
             size = self.models.crop_size
             feats = self.models.encode(crops_of([(img, b) for _, b in tracked], size, self.models.margin),
@@ -390,6 +392,7 @@ class Camera:
         size = self.models.crop_size
         cows = crops_n = rum_yes = 0
         rum_p = []
+        done = []                                   # the burst's cows, decided together below
         for ch in chains:
             if len(ch) < max(2, 0.5 * len(sampled)):      # seen in too little of the burst
                 continue
@@ -418,25 +421,34 @@ class Camera:
             t = time.perf_counter()
             out = self.models.burst(feats, rel, valid, boxes, motion)
             part["temporal"] += time.perf_counter() - t
-            t = time.perf_counter()
             area = float(np.mean([(b[2] - b[0]) * (b[3] - b[1]) for b in ch.values()]))
-            decision = self.gallery.decide(out, area, t0, tid)
-            self.store.burst((self.id, tid, t0, decision["state"], decision["cow"], decision["sim"],
-                              decision["margin"], decision["p"], out["rumination"], out["posture"],
-                              out["activity"], out["lameness"], out["quality_max"], int(valid.sum()),
-                              int(out["ruminating"])))
-            part["gallery"] += time.perf_counter() - t
-            if self.cache is not None:
-                from model import box_pos
-                self.cache.add(self.id, tid, t0, feats.float().cpu().numpy(), rel, valid, motion,
-                               np.mean([box_pos(b) for b in boxes], 0), crops[len(crops) // 2],
-                               {"state": decision["state"], "cow": decision["cow"], "sim": decision["sim"],
-                                "p": decision["p"], "area": area})
+            # kept until the burst's decision: only what the training cache needs, not every crop
+            keep_feats = feats.float().cpu().numpy() if self.cache is not None else None
+            done.append((tid, out, area, keep_feats, rel, valid, motion, boxes, crops[len(crops) // 2]))
             cows += 1
             crops_n += len(crops)
             rum_p.append(round(out["rumination"], 3))
             rum_yes += out["ruminating"]
+        # the burst's cows are decided together: they were all there at once, so no cow twice
+        t = time.perf_counter()
+        if len(done) > 1 and hasattr(self.gallery, "together"):
+            self.gallery.together([d[0] for d in done], t0)
+        decisions = (self.gallery.decide_batch([(d[1], d[2], d[0]) for d in done], t0)
+                     if hasattr(self.gallery, "decide_batch") else
+                     [self.gallery.decide(d[1], d[2], t0, d[0]) for d in done])
+        for (tid, out, area, feats, rel, valid, motion, boxes, mid_crop), decision in zip(done, decisions):
+            self.store.burst((self.id, tid, t0, decision["state"], decision["cow"], decision["sim"],
+                              decision["margin"], decision["p"], out["rumination"], out["posture"],
+                              out["activity"], out["lameness"], out["quality_max"], int(valid.sum()),
+                              int(out["ruminating"])))
+            if self.cache is not None:
+                from model import box_pos
+                self.cache.add(self.id, tid, t0, feats, rel, valid, motion,
+                               np.mean([box_pos(b) for b in boxes], 0), mid_crop,
+                               {"state": decision["state"], "cow": decision["cow"], "sim": decision["sim"],
+                                "p": decision["p"], "area": area})
             self.stats[f"id_{decision['state']}"] += 1
+        part["gallery"] += time.perf_counter() - t
         self.stats["bursts"] += 1
         self._time("burst", t0, start=start, end=time.time(), ready=t0 + self.burst_s, frames=len(frames),
                    detected=len(sampled), chains=len(chains), cows=cows, crops=crops_n,
@@ -445,12 +457,22 @@ class Camera:
 
 
 class SharedGallery:
-    """The gallery behind a lock, with the nightly job and the weekly change-over."""
+    """The gallery behind a lock, with the nightly job and the weekly change-over.
+
+    It also keeps who-was-where-when: tracks seen at the same moment are two cows (cannot_link,
+    from each camera's tracker and from the chains of one burst), and a cow confirmed on one
+    track is that track's for claim_s - another track seen at the same time cannot be the same
+    cow unless its burst is clearly surer (claim_steal_margin); otherwise that cow is ruled out
+    for it and the next one is tried."""
 
     def __init__(self, gallery, store, cfg, start_ts):
         self.g, self.store, self.cfg = gallery, store, cfg
         self.lock = threading.Lock()
         self.next_nightly = self._next_hour(start_ts, cfg["farm"]["nightly_hour"])
+        self.cannot_link = set(store.cannot_link_pairs(start_ts - cfg["identity"]["history_days"] * 86400)) \
+            if hasattr(store, "cannot_link_pairs") else set()
+        self._pending_links, self._last_flush = [], start_ts
+        self.claims = {}                         # cow -> (track, ts, p or sim)
 
     def _next_hour(self, ts, hour):
         tz = dt.timezone(dt.timedelta(hours=self.cfg["farm"]["timezone_offset_hours"]))
@@ -459,17 +481,63 @@ class SharedGallery:
             t += dt.timedelta(days=1)
         return t.timestamp()
 
-    def decide(self, out, area, ts, track):
+    def together(self, tracks, ts):
+        """Tracks seen at the same moment: every pair is two different cows."""
+        tracks = sorted(set(tracks))
         with self.lock:
-            if self.g.migration_due(ts):
-                self.store.event(ts, "change-over", "weekly cow change-over started")
-            if ts >= self.next_nightly:
-                res = self.g.nightly(ts)
-                self.store.event(ts, "nightly", json.dumps(res))
-                self.next_nightly = self._next_hour(ts, self.cfg["farm"]["nightly_hour"])
-            d = self.g.match(out["fingerprint"], out["quality_max"], out["quality_mean"], area)
-            self.g.observe(d, out["fingerprint"], ts, track)
-            return d
+            for i, a in enumerate(tracks):
+                for b in tracks[i + 1:]:
+                    if (a, b) not in self.cannot_link:
+                        self.cannot_link.add((a, b))
+                        self._pending_links.append((a, b))
+            if self._pending_links and (len(self._pending_links) >= 500 or ts - self._last_flush >= 60):
+                self.store.add_cannot_link(self._pending_links, ts)
+                self._pending_links, self._last_flush = [], ts
+
+    def apart(self, a, b):
+        return a != b and (min(a, b), max(a, b)) in self.cannot_link
+
+    def _maintain(self, ts):
+        if self.g.migration_due(ts):
+            self.store.event(ts, "change-over", "weekly cow change-over started")
+        if ts >= self.next_nightly:
+            res = self.g.nightly(ts, self.cannot_link)
+            self.store.event(ts, "nightly", json.dumps(res))
+            self.next_nightly = self._next_hour(ts, self.cfg["farm"]["nightly_hour"])
+        hold = self.cfg["identity"].get("claim_s", 120.0)
+        self.claims = {c: v for c, v in self.claims.items() if ts - v[1] <= hold}
+
+    def decide_batch(self, items, ts):
+        """items [(out, area, track)] seen at the same moment (one burst) -> a decision each."""
+        steal = self.cfg["identity"].get("claim_steal_margin", 0.08)
+        conf = lambda d: d["p"] if d.get("p") is not None else (d.get("sim") or 0.0)
+        with self.lock:
+            self._maintain(ts)
+            q = [{"fingerprint": o["fingerprint"], "quality_max": o["quality_max"], "quality_mean": o["quality_mean"],
+                  "area": a} for o, a, _ in items]
+            ds = self.g.match_batch(q)
+            for k, (o, a, tr) in enumerate(items):
+                d = ds[k]
+                if d["state"] != "confirmed":
+                    continue
+                cow = d["cow"]
+                held = self.claims.get(cow)
+                if held and self.apart(tr, held[0]) and conf(d) <= held[2] + steal:
+                    # that cow is on a track seen at the same time, with a burst at least as sure:
+                    # not her - the next cow, with every cow held elsewhere ruled out
+                    ex = {c for c, (t2, _, _) in self.claims.items() if self.apart(tr, t2)}
+                    ex |= {x["cow"] for j, x in enumerate(ds) if j != k and x.get("cow")}
+                    d = ds[k] = self.g.match(o["fingerprint"], o["quality_max"], o["quality_mean"], a, exclude=ex)
+                    self.store.event(ts, "claim-kept", json.dumps({"cow": cow, "held_by": held[0], "track": tr,
+                                                                   "now": d.get("cow"), "state": d["state"]}))
+                if d["state"] == "confirmed":
+                    self.claims[d["cow"]] = (tr, ts, conf(d))
+            for (o, a, tr), d in zip(items, ds):
+                self.g.observe(d, o["fingerprint"], ts, tr)
+            return ds
+
+    def decide(self, out, area, ts, track):
+        return self.decide_batch([(out, area, track)], ts)[0]
 
     def save(self):
         with self.lock:

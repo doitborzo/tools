@@ -48,6 +48,9 @@ new_cow_similarity = 0.55       # bursts this similar are one cow when grouping 
                                 # start from same_cow_sim_p05 in abstain.json
 new_cow_min_bursts = 20         # a group needs this many bursts to become a new cow
 retire_after_hours = 48         # after a change-over, cows not seen this long have left
+max_cows = 0                    # the herd's size (e.g. 60); at it no new ids are made, unknowns wait
+claim_s = 120                   # a confirmed cow belongs to her track this long: a track seen at the
+claim_steal_margin = 0.08       # same time cannot be her unless its burst is this much surer
 
 [lameness]
 enabled = false                 # no lameness labels yet: the head exists, its output is not used
