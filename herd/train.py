@@ -784,7 +784,8 @@ def frame_id_eval(model, split, fps, k=4, seed=0):
 
 
 def cmd_frame_id(args):
-    """One frame -> the burst's fingerprint, for mct.py: the frame heads get an id head, taught to
+    """Optional (mct.py works without it: model.frame_fingerprint runs the temporal model on one
+    frame). One frame -> the burst's fingerprint: the frame heads get an id head, taught to
     point each frame at its own burst's fingerprint (InfoNCE against the other bursts of the batch).
     Everything else is frozen - fingerprints, gallery and abstain.json stay as they were. The old
     model.pt is kept as model.pre_frame_id.pt."""
@@ -803,8 +804,11 @@ def cmd_frame_id(args):
     rng = random.Random(args.seed)
     torch.manual_seed(args.seed)
     tr_dir = os.path.join(args.features, "train")
-    dev_clips = set(ck["dev_clips"])
-    train = Split(tr_dir, set(clips_of(tr_dir)) - dev_clips)
+    all_clips = clips_of(tr_dir)
+    # the model's own dev clips when this is its training folder; else (the barn's) a tenth held out
+    dev_clips = set(ck.get("dev_clips", [])) & set(all_clips) or \
+        set(random.Random(args.seed).sample(all_clips, max(1, len(all_clips) // 10)))
+    train = Split(tr_dir, set(all_clips) - dev_clips)
     dev = Split(tr_dir, dev_clips)
     for folder in args.extra_train or []:
         train.extend(Split(folder))

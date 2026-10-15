@@ -77,9 +77,8 @@ every_n = 10                    # 60 cows, a burst a minute each: ~360 of ~3600 
 max_gb = 200                    # stop keeping when the folder reaches this
 folder = "training_cache"       # next to the store unless absolute
 
-[mct]                           # one track per cow across cameras (mct.py) - off until the model has
-enabled = false                 # its frame id head: herd.py frame-id --out <run> (prints the cosines
-                                # handover_min_sim / reacquire_sim go between)
+[mct]                           # one track per cow across cameras (mct.py); a cow's frame id is the
+enabled = false                 # herd model's transformer on one frame (herd/mct_pod.sh: thresholds)
 neighbours = []                 # camera pairs with a band of shared floor: [["cam1", "cam2"], ["cam2", "cam3"]]
 disjoint = []                   # pairs that share no floor at all: cows seen by both at once are two cows
 handover_s = 2.5                # a neighbour's cow seen this recently may be passed on

@@ -163,7 +163,7 @@ time on tracks no cow could be given.
 | `abstain.py` | the NaN model |
 | `gallery.py` | prototypes, matching, enrolment, change-over, retirement |
 | `pipeline.py` | cameras -> 1 fps + bursts -> store |
-| `mct.py` | one track per cow across cameras (`[mct]`; frame id head from `herd.py frame-id`) |
+| `mct.py` | one track per cow across cameras (`[mct]`; a frame id from the herd model on one frame) |
 | `mct_eval.py`, `mct_pod.sh` | that tracker scored on MmCows' four synchronised cameras (GUIDE 4.8) |
 | `stress.py` | a burst alone, then N cameras live on one GPU: lag, burst time, GPU share |
 | `store.py`, `report.py` | SQLite; per-cow days, CSV, alerts, verdicts |

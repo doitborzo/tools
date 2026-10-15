@@ -61,8 +61,8 @@ DEFAULTS = {
     # `exclude` polygons (the far zone) are greyed out before the detector sees the
     # frame. Per camera the same keys override these. herd.py eval-det suggests values.
     "zone": {"min_box_pct": 0.0, "min_box_side_px": 0, "blank_excluded": True},
-    # one track per cow across cameras (mct.py), off by default: needs a model with the frame id
-    # head (herd.py frame-id). Cameras then track in their `tracking_mask` (overlapping the
+    # one track per cow across cameras (mct.py), off by default; a cow's frame id is the herd
+    # model's transformer on one frame. Cameras then track in their `tracking_mask` (overlapping the
     # neighbours') and still count only in their `mask`.
     "mct": {"enabled": False, "neighbours": [], "disjoint": [], "portals": [],
             "w_iou": 0.65, "ema": 0.2,

@@ -315,10 +315,11 @@ What holds even without `[mct]`:
   `store.alias_cow` / `unalias_cow`, reversible); reports follow the aliases.
 
 With `[mct] enabled = true` one `GlobalTracker` serves all cameras. Every box gets a
-**frame id** (`FrameHeads.id`, one small head over the frame vector, taught by
-`herd.py frame-id --features F --out RUN` to point each frame at its own burst's
-fingerprint; the rest of the model is frozen and the old file is kept as
-`model.pre_frame_id.pt`). A box gets its global track (`gid`):
+**frame id** (`model.frame_fingerprint`): the herd model's own temporal transformer
+run on a burst of that one frame — a vector in the burst fingerprint's space, with no
+extra training and no other dataset. (Later, on the barn's own data, `herd.py
+frame-id --features F --out RUN` can teach a small head to do the same faster; the
+model then uses the head.) A box gets its global track (`gid`):
 
 1. from the same camera — IoU with the frame id (`w_iou`), and a cow hidden for up to
    `reacquire_s` comes back near where she was if her frame id matches (`reacquire_sim`);
@@ -335,16 +336,15 @@ its `mask`) but writes seconds and bursts only for boxes in its own `mask`, so a
 an overlap is counted once, under one track. Across cameras `cannot_link` is added only
 for `disjoint` pairs (cameras with no shared floor): without a floor map, one cow in an
 overlap is seen by two cameras at once. Handovers are logged in `track_handovers`.
-`frame-id` prints the frame-to-frame cosines (same cow p10 / two cows p90–p99):
-`handover_min_sim` and `reacquire_sim` go between them. Not yet: a floor map
+The MmCows check below sweeps `handover_min_sim` and shows where it should sit. Not yet: a floor map
 (homography from measured floor points) with a Kalman filter, a nightly merge of split
 profiles, cross-camera positives in training.
 
 **Checking it — MmCows** (`mct_eval.py`, `mct_pod.sh`): four synchronised cameras over
 one pen of 16 cows, a frame a second (7/25 12:00–15:00), each cow's number in every
-camera every 15 s. `bash herd/mct_pod.sh` (tmux `herd-mct`): the frame id head if the
-model has none (`FEATURES=` CBVD-5 train features, or `FRAME_ID=1` to fetch CBVD-5 and
-extract them), then `fetch` (`MINUTES=60`, up to 180), `embed` (GPU) and `score`:
+camera every 15 s. `bash herd/mct_pod.sh` (tmux `herd-mct`) needs only the detector
+and RUN's `model.pt` (nothing is trained): `fetch` (`MINUTES=60`, up to 180), `embed`
+(GPU) and `score`:
 
 | measure | what it says |
 |---|---|
@@ -506,9 +506,9 @@ be checked on the barn's data.
      size sweeps), section 4.0;
    - `[store] path` — where the SQLite file, the gallery and the cache go;
    - `[identity] max_cows` — the herd's size (no new ids beyond it);
-   - several cameras over one herd: `[mct]` (section 4.8) — after `herd.py frame-id`,
-     `enabled = true`, `neighbours`, a `tracking_mask` per camera reaching into the
-     neighbour's floor, `portals` for blind passages.
+   - several cameras over one herd: `[mct]` (section 4.8) — `enabled = true`,
+     `neighbours`, a `tracking_mask` per camera reaching into the neighbour's floor,
+     `portals` for blind passages.
 2. Run: `python herd/herd.py run --config barn.toml`. For recorded files instead of
    RTSP: `--start 2026-10-07T06:00` and `url` = the file's path.
 3. In the first days the gallery enrols the herd by itself (`new-<date>-<n>`). For ear

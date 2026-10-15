@@ -9,7 +9,8 @@ number (visual_data.zip labels/combined). The other pens are blacked out in the 
     fetch   the frames of --minutes from --start (every --step s), shrunk to 1920 px, and the labels
             of that window; zips are read in place (HTTP Range), nothing else is downloaded
     embed   (GPU) every frame of every camera: the detector -> crops -> DINOv2 -> frame heads:
-            boxes, the frame id (FrameHeads.id, herd.py frame-id) and DINOv2's CLS token, per camera
+            boxes, the frame id (model.frame_fingerprint: the herd transformer on one frame) and
+            DINOv2's CLS token, per camera
     score   (CPU) the trackers on those boxes, a second at a time, camera after camera:
               iou        the system without mct: an IoU tracker per camera (pipeline.Tracker)
               cam        mct.GlobalTracker without neighbours: per camera, IoU + frame id, reacquire
@@ -30,7 +31,8 @@ number (visual_data.zip labels/combined). The other pens are blacked out in the 
     python herd/mct_eval.py embed --data /workspace/mct --model /workspace/herd/run9/model.pt --detector <best/>
     python herd/mct_eval.py score --data /workspace/mct          # -> mct_eval.json + a table
 
-The 12:00-15:00 hours are never used for training: frame-id learns on CBVD-5's features.
+Nothing is trained here and no other dataset is needed: the frame id is the herd model's own
+transformer run on a burst of one frame.
 """
 
 from __future__ import annotations
@@ -152,10 +154,9 @@ def cmd_embed(args):
     if args.threshold is not None:
         cfg["detector"]["threshold"] = args.threshold
     models = pipeline.Models(cfg)
-    has_id = models.model.frame_id
     hidden = models.encoder.hidden
-    print(f"[embed] detector threshold {getattr(models.detector, 'threshold', '?')}; frame id head: "
-          f"{'yes' if has_id else 'NO - only the DINOv2 baseline (herd.py frame-id --out <run> adds it)'}", flush=True)
+    print(f"[embed] detector threshold {getattr(models.detector, 'threshold', '?')}; frame id: "
+          f"{'the trained head' if models.model.frame_id else 'the herd transformer on one frame'}", flush=True)
     os.makedirs(os.path.join(args.data, "emb"), exist_ok=True)
     for cam in meta["cams"]:
         out = os.path.join(args.data, "emb", f"{cam}.npz")
@@ -176,9 +177,8 @@ def cmd_embed(args):
                 boxes = [b for bs in dets for b in bs]
                 if pairs:
                     feats = models.encode(pipeline.crops_of(pairs, models.crop_size, models.margin))
-                    if has_id:
-                        _, _, ids = models.frame_heads(feats, boxes, urgent=False, with_id=True)
-                        F.append(np.asarray(ids, np.float16))
+                    _, _, ids = models.frame_heads(feats, boxes, urgent=False, with_id=True)
+                    F.append(np.asarray(ids, np.float16))
                     C.append(feats[:, :hidden].float().cpu().numpy().astype(np.float16))
                     B.append(np.asarray(boxes, np.float32))
                 T += chunk

@@ -1,8 +1,8 @@
 """One track per cow across the barn's cameras, without calibration (stage B of the multi-camera plan).
 
 Every second each camera hands its boxes in the tracking zone (`tracking_mask`, overlapping its
-neighbours) with one frame id per box (FrameHeads.id, train.py frame-id: the frame's guess of its
-burst fingerprint). GlobalTracker.update gives each box a global track id (gid), in this order:
+neighbours) with one frame id per box (model.frame_fingerprint: the herd transformer on a burst of
+that one frame - the frame's guess of its burst fingerprint). GlobalTracker.update gives each box a global track id (gid), in this order:
 
   1. the same camera     the gid this camera had there a moment ago: IoU and the frame id
                          (w_iou * IoU + (1 - w_iou) * cos, best assignment); a cow lost for a few

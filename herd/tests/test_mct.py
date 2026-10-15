@@ -321,3 +321,16 @@ def test_mct_eval_scores_one_track_across_cameras():
         assert r["fid/cam"]["tracks_per_cow"] < r["iou"]["tracks_per_cow"]      # the hidden cow comes back
         e = m["enroll"]["with_cannot_link"]
         assert e["cows_made"] == 4 and e["purity"] == 1.0
+
+
+def test_frame_fingerprint_without_a_head_is_the_burst_of_one_frame():
+    import torch
+    import model as mdl
+    torch.manual_seed(0)
+    m = mdl.HerdModel(24, d=32, layers=1, heads=2).eval()
+    x = torch.randn(5, 24)
+    with torch.no_grad():
+        z = m.frame_fingerprint(x)
+        ref = m.temporal(x[2:3].unsqueeze(1), torch.zeros(1, 1), torch.ones(1, 1, dtype=torch.bool))["fingerprint"]
+    assert z.shape == (5, mdl.ID_DIM) and torch.allclose(z.norm(dim=-1), torch.ones(5), atol=1e-5)
+    assert torch.allclose(z[2], ref[0], atol=1e-5)

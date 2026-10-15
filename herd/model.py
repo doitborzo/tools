@@ -170,6 +170,17 @@ class HerdModel(nn.Module):
     def frame_id(self):
         return self.frame.id is not None
 
+    def frame_fingerprint(self, x, pos=None):
+        """One frame -> a unit vector in the burst fingerprint's space (what mct.py tracks by).
+        With the frame id head (train.py frame-id) that head; without it the temporal model itself
+        on a burst of this one frame - no training and no dataset needed, a few transformer layers
+        over a single token."""
+        if self.frame.id is not None:
+            return self.frame(x, pos)["id"]
+        t = x.new_zeros(len(x), 1)
+        valid = torch.ones(len(x), 1, dtype=torch.bool, device=x.device)
+        return self.temporal(x.unsqueeze(1), t, valid, pos)["fingerprint"]
+
     @property
     def motion_dim(self):
         return self.kw.get("motion_dim", 0)

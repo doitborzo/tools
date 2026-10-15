@@ -205,7 +205,7 @@ class Models:
         return torch.cat(out) if out else torch.zeros((0, self.encoder.out_dim), device=self.dev)
 
     def frame_heads(self, feats, boxes, urgent=True, kind="heads", with_id=False):
-        """Posture and activity per box; with_id also the frame id (None without the head)."""
+        """Posture and activity per box; with_id also the frame id (model.frame_fingerprint)."""
         from model import box_pos
         with self.gpu(urgent, kind), self.torch.no_grad():
             pos = self.torch.tensor([box_pos(b) for b in boxes], device=self.dev).float()
@@ -213,7 +213,7 @@ class Models:
             pp, pa = o["posture"].softmax(-1).cpu().numpy(), o["activity"].softmax(-1).cpu().numpy()
             if not with_id:
                 return pp, pa
-            return pp, pa, (o["id"].float().cpu().numpy() if "id" in o else [None] * len(boxes))
+            return pp, pa, self.model.frame_fingerprint(feats.float(), pos).float().cpu().numpy()
 
     def burst(self, feats, times, valid, boxes, motion=None, urgent=False, kind="temporal"):
         from model import box_pos
@@ -669,9 +669,6 @@ def run(cfg, start=None, models=None, max_wall_s=None):
             for i, c in enumerate(cfg["cameras"])]
     if cfg["mct"]["enabled"]:
         from mct import GlobalTracker
-        if not models.model.frame_id:
-            print("[run] [mct] enabled, but the model has no frame id head (herd.py frame-id --out <run>): "
-                  "cows are followed by their boxes within a camera only", flush=True)
         glob = GlobalTracker(cfg, store, shared.separate)
         for cam in cams:
             cam.glob = glob
