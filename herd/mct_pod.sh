@@ -21,6 +21,7 @@
 #
 # Knobs: WORK=/workspace  RUN=run9  DET=<best/> (default: the newest)  MINUTES=60  START=0  STEP=1
 #        SHOW_MIN=10  SHOW_VARIANT=<a tracker of the table>  APPEARANCE=1 (also hand over by look)
+#        IDENTITY=<reid.py's identity.pt>: the frame id from the identity model (embed is redone for it)
 # An older run's frames are kept; its embeddings are redone once (they had no posture).
 # MmCows: CC BY-NC-SA 4.0 (non-commercial). Every step resumes (frames fetched and cameras embedded are kept).
 
@@ -51,7 +52,7 @@ if [ -z "${HERD_MCT_IN_TMUX:-}" ]; then
     fi
     mkdir -p "$M"
     knobs=""
-    for v in WORK RUN DET MINUTES START STEP SHOW_MIN SHOW_VARIANT APPEARANCE MODELS; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
+    for v in WORK RUN DET MINUTES START STEP SHOW_MIN SHOW_VARIANT APPEARANCE IDENTITY MODELS; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env HERD_MCT_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/mct_pod.sh"); echo; echo '[mct finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log   ($LOG)"
@@ -101,7 +102,8 @@ step "Fetch MmCows (7/25, ${MINUTES:-60} min from 12:00 + ${START:-0} min, a fra
 "$PY" "$HERE/mct_eval.py" fetch --data "$M" --minutes "${MINUTES:-60}" --start "${START:-0}" --step "${STEP:-1}"
 
 step "Embed: detector -> DINOv2 -> frame heads (GPU)"
-"$PY" "$HERE/mct_eval.py" embed --data "$M" --model "$H/$RUN/model.pt" --detector "$DET"
+idm=(); [ -n "${IDENTITY:-}" ] && idm=(--identity "$IDENTITY")
+"$PY" "$HERE/mct_eval.py" embed --data "$M" --model "$H/$RUN/model.pt" --detector "$DET" "${idm[@]}"
 
 step "Score"
 app=(); [ "${APPEARANCE:-0}" = "1" ] && app=(--appearance)

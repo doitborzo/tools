@@ -163,6 +163,13 @@ class Models:
             self.rum_model.load_state_dict(rk["state"])
             self.rum_model_thr = float(rk["threshold"])
             self.motion_dim = max(self.motion_dim, rk["kw"].get("motion_dim", 0))
+        # reid.py's identity model, when the config names one: the fingerprint (bursts, and one frame a
+        # second for mct.py) comes from it - taught on cows with ids - and the gallery takes its abstain.json
+        self.id_model, self.id_abstain = None, None
+        ip = cfg["model"].get("identity")
+        if ip:
+            from reid import load_identity
+            self.id_model, self.id_abstain = load_identity(ip, self.features_meta, self.dev)
         # The cut-off calibrated with the model: "ruminating" per burst, summed
         # into minutes by the reports (the one that keeps the share true).
         try:
@@ -213,6 +220,11 @@ class Models:
             pp, pa = o["posture"].softmax(-1).cpu().numpy(), o["activity"].softmax(-1).cpu().numpy()
             if not with_id:
                 return pp, pa
+            if self.id_model is not None:
+                x = feats.float().unsqueeze(1)
+                o = self.id_model(x, x.new_zeros(len(x), 1), self.torch.ones(len(x), 1, dtype=self.torch.bool,
+                                                                               device=self.dev), pos)
+                return pp, pa, o["fingerprint"].float().cpu().numpy()
             return pp, pa, self.model.frame_fingerprint(feats.float(), pos).float().cpu().numpy()
 
     def burst(self, feats, times, valid, boxes, motion=None, urgent=False, kind="temporal"):
@@ -235,6 +247,12 @@ class Models:
                                    torch.as_tensor(valid, device=self.dev).unsqueeze(0),
                                    motion=mot if self.rum_model.motion_dim else None)
                 out["rumination"] = float(r["rumination"][0].sigmoid())
+            if self.id_model is not None:
+                i = self.id_model(feats.unsqueeze(0).float(), torch.as_tensor(times, device=self.dev).unsqueeze(0).float(),
+                                  torch.as_tensor(valid, device=self.dev).unsqueeze(0), pos)
+                out["fingerprint"] = i["fingerprint"][0].cpu().numpy()
+                out["quality_max"] = float(i["weights"][0].max())
+                out["quality_mean"] = float(i["quality"][0][torch.as_tensor(valid, device=self.dev)].mean())
         if self.rum_model is not None:
             out["ruminating"] = bool(out["rumination"] >= self.rum_model_thr)
             return out
@@ -674,8 +692,10 @@ def run(cfg, start=None, models=None, max_wall_s=None):
     abstain = json.load(open(ab_path, encoding="utf-8")) if os.path.exists(ab_path) else None
     folder = os.path.join(os.path.dirname(os.path.abspath(cfg["store"]["path"])), "gallery")
     start_ts = start if start is not None else time.time()
-    shared = SharedGallery(gallery_mod.Gallery(folder, cfg, abstain), store, cfg, start_ts)
     models = models or Models(cfg)
+    if getattr(models, "id_model", None) is not None:
+        abstain = models.id_abstain          # the NaN model fitted on the identity model's fingerprints
+    shared = SharedGallery(gallery_mod.Gallery(folder, cfg, abstain), store, cfg, start_ts)
     cams = [Camera(c, i, len(cfg["cameras"]), cfg, models, shared, store, start_ts)
             for i, c in enumerate(cfg["cameras"])]
     if cfg["mct"]["enabled"]:

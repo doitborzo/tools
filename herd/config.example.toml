@@ -20,6 +20,8 @@ frame_width = 1920              # Full HD kept as it comes (wider frames are sca
 checkpoint = "/workspace/herd/run1/model.pt"     # abstain.json next to it is picked up
 # rumination = "/workspace/rum/model/rumination.pt"  # rumination.py's model (Kaggle + CVB): decides
 #                                                  # rumination in place of the herd model's head
+# identity = "/workspace/reid/id_model/identity.pt"  # reid.py's identity model (cows with ids, other
+#                                                  # days and cameras): the fingerprint and its NaN model
 
 [detector]
 weights = "/workspace/lora-runs/detector/best"   # RT-DETRv2 (cowbench/detector.py)

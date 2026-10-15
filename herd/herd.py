@@ -9,6 +9,7 @@ Training (on CBVD-5 today, on the barn's own footage later):
     herd.py train                           temporal transformer + all heads on those vectors
     herd.py eval                            val scores + cowbench-format results
     herd.py frame-id --out R                one frame -> its burst's fingerprint (mct.py tracks by it)
+    herd.py reid fetch|extract|train        identity taught on public sets with cow ids (reid_pod.sh)
     herd.py eval-det --run R                the same on the detector's boxes: detector misses count
     herd.py calibrate --detector D          the detector's boxes reshaped to the annotation's habit
     herd.py show-dets --src DIR --detector D  every box a detector draws on a folder / video, as an HTML gallery
@@ -79,6 +80,9 @@ def main():
     if cmd == "calibrate":
         import calib_boxes
         return calib_boxes.main(argv)
+    if cmd == "reid":
+        import reid
+        return reid.main(argv)
     if cmd == "show-ids":
         import show_ids
         return show_ids.main(argv)

@@ -153,14 +153,19 @@ def cmd_embed(args):
     cfg["detector"]["weights"] = args.detector
     if args.threshold is not None:
         cfg["detector"]["threshold"] = args.threshold
+    if args.identity:
+        cfg["model"]["identity"] = args.identity
     models = pipeline.Models(cfg)
     hidden = models.encoder.hidden
-    print(f"[embed] detector threshold {getattr(models.detector, 'threshold', '?')}; frame id: "
-          f"{'the trained head' if models.model.frame_id else 'the herd transformer on one frame'}", flush=True)
+    source = ("the identity model (reid.py) on one frame" if models.id_model is not None else
+              "the trained head" if models.model.frame_id else "the herd transformer on one frame")
+    print(f"[embed] detector threshold {getattr(models.detector, 'threshold', '?')}; frame id: {source}", flush=True)
+    stamp = {"frame_id": source, "identity": os.path.abspath(args.identity) if args.identity else ""}
     os.makedirs(os.path.join(args.data, "emb"), exist_ok=True)
     for cam in meta["cams"]:
         out = os.path.join(args.data, "emb", f"{cam}.npz")
-        if os.path.exists(out) and not args.force and "lying" in np.load(out).files:
+        if os.path.exists(out) and not args.force and "lying" in np.load(out).files and \
+                json.loads(str(np.load(out).get("stamp", "{}"))) == stamp:
             print(f"[embed] {cam}: there already", flush=True)
             continue
         folder = os.path.join(args.data, "frames", cam)
@@ -193,7 +198,7 @@ def cmd_embed(args):
                  boxes=np.concatenate(B) if B else np.zeros((0, 4), np.float32),
                  cls=np.concatenate(C) if C else np.zeros((0, hidden), np.float16),
                  fid=np.concatenate(F) if F else np.zeros((0, 0), np.float16),
-                 lying=np.concatenate(L) if L else np.zeros((0,), np.float32))
+                 lying=np.concatenate(L) if L else np.zeros((0,), np.float32), stamp=json.dumps(stamp))
         print(f"\n[embed] {cam}: {len(T)} frames, {sum(N)} boxes ({sum(N) / max(1, len(T)):.1f} a frame) -> {out}",
               flush=True)
 
@@ -290,6 +295,30 @@ def proj_mats(data, cams):
             m = re.search(r"<projection_matrix.*?<data>(.*?)</data>", open(path, encoding="utf-8").read(), re.S)
             out[cam] = [float(x) for x in m.group(1).split()]
     return out
+
+
+def look_check(gt_map, dets):
+    """By look alone: a labelled cow seen by one camera, against the cows another camera sees at the same
+    second - is the nearest frame id hers? (chance: one in the number of cows there)."""
+    at = collections.defaultdict(list)
+    for (cam, ts, j), cow in gt_map.items():
+        e = dets[cam][ts][j][1]
+        if e is not None:
+            at[ts].append((cam, cow, np.asarray(e, np.float32)))
+    hit = n = 0
+    chance = []
+    for v in at.values():
+        for c1, w1, e1 in v:
+            for c2 in {c for c, _, _ in v if c != c1}:
+                cands = [(w, e) for c, w, e in v if c == c2]
+                if w1 not in [w for w, _ in cands]:
+                    continue
+                best = max(cands, key=lambda x: float(x[1] @ e1))[0]
+                hit += best == w1
+                n += 1
+                chance.append(1 / len(cands))
+    return {"look_cross_cam_top1": hit / n if n else None, "chance": float(np.mean(chance)) if chance else None,
+            "queries": n}
 
 
 def floor_check(gt_map, dets, mats):
@@ -558,6 +587,10 @@ def cmd_score(args):
             gt_map, n_gt, n_det = prepared["gt"]
             results["data"]["detector_recall"] = len(gt_map) / max(1, n_gt)
             results["data"]["detector_precision"] = len(gt_map) / max(1, n_det)
+            results["data"]["look"] = lk = look_check(gt_map, dets)
+            if lk["queries"]:
+                print(f"[score] by look: a cow in one camera, the nearest frame id among another camera's cows "
+                      f"at that second is hers in {lk['look_cross_cam_top1']:.1%} (chance {lk['chance']:.1%})", flush=True)
             if mats:
                 results["data"]["floor_points"] = fc = floor_check(gt_map, dets, mats)
                 if fc:
@@ -723,6 +756,7 @@ def main(argv=None):
     e.add_argument("--threshold", type=float, default=None)
     e.add_argument("--batch", type=int, default=8)
     e.add_argument("--force", action="store_true")
+    e.add_argument("--identity", default="", help="reid.py's identity.pt: the frame id from it")
     s = sub.add_parser("score")
     v = sub.add_parser("show")
     for q in (s, v):

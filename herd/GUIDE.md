@@ -397,6 +397,38 @@ every 30 s. For the barn itself: `herd.py show-ids --config barn.toml --cam cam1
 wrote — each box's cow (or NaN), its track, the last burst decision, posture and
 activity — in the cow's colour, the same in every camera.
 
+
+### 4.9 Identity taught on cows with ids (`reid.py`, `reid_pod.sh`, `[model] identity`)
+
+The herd model's fingerprint learnt on CBVD-5, which names no cows: it tells "the same cow within
+7 s" and knows the view more than the cow. `reid.py` teaches a **copy** of its temporal transformer
+on three public sets that do name their cows (the herd model itself — posture, activity,
+rumination — is not touched):
+
+| set | cows | what | licence |
+|---|---|---|---|
+| MultiCamCows2024 (Bristol) | 90 | 3 ceiling cameras, 7 days, 101k crops (tracklets at 5 Hz), the same folder number every day | NCGL (non-commercial) |
+| Cows2021 (Bristol), identification test set | 181 | top-down crops over 4 weeks | NCGL |
+| OpenCows2020, identification part | 46 | top-down crops | NCGL |
+
+- `fetch` reads only the crops from the zips (MultiCamCows: 3.6 GB of 36.5);
+- `extract` runs DINOv2 on them as the barn does (square crop, the model's margin and grid) and
+  makes pseudo-bursts — 7 s of one camera's tracklet (35 crops at 5 Hz) or a handful of one cow's
+  stills of a day — stretched to the barn's 175 frames, each with its cow's id; a sixth of each
+  set's cows is held out (never trained on), as the barn's cows are new cows;
+- `train`: supervised contrastive over cow ids — one cow on other days and from other cameras
+  are positives — with a quarter of the views cut to a single frame (mct.py tracks by one frame
+  a second). Scored on the held-out cows: the same cow on another day (`other_day_top1`), from
+  another camera the same day (`other_camera_top1`), and from one frame (`frame_other_day_top1`),
+  before and after; the NaN model is refitted on these fingerprints (`abstain.json` next to
+  `identity.pt`).
+
+`bash herd/reid_pod.sh` does all of it, then MmCows (`mct_pod.sh` with `IDENTITY=` the new model:
+the trackers, and `look_cross_cam_top1` — a cow in one camera, the nearest frame id among another
+camera's cows at that second is hers). In the barn: `[model] identity = ".../identity.pt"` — the
+gallery and mct.py take its fingerprint, the gallery its `abstain.json`; a gallery built with the
+old fingerprints must be enrolled again (its prototypes are in the old space). All three sets are
+non-commercial: for a commercial product the barn's own data (`[training_cache]`) is the clean path.
 ---
 
 ## 5. Training on the pod (CBVD-5)
@@ -726,6 +758,7 @@ model sees fine detail: coat pattern, the jaw.
 | `mct.py` | one track per cow across cameras (GlobalTracker) |
 | `mct_eval.py`, `mct_pod.sh` | that tracker scored on MmCows' four cameras |
 | `show_ids.py` | `herd.py show-ids`: who is who drawn on a recorded file (from the store) |
+| `reid.py`, `reid_pod.sh` | identity taught on public sets with cow ids (section 4.9) |
 | `store.py` | SQLite: seconds, bursts, events, alerts, verdicts |
 | `report.py` | days per cow, CSV, alerts, verdicts |
 | `eval_det.py` | the whole path on the detector's boxes, threshold sweep |
