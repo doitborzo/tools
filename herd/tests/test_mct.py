@@ -312,7 +312,8 @@ def test_mct_eval_scores_one_track_across_cameras():
                             fh.write(f"{c} {(b[0] + b[2]) / 2} {(b[1] + b[3]) / 2} {b[2] - b[0]} {b[3] - b[1]}\n")
             np.savez(os.path.join(d, "emb", f"{cam}.npz"), ts=np.array(T) + 1690304400, n=np.array(N),
                      boxes=np.array(B, np.float32), cls=np.array(F, np.float16), fid=np.array(F, np.float16))
-        mct_eval.main(["score", "--data", d, "--min-bursts", "3", "--sweep", "0.6"])
+        mct_eval.main(["score", "--data", d, "--min-bursts", "3", "--appearance", "--sweep", "0.6",
+                       "--enroll", "fid/mct"])
         r = js.load(open(os.path.join(d, "mct_eval.json")))
         assert r["iou"]["cross_cam_same_track"] == 0.0 and r["iou"]["idf1_global"] < 0.7
         m = r["fid/mct"]
@@ -334,3 +335,105 @@ def test_frame_fingerprint_without_a_head_is_the_burst_of_one_frame():
         ref = m.temporal(x[2:3].unsqueeze(1), torch.zeros(1, 1), torch.ones(1, 1, dtype=torch.bool))["fingerprint"]
     assert z.shape == (5, mdl.ID_DIM) and torch.allclose(z.norm(dim=-1), torch.ones(5), atol=1e-5)
     assert torch.allclose(z[2], ref[0], atol=1e-5)
+
+
+def _write_proj(d, cam, P):
+    os.makedirs(os.path.join(d, "proj_mat"), exist_ok=True)
+    with open(os.path.join(d, "proj_mat", f"proj_mat_cam{cam[-1]}.xml"), "w") as fh:
+        fh.write("<opencv_storage><projection_matrix><rows>3</rows><cols>4</cols><dt>d</dt><data>"
+                 + " ".join(map(str, np.ravel(P))) + "</data></projection_matrix></opencv_storage>")
+
+
+def test_geo_hands_cows_over_by_place_alone():
+    """Two cameras from opposite sides, frame ids that say nothing (random): passed on by where the cows
+    lie on the floor (the projection matrices, body height from p(lying)) - and drawn by show."""
+    import json as js
+    import mct_eval
+    rng = np.random.default_rng(11)
+    W, H = mct_eval.PROJ_SIZE
+    # world cm -> pixels of a 4480x2800 frame; the second camera sees the pen mirrored
+    P = {"cam_1": np.array([[3.0, 0.0, -1.0, 500.0], [0.0, 2.0, -2.0, 800.0], [0, 0, 0, 1.0]]),
+         "cam_2": np.array([[-3.0, 0.0, -1.0, 3900.0], [0.0, -2.0, -2.0, 2200.0], [0, 0, 0, 1.0]])}
+    cows = {c: (150.0 + 250 * c, 100.0 + 120 * (c % 3)) for c in range(1, 5)}
+    with tempfile.TemporaryDirectory() as d:
+        js.dump({"cams": ["cam_1", "cam_2"], "start_ts": 1690304400, "end_ts": 1690304400 + 120, "step": 1},
+                open(os.path.join(d, "meta.json"), "w"))
+        os.makedirs(os.path.join(d, "emb"))
+        for cam in P:
+            _write_proj(d, cam, P[cam])
+            os.makedirs(os.path.join(d, "labels", cam))
+            T, N, B, F, L = [], [], [], [], []
+            for k in range(120):
+                ts = 1690304400 + k
+                rows = []
+                for c, (x, y) in cows.items():
+                    u, v, w = P[cam] @ [x + 0.3 * k, y, 55.0, 1.0]            # lying: centre 55 cm up
+                    cx, cy = u / w / W, v / w / H
+                    rows.append((c, [cx - 0.03, cy - 0.04, cx + 0.03, cy + 0.04]))
+                for c, b in rows:
+                    B.append(b), F.append(_unit(rng.normal(size=16))), L.append(1.0)
+                T.append(ts), N.append(len(rows))
+                if k % 15 == 0:
+                    with open(os.path.join(d, "labels", cam, f"{ts}_12-00-00.txt"), "w") as fh:
+                        fh.writelines(f"{c} {(b[0] + b[2]) / 2} {(b[1] + b[3]) / 2} {b[2] - b[0]} {b[3] - b[1]}\n"
+                                      for c, b in rows)
+            np.savez(os.path.join(d, "emb", f"{cam}.npz"), ts=np.array(T), n=np.array(N), boxes=np.array(B, np.float32),
+                     cls=np.array(F, np.float16), fid=np.array(F, np.float16), lying=np.array(L, np.float32))
+        mct_eval.main(["score", "--data", d, "--min-bursts", "1", "--dist-sweep"])
+        r = js.load(open(os.path.join(d, "mct_eval.json")))
+        assert r["data"]["floor_points"]["same_cow_median_cm"] < 5
+        g = r["fid/geo"]
+        assert g["cross_cam_same_track"] == 1.0 and g["false_merges"] == 0 and g["tracks_per_cow"] == 1.0, g
+        assert r["fid/still"]["cross_cam_same_track"] == 0.0
+        mct_eval.main(["show", "--data", d, "--minutes", "0.5", "--still-every", "10"])
+        out = os.path.join(d, "show", "fid_geo")
+        assert os.path.getsize(os.path.join(out, "ids.mp4")) > 1000 and len(os.listdir(os.path.join(out, "stills"))) == 3
+
+
+def test_still_cow_kept_and_cannot_link_needs_evidence():
+    import mct
+    gt = mct.GlobalTracker(_mct_cfg([("cam1", {})]))
+    g = gt.update("cam1", 0.0, [{"box": _box(0.5), "emb": None}])[0]
+    # unseen for 40 s (another cow lay in front), back at the same place: the same cow, no look needed
+    assert gt.update("cam1", 40.0, [{"box": _box(0.505), "emb": None}])[0] == g
+    co = mct.CoSeen(min_s=3, max_iou=0.3)
+    a, b, dup = _box(0.2), _box(0.7), _box(0.21)
+    assert co.add(["t1", "t2", "t3"], [a, b, dup]) == []               # t1 / t3: two boxes on one cow
+    co.add(["t1", "t2", "t3"], [a, b, dup])
+    assert co.add(["t1", "t2", "t3"], [a, b, dup]) == [("t1", "t2"), ("t2", "t3")]
+
+
+def test_floor_mapper_from_floor_points():
+    from common import floor_mapper
+    pts = [[0.1, 0.9, 0, 0], [0.9, 0.9, 800, 0], [0.9, 0.1, 800, 1200], [0.1, 0.1, 0, 1200]]
+    f = floor_mapper({"floor_points": pts}, DEFAULTS["mct"])
+    x, y = f([0.45, 0.4, 0.55, 0.5])                                    # bottom centre (0.5, 0.5)
+    assert abs(x - 400) < 1e-6 and abs(y - 600) < 1e-6
+    assert floor_mapper({}, DEFAULTS["mct"]) is None
+
+
+def test_show_ids_draws_the_store_on_the_recording():
+    import datetime as dt
+    import cv2
+    import show_ids
+    from store import Store
+    with tempfile.TemporaryDirectory() as d:
+        video = os.path.join(d, "cam1.mp4")
+        w = cv2.VideoWriter(video, cv2.VideoWriter_fourcc(*"mp4v"), 5, (320, 240))
+        for _ in range(5 * 12):
+            w.write(np.full((240, 320, 3), 90, np.uint8))
+        w.release()
+        start = dt.datetime(2026, 10, 7, 6, 0, 0).timestamp()
+        cfg_path = os.path.join(d, "barn.toml")
+        store_path = os.path.join(d, "herd.sqlite")
+        open(cfg_path, "w").write(f'[store]\npath = "{store_path}"\n')
+        store = Store(store_path)
+        store.seconds([("cam1", "trk-a", start + k, 0.1, 0.2, 0.4, 0.6, "lying", "none", 0.9) for k in range(10)] +
+                      [("cam1", "trk-b", start + k, 0.5, 0.2, 0.8, 0.6, "standing", "feeding", 0.1) for k in range(10)])
+        store.burst(("cam1", "trk-a", start + 2, "confirmed", "A12", 0.9, 0.2, 0.95, 0.1, "lying", "none", None, 0.5, 100))
+        out = os.path.join(d, "show")
+        show_ids.main(["--config", cfg_path, "--cam", "cam1", "--video", video, "--start", "2026-10-07T06:00:00",
+                       "--minutes", "0.2", "--out", out, "--still-every", "5"])
+        assert os.path.getsize(os.path.join(out, "ids.mp4")) > 1000
+        assert len(os.listdir(os.path.join(out, "stills"))) == 3                  # seconds 0, 5, 10
+        assert "50%" in open(os.path.join(out, "index.html")).read()              # trk-a has a cow, trk-b is NaN

@@ -375,7 +375,7 @@ class Camera:
         with self.trk_lock:
             tracked = self.tracker.update(ts, boxes)
         if len(tracked) > 1 and hasattr(self.gallery, "together"):
-            self.gallery.together([tid for tid, _ in tracked], ts)     # one camera, one second: all different
+            self.gallery.together([tid for tid, _ in tracked], ts, [b for _, b in tracked])   # two cows, with evidence
         if tracked:
             size = self.models.crop_size
             feats = self.models.encode(crops_of([(img, b) for _, b in tracked], size, self.models.margin),
@@ -397,9 +397,11 @@ class Camera:
             feats = self.models.encode(crops_of([(img, b) for b in boxes], self.models.crop_size, self.models.margin),
                                        urgent=True, kind="second_encode")
             pp, pa, ids = self.models.frame_heads(feats, boxes, with_id=True)
-            gids = self.glob.update(self.id, ts, [{"box": b, "emb": e} for b, e in zip(boxes, ids)])
+            lying = POSTURES.index("lying")
+            gids = self.glob.update(self.id, ts, [{"box": b, "emb": e, "p_lying": float(p[lying])}
+                                                  for b, e, p in zip(boxes, ids, pp)])
             if len(gids) > 1 and hasattr(self.gallery, "together"):
-                self.gallery.together(gids, ts)                     # one camera, one second: all different
+                self.gallery.together(gids, ts, boxes)              # two cows, with evidence (mct.CoSeen)
             for gid, b, p, a in zip(gids, boxes, pp, pa):
                 if in_mask(b, self.mask):
                     rows.append((self.id, gid, ts, *b, POSTURES[int(p.argmax())], ACTIVITIES[int(a.argmax())],
@@ -473,7 +475,9 @@ class Camera:
         # the burst's cows are decided together: they were all there at once, so no cow twice
         t = time.perf_counter()
         if len(done) > 1 and hasattr(self.gallery, "together"):
-            self.gallery.together([d[0] for d in done], t0)
+            # seven seconds side by side is evidence enough, unless the two chains are one cow's
+            self.gallery.together([d[0] for d in done], t0, [d[7][len(d[7]) // 2] for d in done],
+                                  weight=self.cfg["identity"].get("cannot_link_min_s", 5))
         decisions = (self.gallery.decide_batch([(d[1], d[2], d[0]) for d in done], t0)
                      if hasattr(self.gallery, "decide_batch") else
                      [self.gallery.decide(d[1], d[2], t0, d[0]) for d in done])
@@ -513,6 +517,8 @@ class SharedGallery:
         self.cannot_link = set(store.cannot_link_pairs(start_ts - cfg["identity"]["history_days"] * 86400)) \
             if hasattr(store, "cannot_link_pairs") else set()
         self._pending_links, self._last_flush = [], start_ts
+        from mct import CoSeen
+        self.co_seen = CoSeen(cfg["identity"].get("cannot_link_min_s", 5), cfg["identity"].get("cannot_link_max_iou", 0.3))
         self.claims = {}                         # cow -> (track, ts, p or sim)
 
     def _next_hour(self, ts, hour):
@@ -522,15 +528,20 @@ class SharedGallery:
             t += dt.timedelta(days=1)
         return t.timestamp()
 
-    def together(self, tracks, ts):
-        """Tracks seen at the same moment: every pair is two different cows."""
-        tracks = sorted(set(tracks))
+    def together(self, tracks, ts, boxes=None, weight=1):
+        """Tracks seen at the same moment by one camera. With their boxes: two different cows once
+        seen so in cannot_link_min_s moments with boxes apart (mct.CoSeen; weight: moments this
+        sighting counts for). Without boxes: every pair at once."""
+        if boxes is not None:
+            pairs = self.co_seen.add(tracks, boxes, weight)
+        else:
+            tracks = sorted(set(tracks))
+            pairs = [(a, b) for i, a in enumerate(tracks) for b in tracks[i + 1:]]
         with self.lock:
-            for i, a in enumerate(tracks):
-                for b in tracks[i + 1:]:
-                    if (a, b) not in self.cannot_link:
-                        self.cannot_link.add((a, b))
-                        self._pending_links.append((a, b))
+            for k in pairs:
+                if k not in self.cannot_link:
+                    self.cannot_link.add(k)
+                    self._pending_links.append(k)
             if self._pending_links and (len(self._pending_links) >= 500 or ts - self._last_flush >= 60):
                 self.store.add_cannot_link(self._pending_links, ts)
                 self._pending_links, self._last_flush = [], ts

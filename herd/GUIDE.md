@@ -302,8 +302,10 @@ Without it each camera has its own IoU tracker: a cow walking from one camera to
 next gets a new track, and the two tracks are joined only if the gallery names both.
 What holds even without `[mct]`:
 
-- **seen together = two cows.** Tracks one camera sees in the same second, and the
-  chains of one burst, are written to `cannot_link`. A burst's cows are matched to the
+- **seen together = two cows.** Two tracks one camera sees together for
+  `cannot_link_min_s` (5) seconds with boxes apart (IoU < `cannot_link_max_iou`, 0.3),
+  and the chains of one burst, are written to `cannot_link` (`mct.CoSeen`). One second
+  was not enough: two boxes on one cow made 3–5% of the pairs wrong on MmCows. A burst's cows are matched to the
   gallery together (best assignment, no cow twice), and a cow confirmed on one track
   is held by it for `claim_s` (120 s): another track seen at the same time gets her
   only with a burst surer by `claim_steal_margin` (0.08), else the next cow
@@ -323,28 +325,48 @@ model then uses the head.) A box gets its global track (`gid`):
 
 1. from the same camera — IoU with the frame id (`w_iou`), and a cow hidden for up to
    `reacquire_s` comes back near where she was if her frame id matches (`reacquire_sim`);
-2. from a neighbour (`neighbours` = pairs of cameras with shared floor) — a cow the
+   a cow lying still whose box comes back at the same place (IoU ≥ `still_iou`) within
+   `still_s` (60 s) is hers whatever she looks like;
+2. **by place on the floor** — with calibrated cameras: per camera `floor_points` (≥ 4
+   marks on the floor: where they are in the frame, 0–1, and their measured X, Y in cm,
+   the same axes for all cameras; the box's bottom centre is mapped) or `proj_mat`
+   (a 3×4 projection matrix, as MmCows has; the box centre at the cow's body height,
+   55 cm lying / 90 cm standing by the posture head). A cow another camera saw in the
+   last `handover_s`, within `handover_dist` (100 cm) of this box's floor point, the
+   next one at least `handover_dist_margin` (50 cm) further. `apart_dist` > 0: cows
+   two cameras see that far apart at the same second are two cows (`cannot_link`);
+3. from a neighbour (`neighbours` = pairs of cameras with shared floor) — a cow the
    neighbour saw in the last `handover_s`, by frame id ≥ `handover_min_sim` and
    `handover_margin` ahead of the next cow (otherwise a new track: two look-alikes are
    not guessed). `handover_zone` (per camera, optional) is where that may happen;
-3. through a portal (`[[mct.portals]]`: a blind passage `from` → `to` taking `min_s` to
+4. through a portal (`[[mct.portals]]`: a blind passage `from` → `to` taking `min_s` to
    `max_s`) — at `handover_min_sim + portal_extra_sim`;
-4. otherwise a new `gid`.
+5. otherwise a new `gid`.
+
+**By look alone, cows are not passed between cameras.** MmCows (60 min, 4 cameras):
+a cow seen by two cameras at once got one track in 0.1–1.4% of the cases, and every
+looser `handover_min_sim` only merged different cows (1285 false merges at 0.5) —
+from opposite corners a cow shows another side, and the fingerprint (trained without
+cow ids) knows the view, not the cow. By place: one cow seen from two cameras is
+within 1 m of herself in 63% of the pairs, two different cows in 0.7%. So: calibrate
+the cameras (`floor_points`) before turning `[mct]` on; without calibration keep
+handover off (`handover_min_sim = 0.8`).
 
 Each camera then tracks in its `tracking_mask` (overlapping its neighbours; default
 its `mask`) but writes seconds and bursts only for boxes in its own `mask`, so a cow in
 an overlap is counted once, under one track. Across cameras `cannot_link` is added only
 for `disjoint` pairs (cameras with no shared floor): without a floor map, one cow in an
 overlap is seen by two cameras at once. Handovers are logged in `track_handovers`.
-The MmCows check below sweeps `handover_min_sim` and shows where it should sit. Not yet: a floor map
-(homography from measured floor points) with a Kalman filter, a nightly merge of split
-profiles, cross-camera positives in training.
+Not yet: a Kalman filter on the floor point, a nightly merge of split profiles, and
+identity training with real cow ids across views (the fingerprint does not tell cows
+apart across views today).
 
 **Checking it — MmCows** (`mct_eval.py`, `mct_pod.sh`): four synchronised cameras over
 one pen of 16 cows, a frame a second (7/25 12:00–15:00), each cow's number in every
-camera every 15 s. `bash herd/mct_pod.sh` (tmux `herd-mct`) needs only the detector
-and RUN's `model.pt` (nothing is trained): `fetch` (`MINUTES=60`, up to 180), `embed`
-(GPU) and `score`:
+camera every 15 s, the cameras' projection matrices and the cows' positions.
+`bash herd/mct_pod.sh` (tmux `herd-mct`) needs only the detector and RUN's `model.pt`
+(nothing is trained): `fetch` (`MINUTES=60`, up to 180), `embed` (GPU), `score` and
+`show`:
 
 | measure | what it says |
 |---|---|
@@ -356,12 +378,24 @@ and RUN's `model.pt` (nothing is trained): `fetch` (`MINUTES=60`, up to 180), `e
 | `false_cannot_link` | track pairs marked "two cows" that are one cow |
 | `enroll` | new cows from the tracks (7 s pseudo-bursts of frame ids), with and without `cannot_link`: cows made of 16, ids per cow, purity |
 
-The trackers compared: `iou` (the system without `[mct]`), `cam` (GlobalTracker per
-camera), `mct` (all four cameras neighbours), with the frame id (`fid/…`) and with
-DINOv2's CLS (`dino/…`, needs no training), and `mct@<s>` for a sweep of
-`handover_min_sim`. The 1 s frames show the neighbouring pens too; each camera is
+The trackers compared: `iou` (the system without `[mct]`), `fid/cam` (GlobalTracker
+per camera, as stage B), `fid/still` (+ cows lying still held), `fid/geo` (+ passed on
+by the floor point), `fid/geo+apart500` (+ cows 5 m apart are two), `fid/geo@<cm>`
+(other `handover_dist`); `--appearance` adds handing over by look, `--dino` DINOv2's
+CLS as the vector. The 1 s frames show the neighbouring pens too; each camera is
 limited to its pen (the hull of its labelled cows), as a barn camera to its mask.
 MmCows is CC BY-NC-SA 4.0 — non-commercial.
+
+**Watching it.** `mct_eval.py show --data D --variant fid/geo --minutes 10` (the pod
+runs it on the best tracker) draws the four cameras and the floor, a frame a second:
+every box in its track's colour with the track's number (`#12`), `= cow N` — the cow
+that track mostly is — and on the labelled seconds `true: cow N`, with a red frame and
+`WRONG` when the two differ; on the floor panel the tracks as dots and the true cows
+as rings. Out: `show/<variant>/ids.mp4` (MPEG-4: VLC) and `index.html` with a still
+every 30 s. For the barn itself: `herd.py show-ids --config barn.toml --cam cam1
+--video cam1.mp4 --start <the run's --start>` draws what a run on that recorded file
+wrote — each box's cow (or NaN), its track, the last burst decision, posture and
+activity — in the cow's colour, the same in every camera.
 
 ---
 
@@ -688,6 +722,7 @@ model sees fine detail: coat pattern, the jaw.
 | `pipeline.py` | real time: cameras, detector, tracker, bursts, cache |
 | `mct.py` | one track per cow across cameras (GlobalTracker) |
 | `mct_eval.py`, `mct_pod.sh` | that tracker scored on MmCows' four cameras |
+| `show_ids.py` | `herd.py show-ids`: who is who drawn on a recorded file (from the store) |
 | `store.py` | SQLite: seconds, bursts, events, alerts, verdicts |
 | `report.py` | days per cow, CSV, alerts, verdicts |
 | `eval_det.py` | the whole path on the detector's boxes, threshold sweep |

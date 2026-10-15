@@ -45,7 +45,10 @@ DEFAULTS = {
                  "merge_similarity": 0.68, "merge_max_conflict_rate": 0.005,
                  # a cow's claim by a track holds this long; a track seen at the same time
                  # elsewhere takes it only with a clearly better burst
-                 "claim_s": 120.0, "claim_steal_margin": 0.08},
+                 "claim_s": 120.0, "claim_steal_margin": 0.08,
+                 # two tracks of one camera are two cows once seen together this many seconds with
+                 # boxes overlapping less than cannot_link_max_iou (mct.CoSeen)
+                 "cannot_link_min_s": 5, "cannot_link_max_iou": 0.3},
     "lameness": {"enabled": False},
     "alerts": {"baseline_days": 7, "min_baseline_days": 3, "min_observed_minutes": 120,
                "mad_z": 3.0, "rumination_drop": 0.20, "lying_directions": ["low", "high"],
@@ -67,7 +70,15 @@ DEFAULTS = {
     "mct": {"enabled": False, "neighbours": [], "disjoint": [], "portals": [],
             "w_iou": 0.65, "ema": 0.2,
             "reacquire_s": 10.0, "reacquire_sim": 0.7, "reacquire_dist": 0.15,
-            "handover_s": 2.5, "handover_min_sim": 0.5, "handover_margin": 0.05, "portal_extra_sim": 0.08},
+            # a cow lying or standing still: her box back at the same place within still_s is her
+            "still_s": 60.0, "still_iou": 0.5,
+            "handover_s": 2.5, "handover_min_sim": 0.5, "handover_margin": 0.05, "portal_extra_sim": 0.08,
+            # with calibrated cameras (proj_mat or floor_points): a cow is passed on by where she
+            # stands - within handover_dist of a cow another camera sees, the next one at least
+            # handover_dist_margin further (units of the calibration, e.g. cm). apart_dist > 0:
+            # cows seen at the same second this far apart by two cameras are two cows
+            "handover_dist": 100.0, "handover_dist_margin": 50.0, "apart_dist": 0.0,
+            "body_height_lying": 55.0, "body_height_standing": 90.0},
     "cameras": [],
 }
 
@@ -160,6 +171,48 @@ def in_zone(box, cam, w, h, tracking=False):
     mask = (cam.get("tracking_mask") or cam.get("mask")) if tracking else cam.get("mask")
     return in_mask(box, mask) and big_enough(box, w, h, zone_min_area(cam),
                                                           cam.get("min_box_side_px", 0))
+
+
+def homography(src, dst):
+    """3x3 H with dst ~ H @ src from >= 4 point pairs (DLT)."""
+    import numpy as np
+    A = []
+    for (x, y), (u, v) in zip(src, dst):
+        A.append([-x, -y, -1, 0, 0, 0, u * x, u * y, u])
+        A.append([0, 0, 0, -x, -y, -1, v * x, v * y, v])
+    H = np.linalg.svd(np.asarray(A, float))[2][-1].reshape(3, 3)
+    return H / H[2, 2]
+
+
+def floor_mapper(cam, mct):
+    """A camera's box -> where the cow is on the floor, or None for a camera without calibration.
+
+    proj_mat (3x4, world -> pixels of a proj_size [w, h] image, e.g. MmCows'): the box centre is taken
+    back to the plane at the cow's body height - body_height_lying / _standing, mixed by p(lying) -
+    since a lying cow's centre is much lower than a standing one's. floor_points [[u, v, X, Y], ...]
+    (>= 4, u v in 0-1 of the frame, X Y measured on the floor): a floor homography, applied to the
+    box's bottom centre (where a cow touches the floor, as seen from above-and-aside)."""
+    import numpy as np
+    if cam.get("proj_mat"):
+        P = np.asarray(cam["proj_mat"], float).reshape(3, 4)
+        w, h = cam.get("proj_size") or (1.0, 1.0)
+        lo, hi = mct["body_height_lying"], mct["body_height_standing"]
+
+        def f(box, p_lying=0.5):
+            z = p_lying * lo + (1 - p_lying) * hi
+            H = np.stack([P[:, 0], P[:, 1], P[:, 2] * z + P[:, 3]], 1)
+            q = np.linalg.solve(H, [(box[0] + box[2]) / 2 * w, (box[1] + box[3]) / 2 * h, 1.0])
+            return (float(q[0] / q[2]), float(q[1] / q[2]))
+        return f
+    pts = cam.get("floor_points")
+    if pts and len(pts) >= 4:
+        Hinv = homography([(u, v) for u, v, _, _ in pts], [(x, y) for _, _, x, y in pts])
+
+        def g(box, p_lying=0.5):
+            q = Hinv @ np.array([(box[0] + box[2]) / 2, box[3], 1.0])
+            return (float(q[0] / q[2]), float(q[1] / q[2]))
+        return g
+    return None
 
 
 _BLANK_CACHE = {}

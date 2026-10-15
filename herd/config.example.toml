@@ -86,6 +86,14 @@ handover_min_sim = 0.5          # frame id vs the track's running average, and a
 handover_margin = 0.05          # this much above the next candidate (else a new track)
 reacquire_s = 10.0              # a cow hidden this long is taken back near where she was ...
 reacquire_sim = 0.7             # ... if her frame id is this close
+still_s = 60                    # a cow lying / standing still: her box back at the same place (IoU >=
+still_iou = 0.5                 # still_iou) within still_s is her, whatever she looks like
+# Calibrated cameras (per camera floor_points, see below): cows are passed between cameras by where
+# they stand, not by how they look - from opposite sides a cow does not look the same (MmCows: the
+# look passed 0.1% of cows right, the floor place - see herd/mct_eval.py)
+handover_dist = 100             # floor distance (the floor_points' units, e.g. cm) to be the same cow
+handover_dist_margin = 50       # and the next cow at least this much further
+apart_dist = 0                  # > 0: two cameras' cows this far apart at the same second are two cows
 # a blind passage between two cameras: a cow lost by `from` min_s..max_s ago may come out in `to`
 # [[mct.portals]]
 # from = "cam2"
@@ -106,6 +114,9 @@ mask = [[0.0, 0.0], [0.55, 0.0], [0.55, 1.0], [0.0, 1.0]]
 # cows are still counted only in mask. handover_zone (optional): where a neighbour's cow may come in
 # tracking_mask = [[0.0, 0.0], [0.75, 0.0], [0.75, 1.0], [0.0, 1.0]]
 # handover_zone = [[0.45, 0.0], [0.75, 0.0], [0.75, 1.0], [0.45, 1.0]]
+# with [mct]: >= 4 marks on the floor, [u, v] in the frame (0-1) and [X, Y] measured (cm), the same
+# floor axes for every camera - cows are then handed over by where they stand
+# floor_points = [[0.10, 0.90, 0, 0], [0.90, 0.90, 800, 0], [0.80, 0.20, 800, 1200], [0.20, 0.20, 0, 1200]]
 # optional: a part of the view to grey out before the detector (one polygon or a list),
 # for what the size cut does not catch - e.g. a neighbour's pen behind a rail
 # exclude = [[0.0, 0.0], [1.0, 0.0], [1.0, 0.15], [0.0, 0.15]]

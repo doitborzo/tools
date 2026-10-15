@@ -7,16 +7,21 @@
 #   2. fetch: MmCows 7/25 from 12:00 + START min, MINUTES (60; up to 180) at a frame every STEP s,
 #      4 cameras (~0.7 MB a frame read, ~0.3 MB kept), and the 15 s labels with the cows' numbers
 #   3. embed (GPU): detector -> crops -> DINOv2 -> frame heads, every frame of every camera
-#   4. score (CPU): IoU tracker per camera vs GlobalTracker per camera vs across cameras, frame id vs
-#      DINOv2, a sweep of handover_min_sim; new cows grouped by gallery.enroll with / without cannot_link
-#   5. WORK/export/herd_mct_<date>.tgz: mct_eval.json and the log
+#   4. score (CPU): the IoU tracker per camera, GlobalTracker per camera (+ cows lying still held by
+#      their place), and across cameras by the floor point (MmCows' projection matrices; body height
+#      from p(lying)); cannot_link with evidence; new cows grouped by gallery.enroll
+#   5. show: SHOW_MIN minutes (10) of the four cameras and the floor as a video and stills - every box
+#      in its track's colour, the cow the track mostly is and the true one (red when they differ);
+#      SHOW_VARIANT (default: the best tracker of the table)
+#   6. WORK/export/herd_mct_<date>.tgz: mct_eval.json, the log, show/ (ids.mp4 - VLC; index.html)
 #
 #   bash herd/mct_pod.sh          start in tmux "herd-mct"
 #   bash herd/mct_pod.sh log      follow it
 #   bash herd/mct_pod.sh stop
 #
 # Knobs: WORK=/workspace  RUN=run9  DET=<best/> (default: the newest)  MINUTES=60  START=0  STEP=1
-#        SWEEP="0.3 0.4 0.6 0.7 0.8"
+#        SHOW_MIN=10  SHOW_VARIANT=<a tracker of the table>  APPEARANCE=1 (also hand over by look)
+# An older run's frames are kept; its embeddings are redone once (they had no posture).
 # MmCows: CC BY-NC-SA 4.0 (non-commercial). Every step resumes (frames fetched and cameras embedded are kept).
 
 set -euo pipefail
@@ -46,7 +51,7 @@ if [ -z "${HERD_MCT_IN_TMUX:-}" ]; then
     fi
     mkdir -p "$M"
     knobs=""
-    for v in WORK RUN DET MINUTES START STEP SWEEP MODELS; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
+    for v in WORK RUN DET MINUTES START STEP SHOW_MIN SHOW_VARIANT APPEARANCE MODELS; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env HERD_MCT_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/mct_pod.sh"); echo; echo '[mct finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log   ($LOG)"
@@ -99,12 +104,17 @@ step "Embed: detector -> DINOv2 -> frame heads (GPU)"
 "$PY" "$HERE/mct_eval.py" embed --data "$M" --model "$H/$RUN/model.pt" --detector "$DET"
 
 step "Score"
-"$PY" "$HERE/mct_eval.py" score --data "$M" --sweep ${SWEEP:-0.3 0.4 0.6 0.7 0.8}
+app=(); [ "${APPEARANCE:-0}" = "1" ] && app=(--appearance)
+"$PY" "$HERE/mct_eval.py" score --data "$M" "${app[@]}"
+
+step "Show: who is who, drawn"
+V="${SHOW_VARIANT:-$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1]))['data']['best'])" "$M/mct_eval.json")}"
+"$PY" "$HERE/mct_eval.py" show --data "$M" --variant "$V" --minutes "${SHOW_MIN:-10}" "${app[@]}"
 
 mkdir -p "$WORK/export"
 T="$WORK/export/herd_mct_$(date +%Y%m%d_%H%M).tgz"
 parts=()
-for p in "$M/mct_eval.json" "$LOG"; do
+for p in "$M/mct_eval.json" "$LOG" "$M/show"; do
     [ -e "$p" ] && parts+=("${p#"$WORK"/}")
 done
 (cd "$WORK" && tar -czf "$T" "${parts[@]}")

@@ -53,7 +53,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from common import DEFAULTS, iou, write_json  # noqa: E402
+from common import DEFAULTS, POSTURES, floor_mapper, iou, write_json  # noqa: E402
 
 HF = "https://huggingface.co/datasets/neis-lab/mmcows/resolve/main"
 DAY = "0725"
@@ -84,14 +84,14 @@ def cmd_fetch(args):
     names = vz.names()
     labels = [n for n in names if f"/labels/combined/{DAY}/" in n and n.endswith(".txt")
               and t0 <= (_ts(n) or 0) < t1 and n.split("/")[-2] in args.cams]
-    extra = [n for n in names if f"/proj_mat/{DAY}/" in n]
+    extra = [n for n in names if f"/proj_mat/{DAY}/" in n or ("/visual_location/" in n and n.endswith(".csv"))]
     for n in labels + extra:
-        sub = "labels/" + n.split("/")[-2] if n in labels else "proj_mat"
+        sub = "labels/" + n.split("/")[-2] if n in labels else ("proj_mat" if "/proj_mat/" in n else "visual_location")
         out = os.path.join(args.data, sub, os.path.basename(n))
         if not os.path.exists(out):
             os.makedirs(os.path.dirname(out), exist_ok=True)
             open(out, "wb").write(vz.read(n))
-    print(f"[fetch] {len(labels)} label files, {len(extra)} projection matrices", flush=True)
+    print(f"[fetch] {len(labels)} label files, projection matrices and the cows' positions", flush=True)
     meta = {"day": DAY, "start_ts": t0, "end_ts": t1, "step": args.step, "cams": list(args.cams),
             "max_side": args.max_side, "source": HF, "licence": "CC BY-NC-SA 4.0"}
     for cam in args.cams:
@@ -160,13 +160,13 @@ def cmd_embed(args):
     os.makedirs(os.path.join(args.data, "emb"), exist_ok=True)
     for cam in meta["cams"]:
         out = os.path.join(args.data, "emb", f"{cam}.npz")
-        if os.path.exists(out) and not args.force:
+        if os.path.exists(out) and not args.force and "lying" in np.load(out).files:
             print(f"[embed] {cam}: there already", flush=True)
             continue
         folder = os.path.join(args.data, "frames", cam)
         tss = sorted(int(f[:-4]) for f in os.listdir(folder) if f.endswith(".jpg"))
         load = lambda ts: np.asarray(Image.open(os.path.join(folder, f"{ts}.jpg")).convert("RGB"))
-        T, N, B, C, F = [], [], [], [], []
+        T, N, B, C, F, L = [], [], [], [], [], []
         start = time.time()
         with cf.ThreadPoolExecutor(4) as ex:
             for k in range(0, len(tss), args.batch):
@@ -177,8 +177,9 @@ def cmd_embed(args):
                 boxes = [b for bs in dets for b in bs]
                 if pairs:
                     feats = models.encode(pipeline.crops_of(pairs, models.crop_size, models.margin))
-                    _, _, ids = models.frame_heads(feats, boxes, urgent=False, with_id=True)
+                    pp, _, ids = models.frame_heads(feats, boxes, urgent=False, with_id=True)
                     F.append(np.asarray(ids, np.float16))
+                    L.append(pp[:, POSTURES.index("lying")].astype(np.float32))
                     C.append(feats[:, :hidden].float().cpu().numpy().astype(np.float16))
                     B.append(np.asarray(boxes, np.float32))
                 T += chunk
@@ -191,7 +192,8 @@ def cmd_embed(args):
         np.savez(out, ts=np.array(T, np.int64), n=np.array(N, np.int32),
                  boxes=np.concatenate(B) if B else np.zeros((0, 4), np.float32),
                  cls=np.concatenate(C) if C else np.zeros((0, hidden), np.float16),
-                 fid=np.concatenate(F) if F else np.zeros((0, 0), np.float16))
+                 fid=np.concatenate(F) if F else np.zeros((0, 0), np.float16),
+                 lying=np.concatenate(L) if L else np.zeros((0,), np.float32))
         print(f"\n[embed] {cam}: {len(T)} frames, {sum(N)} boxes ({sum(N) / max(1, len(T)):.1f} a frame) -> {out}",
               flush=True)
 
@@ -199,14 +201,16 @@ def cmd_embed(args):
 # ------------------------------------------------------------------ score
 
 def load_emb(data, cams):
-    """{cam: {ts: [(box, fid or None, cls)]}}"""
+    """{cam: {ts: [(box, fid or None, cls, p_lying or None)]}}"""
     out = {}
     for cam in cams:
         z = np.load(os.path.join(data, "emb", f"{cam}.npz"))
         boxes, cls, fid = z["boxes"], z["cls"].astype(np.float32), z["fid"].astype(np.float32)
+        lying = z["lying"] if "lying" in z.files else None
         per, i = {}, 0
         for ts, n in zip(z["ts"].tolist(), z["n"].tolist()):
-            per[ts] = [(boxes[j].tolist(), fid[j] if fid.size else None, cls[j]) for j in range(i, i + n)]
+            per[ts] = [(boxes[j].tolist(), fid[j] if fid.size else None, cls[j],
+                        None if lying is None else float(lying[j])) for j in range(i, i + n)]
             i += n
         out[cam] = per
     return out
@@ -269,13 +273,55 @@ def prepare(emb, kind):
     """The vectors a tracker follows: the frame id as it is, or DINOv2's CLS centred on its mean
     (the pen's look common to every cow taken out) and normalised."""
     if kind == "fid":
-        return {c: {t: [(b, f) for b, f, _ in v] for t, v in per.items()} for c, per in emb.items()}
-    mean = np.mean([x for per in emb.values() for v in per.values() for _, _, x in v], 0)
-    return {c: {t: [(b, _unit(x - mean)) for b, _, x in v] for t, v in per.items()} for c, per in emb.items()}
+        return {c: {t: [(b, f, ly) for b, f, _, ly in v] for t, v in per.items()} for c, per in emb.items()}
+    mean = np.mean([x for per in emb.values() for v in per.values() for _, _, x, _ in v], 0)
+    return {c: {t: [(b, _unit(x - mean), ly) for b, _, x, ly in v] for t, v in per.items()} for c, per in emb.items()}
 
 
-def run_tracker(dets, kind, mct_over=None):
-    """Every second, camera after camera -> ({(cam, ts, j): track}, cannot_link pairs, tracker stats)."""
+PROJ_SIZE = (4480, 2800)                      # MmCows' frames, the pixels its projection matrices map to
+
+
+def proj_mats(data, cams):
+    """{cam: 3x4 projection matrix (world cm -> pixels of the 4480x2800 frame)} from proj_mat/*.xml."""
+    out = {}
+    for cam in cams:
+        path = os.path.join(data, "proj_mat", f"proj_mat_cam{cam.split('_')[-1]}.xml")
+        if os.path.exists(path):
+            m = re.search(r"<projection_matrix.*?<data>(.*?)</data>", open(path, encoding="utf-8").read(), re.S)
+            out[cam] = [float(x) for x in m.group(1).split()]
+    return out
+
+
+def floor_check(gt_map, dets, mats):
+    """How well the floor points agree: on the labelled seconds, the same cow seen by two cameras
+    (distance between their floor points) against two different cows (cm)."""
+    import itertools
+    mappers = {c: floor_mapper({"proj_mat": m, "proj_size": PROJ_SIZE}, DEFAULTS["mct"]) for c, m in mats.items()}
+    at = collections.defaultdict(list)
+    for (cam, ts, j), cow in gt_map.items():
+        if cam in mappers:
+            b, _, ly = dets[cam][ts][j]
+            at[ts].append((cam, cow, mappers[cam](b, 0.5 if ly is None else ly)))
+    same, other = [], []
+    for v in at.values():
+        for (c1, w1, p1), (c2, w2, p2) in itertools.combinations(v, 2):
+            if c1 != c2:
+                (same if w1 == w2 else other).append(float(np.hypot(p1[0] - p2[0], p1[1] - p2[1])))
+    if not same:
+        return None
+    same, other = np.array(same), np.array(other)
+    return {"same_cow_median_cm": float(np.median(same)), "same_cow_p90_cm": float(np.percentile(same, 90)),
+            "same_cow_within_100cm": float(np.mean(same < 100)),
+            "other_cows_p5_cm": float(np.percentile(other, 5)) if other.size else None,
+            "other_cows_within_100cm": float(np.mean(other < 100)) if other.size else None}
+
+
+def run_tracker(dets, kind, mct_over=None, mats=None):
+    """Every second, camera after camera -> ({(cam, ts, j): track}, cannot_link pairs, tracker stats).
+    kind: iou (pipeline.Tracker per camera), cam (GlobalTracker, no neighbours), mct (neighbours by
+    look), geo (passed on by the floor point: mats, the cameras' projection matrices).
+    cannot_link: same camera with evidence (mct.CoSeen, as the pipeline), across cameras from the
+    tracker (apart_dist)."""
     import mct
     import pipeline
     cams = sorted(dets)
@@ -286,9 +332,15 @@ def run_tracker(dets, kind, mct_over=None):
     cfg["mct"].update(mct_over or {})
     if kind == "mct":
         cfg["mct"]["neighbours"] = [[a, b] for i, a in enumerate(cams) for b in cams[i + 1:]]
+    if kind == "geo":
+        for c in cfg["cameras"]:
+            if c["id"] in (mats or {}):
+                c.update(proj_mat=mats[c["id"]], proj_size=list(PROJ_SIZE))
+    co = mct.CoSeen(cfg["identity"]["cannot_link_min_s"], cfg["identity"]["cannot_link_max_iou"])
     trackers = ({c: pipeline.Tracker(c, cfg["tracker"]["iou"], cfg["tracker"]["max_age_s"]) for c in cams}
                 if kind == "iou" else None)
-    glob = mct.GlobalTracker(cfg) if kind != "iou" else None
+    glob = mct.GlobalTracker(cfg, apart=lambda pairs, ts: links.update((min(a, b), max(a, b)) for a, b in pairs)) \
+        if kind != "iou" else None
     for ts in seconds:
         for cam in cams:
             ds = dets[cam].get(ts)
@@ -296,7 +348,7 @@ def run_tracker(dets, kind, mct_over=None):
                 continue
             if trackers is not None:
                 # the IoU tracker returns its tracks in its own order: map back by the box
-                out = trackers[cam].update(float(ts), [b for b, _ in ds])
+                out = trackers[cam].update(float(ts), [d[0] for d in ds])
                 left = list(range(len(ds)))
                 ids = [None] * len(ds)
                 for tid, b in out:
@@ -304,11 +356,11 @@ def run_tracker(dets, kind, mct_over=None):
                     left.remove(j)
                     ids[j] = tid
             else:
-                ids = glob.update(cam, float(ts), [{"box": b, "emb": e} for b, e in ds])
+                ids = glob.update(cam, float(ts), [{"box": b, "emb": e, "p_lying": 0.5 if ly is None else ly}
+                                                   for b, e, ly in ds])
             for j, g in enumerate(ids):
                 got[(cam, ts, j)] = g
-            ids = sorted(set(ids))
-            links.update((a, b) for i, a in enumerate(ids) for b in ids[i + 1:])
+            links.update(co.add(ids, [d[0] for d in ds]))
     return got, links, (dict(glob.stats) if glob else {})
 
 
@@ -326,8 +378,8 @@ def match_gt(gt, dets, thr=0.5):
             n_det += len(ds)
             S = np.full((len(cows), len(ds)), NEG)
             for i, (_, g) in enumerate(cows):
-                for j, (b, _) in enumerate(ds):
-                    v = iou(g, b)
+                for j, d in enumerate(ds):
+                    v = iou(g, d[0])
                     if v >= thr:
                         S[i, j] = v
             for i, j in assign(S):
@@ -458,47 +510,80 @@ def enroll_eval(bursts, links, major, min_bursts, similarity, max_units=600):
     return res
 
 
-def cmd_score(args):
+def variants(args, has_mats):
+    """(name, vector, kind, [mct] overrides) of every tracker scored."""
+    v = [("iou", "fid", "iou", {}),
+         ("fid/cam", "fid", "cam", {"still_s": 0}),           # stage B as it was
+         ("fid/still", "fid", "cam", {})]                      # + a cow lying still held by her place
+    if has_mats:
+        v += [("fid/geo", "fid", "geo", {}),
+              (f"fid/geo+apart{args.apart:g}", "fid", "geo", {"apart_dist": args.apart})]
+        v += [(f"fid/geo@{d:g}", "fid", "geo", {"handover_dist": d}) for d in args.dist_sweep]
+    if args.appearance:
+        v += [("fid/mct", "fid", "mct", {})]
+        v += [(f"fid/mct@{x:g}", "fid", "mct", {"handover_min_sim": x, "reacquire_sim": max(x, 0.7)})
+              for x in args.sweep]
+    if args.dino:
+        v += [("dino/still", "dino", "cam", {}), ("dino/mct", "dino", "mct", {})]
+    return v
+
+
+def load_all(args):
     meta = json.load(open(os.path.join(args.data, "meta.json"), encoding="utf-8"))
     cams = meta["cams"]
     gt = read_labels(args.data, cams)
     emb, outside = in_pen(load_emb(args.data, cams), pen_masks(gt))
-    print(f"[score] {outside:.1%} of the detections are outside the pen (the neighbouring pens) and left out",
-          flush=True)
-    has_fid = any(f is not None for per in emb.values() for v in per.values() for _, f, _ in v)
-    kinds = (["fid"] if has_fid else []) + ["dino"]
+    return meta, cams, gt, emb, outside, proj_mats(args.data, cams)
+
+
+def cmd_score(args):
+    meta, cams, gt, emb, outside, mats = load_all(args)
+    print(f"[score] {outside:.1%} of the detections are outside the pen (the neighbouring pens) and left out; "
+          f"projection matrices for {len(mats)} of {len(cams)} cameras", flush=True)
+    has_lying = any(x[3] is not None for per in emb.values() for v in per.values() for x in v)
+    if mats and not has_lying:
+        print("[score] !! no p(lying) in the embeddings (an older embed): the floor point is taken at one body "
+              "height; mct_eval.py embed again for the posture", flush=True)
     results = {"data": {"cams": cams, "minutes": (meta["end_ts"] - meta["start_ts"]) / 60, "step_s": meta["step"],
-                        "labelled_frames": sum(len(p) for p in gt.values()), "outside_pen": outside}}
+                        "labelled_frames": sum(len(p) for p in gt.values()), "outside_pen": outside,
+                        "cannot_link_rule": {k: DEFAULTS["identity"][k] for k in ("cannot_link_min_s", "cannot_link_max_iou")}}}
+    prepared = {}
     rows = []
-    for vec in kinds:
-        dets = prepare(emb, vec)
-        gt_map, n_gt, n_det = match_gt(gt, dets)
-        results["data"]["detector_recall"] = len(gt_map) / max(1, n_gt)
-        results["data"]["detector_precision"] = len(gt_map) / max(1, n_det)
-        variants = [("iou", "iou", {})] if vec == kinds[0] else []
-        variants += [("cam", "cam", {}), ("mct", "mct", {})]
-        variants += [(f"mct@{s}", "mct", {"handover_min_sim": s, "reacquire_sim": max(s, args.reacquire_floor)})
-                     for s in args.sweep]
-        for name, kind, over in variants:
-            t = time.time()
-            got, links, stats = run_tracker(dets, kind, over)
-            r, major = score_run(got, links, gt_map, gt, dets, n_gt, n_det)
-            r["tracker"] = stats
-            r["tracks"] = len(set(got.values()))
-            r["seconds"] = round(time.time() - t, 1)
-            if vec == "fid" and kind == "mct" and not over:
-                r["enroll"] = enroll_eval(pseudo_bursts(got, dets), links, major, args.min_bursts, args.similarity)
-            key = f"{vec}/{name}" if kind != "iou" else "iou"
-            results[key] = r
-            rows.append((key, r))
-            print(f"[score] {key:16s} IDF1 camera {r['idf1_camera']:.3f} global {r['idf1_global']:.3f}  "
-                  f"tracks/cow {r['tracks_per_cow'] or 0:.1f}  switches {r['id_switches']}  cross-camera same "
-                  f"{(r['cross_cam_same_track'] or 0):.1%}  false merges {r['false_merges']}  false cannot_link "
-                  f"{r['false_cannot_link']}/{r['cannot_link_pairs']}  ({r['seconds']} s)", flush=True)
+    for name, vec, kind, over in variants(args, bool(mats)):
+        if vec not in prepared:
+            prepared[vec] = prepare(emb, vec)
+        dets = prepared[vec]
+        if "gt" not in prepared:
+            prepared["gt"] = match_gt(gt, dets)
+            gt_map, n_gt, n_det = prepared["gt"]
+            results["data"]["detector_recall"] = len(gt_map) / max(1, n_gt)
+            results["data"]["detector_precision"] = len(gt_map) / max(1, n_det)
+            if mats:
+                results["data"]["floor_points"] = fc = floor_check(gt_map, dets, mats)
+                if fc:
+                    print(f"[score] floor points, labelled cows: one cow in two cameras {fc['same_cow_median_cm']:.0f} cm "
+                          f"apart (median; p90 {fc['same_cow_p90_cm']:.0f}, {fc['same_cow_within_100cm']:.0%} within 1 m); "
+                          f"two cows within 1 m {fc['other_cows_within_100cm']:.1%}", flush=True)
+        gt_map, n_gt, n_det = prepared["gt"]
+        t = time.time()
+        got, links, stats = run_tracker(dets, kind, over, mats)
+        r, major = score_run(got, links, gt_map, gt, dets, n_gt, n_det)
+        r.update(tracker=stats, tracks=len(set(got.values())), seconds=round(time.time() - t, 1), mct=over, kind=kind)
+        if name in args.enroll:
+            r["enroll"] = enroll_eval(pseudo_bursts(got, dets), links, major, args.min_bursts, args.similarity)
+        results[name] = r
+        rows.append((name, r))
+        print(f"[score] {name:18s} IDF1 camera {r['idf1_camera']:.3f} global {r['idf1_global']:.3f}  "
+              f"tracks/cow {r['tracks_per_cow'] or 0:.1f}  switches {r['id_switches']}  cross-camera same "
+              f"{(r['cross_cam_same_track'] or 0):.1%}  false merges {r['false_merges']}  false cannot_link "
+              f"{r['false_cannot_link']}/{r['cannot_link_pairs']}  {stats}  ({r['seconds']} s)", flush=True)
+    best = max(rows, key=lambda x: x[1]["idf1_global"])[0]
+    results["data"]["best"] = best
     write_json(os.path.join(args.data, "mct_eval.json"), results)
     d = results["data"]
     print(f"\nMmCows 7/25, {d['minutes']:.0f} min, {len(cams)} cameras; detector at the labelled seconds: recall "
-          f"{d['detector_recall']:.1%}, precision {d['detector_precision']:.1%}\n")
+          f"{d['detector_recall']:.1%}, precision {d['detector_precision']:.1%}; cannot_link after "
+          f"{d['cannot_link_rule']['cannot_link_min_s']} s together\n")
     print("| tracker | IDF1 per camera | IDF1 all cameras | tracks per cow | ID switches / cow / h | "
           "cow in 2 cameras on one track | false merges | false cannot_link | track purity |")
     print("|---|---|---|---|---|---|---|---|---|")
@@ -514,7 +599,110 @@ def cmd_score(args):
                 print(f"  {name:17s} {e['cows_made']} cows made for {e['true_cows']}; ids per cow "
                       f"{e['ids_per_cow'] or 0:.2f}; cows with no id {e['cows_without_id']}; purity "
                       f"{(e['purity'] or 0):.1%}; bursts left in the pool {e['pool_left']}")
-    print(f"\n-> {os.path.join(args.data, 'mct_eval.json')}")
+    print(f"\nbest IDF1 over all cameras: {best}\n-> {os.path.join(args.data, 'mct_eval.json')}")
+
+
+# ------------------------------------------------------------------ show
+
+def cow_positions(data):
+    """{ts: {cow: (x, y)}} from visual_location/*.csv (MmCows' own 3D positions, every 15 s)."""
+    import csv
+    out = collections.defaultdict(dict)
+    folder = os.path.join(data, "visual_location")
+    for f in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+        m = re.match(r"C(\d+)_", f)
+        if m:
+            for r in csv.DictReader(open(os.path.join(folder, f), encoding="utf-8")):
+                out[int(float(r["timestamp"]))][int(m.group(1))] = (float(r["loc_x_cm"]), float(r["loc_y_cm"]))
+    return out
+
+
+def cmd_show(args):
+    """The four cameras and the floor, a frame a second: every box in its track's colour with the
+    track's number, the cow that track mostly is, and - on the labelled seconds - the cow it really
+    is (a red frame when the two differ)."""
+    import cv2
+    from show_ids import Writer, colour, draw_box, header
+    meta, cams, gt, emb, _, mats = load_all(args)
+    known = {n: (vec, kind, over) for n, vec, kind, over in variants(args, bool(mats))}
+    if args.variant not in known:
+        sys.exit(f"--variant: one of {', '.join(known)}")
+    vec, kind, over = known[args.variant]
+    dets = prepare(emb, vec)
+    got, links, _ = run_tracker(dets, kind, over, mats)
+    gt_map, n_gt, n_det = match_gt(gt, dets)
+    r, major = score_run(got, links, gt_map, gt, dets, n_gt, n_det)
+    order = {}
+    for key in sorted(got, key=lambda k: (k[1], k[0], k[2])):
+        order.setdefault(got[key], len(order) + 1)
+    mappers = {c: floor_mapper({"proj_mat": m, "proj_size": PROJ_SIZE}, DEFAULTS["mct"]) for c, m in mats.items()}
+    truth = cow_positions(args.data)
+    t0 = meta["start_ts"] + int(args.from_min * 60)
+    t1 = min(meta["end_ts"], t0 + int(args.minutes * 60))
+    seconds = [t for t in sorted({t for per in dets.values() for t in per}) if t0 <= t < t1]
+    xy = [mappers[c](d[0], 0.5 if d[2] is None else d[2]) for c in mappers for t in seconds for d in dets[c].get(t, [])]
+    TW, TH, PW = 960, 600, 600
+    if xy:
+        xs, ys = np.array(xy).T
+        # the panel is tall: the pen's long side goes down it
+        flip = np.ptp(np.percentile(xs, [1, 99])) > np.ptp(np.percentile(ys, [1, 99]))
+        if flip:
+            xs, ys = ys, xs
+        lo, blo = np.percentile(xs, 1) - 100, np.percentile(ys, 1) - 100
+        # one scale for both axes: the pen keeps its shape
+        k = min((PW - 40) / (np.percentile(xs, 99) + 100 - lo), (2 * TH - 120) / (np.percentile(ys, 99) + 100 - blo))
+    out = os.path.join(args.out or os.path.join(args.data, "show"), args.variant.replace("/", "_"))
+    w = Writer(out, args.fps, args.still_every, f"MmCows: who is who ({args.variant})")
+    wrong = shown = 0
+    for ts in seconds:
+        tiles = []
+        for cam in cams:
+            path = os.path.join(args.data, "frames", cam, f"{ts}.jpg")
+            img = cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB) if os.path.exists(path) else np.zeros((TH, TW, 3), np.uint8)
+            img = cv2.resize(img, (TW, TH), interpolation=cv2.INTER_AREA)
+            for j, d in enumerate(dets[cam].get(ts, [])):
+                g = got[(cam, ts, j)]
+                mc, cow = major.get(g), gt_map.get((cam, ts, j))
+                lines = [f"#{order[g]}" + (f" = cow {mc}" if mc is not None else "")]
+                bad = cow is not None and mc is not None and cow != mc
+                if cow is not None:
+                    lines.append(f"true: cow {cow}" + ("  WRONG" if bad else ""))
+                draw_box(img, d[0], colour(g), lines, bad, scale=0.45)
+                shown += 1
+                wrong += bad
+            header(img, f"{cam}  {len(dets[cam].get(ts, []))} cows", 0.6)
+            tiles.append(img)
+        while len(tiles) < 4:
+            tiles.append(np.zeros((TH, TW, 3), np.uint8))
+        grid = np.vstack([np.hstack(tiles[:2]), np.hstack(tiles[2:4])])
+        panel = np.full((2 * TH, PW, 3), 25, np.uint8)
+        if xy:
+            to = lambda p: (int(((p[1] if flip else p[0]) - lo) * k) + 20, int(((p[0] if flip else p[1]) - blo) * k) + 50)
+            cv2.line(panel, (20, 2 * TH - 30), (20 + int(100 * k), 2 * TH - 30), (200, 200, 200), 2)
+            cv2.putText(panel, "1 m", (26 + int(100 * k), 2 * TH - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+            near = min(truth, key=lambda t: abs(t - ts), default=None)
+            if near is not None and abs(near - ts) <= 7:
+                for cow, p in truth[near].items():
+                    cv2.circle(panel, to(p), 16, (230, 230, 230), 1, cv2.LINE_AA)
+                    cv2.putText(panel, str(cow), (to(p)[0] + 17, to(p)[1] + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                                (230, 230, 230), 1, cv2.LINE_AA)
+            for c in mappers:
+                for j, d in enumerate(dets[c].get(ts, [])):
+                    g = got[(c, ts, j)]
+                    q = to(mappers[c](d[0], 0.5 if d[2] is None else d[2]))
+                    cv2.circle(panel, q, 6, colour(g), -1, cv2.LINE_AA)
+                    cv2.putText(panel, f"#{order[g]}", (q[0] - 10, q[1] - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                colour(g), 1, cv2.LINE_AA)
+        header(panel, "floor: dots = tracks, rings = true cows", 0.5)
+        canvas = np.vstack([np.zeros((32, grid.shape[1] + PW, 3), np.uint8), np.hstack([grid, panel])])
+        stamp = time.strftime("%H:%M:%S", time.gmtime(ts - 5 * 3600))     # the farm's clock (CDT)
+        header(canvas, f"MmCows 7/25 {stamp}   {args.variant}   colour and # = track; '= cow N' = the cow the "
+                       f"track mostly is; red = that is not this cow" + ("   [labelled second]" if any(ts in gt[c] for c in cams) else ""), 0.6)
+        w.add(canvas, f"{stamp}")
+    page = w.close(f"{args.variant}: IDF1 over all cameras {r['idf1_global']:.3f}, one cow in two cameras on one "
+                   f"track {(r['cross_cam_same_track'] or 0):.0%}, {r['tracks_per_cow'] or 0:.1f} tracks per cow. "
+                   f"{wrong} wrong boxes on the labelled seconds shown.")
+    print(f"[show] {len(seconds)} seconds -> {page} and {os.path.join(out, 'ids.mp4')}")
 
 
 def main(argv=None):
@@ -536,14 +724,25 @@ def main(argv=None):
     e.add_argument("--batch", type=int, default=8)
     e.add_argument("--force", action="store_true")
     s = sub.add_parser("score")
-    s.add_argument("--data", required=True)
-    s.add_argument("--sweep", type=float, nargs="*", default=[0.3, 0.4, 0.6, 0.7, 0.8],
-                   help="handover_min_sim values tried for mct besides the default")
-    s.add_argument("--reacquire-floor", type=float, default=0.7)
+    v = sub.add_parser("show")
+    for q in (s, v):
+        q.add_argument("--data", required=True)
+        q.add_argument("--apart", type=float, default=500.0, help="geo+apart: cows this far apart (cm) are two")
+        q.add_argument("--dist-sweep", type=float, nargs="*", default=[60.0, 150.0], help="handover_dist tried (cm)")
+        q.add_argument("--appearance", action="store_true", help="also hand over by look (stage B) with --sweep")
+        q.add_argument("--sweep", type=float, nargs="*", default=[0.6, 0.8], help="handover_min_sim tried with --appearance")
+        q.add_argument("--dino", action="store_true", help="also DINOv2's CLS as the vector")
+    s.add_argument("--enroll", nargs="*", default=["fid/still", "fid/geo"], help="trackers whose tracks enroll is tried on")
     s.add_argument("--min-bursts", type=int, default=10, help="enroll: bursts a new cow needs")
     s.add_argument("--similarity", type=float, default=DEFAULTS["identity"]["new_cow_similarity"])
+    v.add_argument("--variant", default="fid/geo", help="the tracker drawn (a name from score's table)")
+    v.add_argument("--from-min", type=float, default=0.0)
+    v.add_argument("--minutes", type=float, default=10.0)
+    v.add_argument("--fps", type=float, default=4)
+    v.add_argument("--still-every", type=int, default=30)
+    v.add_argument("--out", default=None, help="default <data>/show/<variant>")
     args = p.parse_args(argv)
-    {"fetch": cmd_fetch, "embed": cmd_embed, "score": cmd_score}[args.cmd](args)
+    {"fetch": cmd_fetch, "embed": cmd_embed, "score": cmd_score, "show": cmd_show}[args.cmd](args)
 
 
 if __name__ == "__main__":

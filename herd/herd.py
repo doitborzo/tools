@@ -17,6 +17,7 @@ Training (on CBVD-5 today, on the barn's own footage later):
 Running:
     herd.py run --config barn.toml [--start ISO]   cameras (RTSP) or files -> herd.sqlite
     herd.py stress --model M --detector D          one GPU: a burst alone, then 5 cameras live
+    herd.py show-ids --config barn.toml --cam cam1 --video F --start ISO   who is who, drawn on a recorded file
 
 Barn data for identity (once the barn runs with [training_cache] enabled):
     herd.py barn sheet --cache C --out tracks.html     one thumbnail per track, to write merges.csv
@@ -78,6 +79,9 @@ def main():
     if cmd == "calibrate":
         import calib_boxes
         return calib_boxes.main(argv)
+    if cmd == "show-ids":
+        import show_ids
+        return show_ids.main(argv)
     if cmd == "show-dets":
         import show_dets
         return show_dets.main(argv)

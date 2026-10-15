@@ -165,6 +165,7 @@ time on tracks no cow could be given.
 | `pipeline.py` | cameras -> 1 fps + bursts -> store |
 | `mct.py` | one track per cow across cameras (`[mct]`; a frame id from the herd model on one frame) |
 | `mct_eval.py`, `mct_pod.sh` | that tracker scored on MmCows' four synchronised cameras (GUIDE 4.8) |
+| `show_ids.py` | `herd.py show-ids`: who is who, drawn on a recorded file from the store (video + stills) |
 | `stress.py` | a burst alone, then N cameras live on one GPU: lag, burst time, GPU share |
 | `store.py`, `report.py` | SQLite; per-cow days, CSV, alerts, verdicts |
 | `tests/` | `python herd/tests/run_all.py` |
