@@ -19,8 +19,9 @@ The herd model's fingerprint was taught on CBVD-5, which has no cow ids: it lear
     extract  (GPU) DINOv2 on every crop, as the barn does (square crop with the model's margin, its
              encoder and grid), then pseudo-bursts: a camera's 7 s of one cow (35 crops at 5 Hz) or a
              handful of one cow's pictures of one day, stretched to the barn's 175 frames, each with
-             its cow's id -> DATA/feat/<source>/{train,val} in train.py's format. val: a sixth of each
-             set's cows, never seen in training (the barn's cows are new cows too).
+             its cow's id -> DATA/feat/<source>/{crops.npz, bursts.jsonl} (each crop's vector once, a
+             burst a list of crops). val: a sixth of each set's cows, never seen in training (the
+             barn's cows are new cows too).
     train    a copy of the herd model's temporal transformer taught to put one cow's bursts together
              (supervised contrastive over cow ids, different days and cameras are positives), a
              quarter of the views cut to a single frame (mct.py tracks by one frame a second).
@@ -167,27 +168,12 @@ def make_bursts(rows, rng, val_cows, tracklets):
     return out
 
 
-def write_split(folder, bursts, feats, src, meta):
-    """Pseudo-bursts -> train.py's feature folder (index.jsonl, <clip>.npz, meta.json); a clip per cow."""
+def write_bursts(folder, bursts, src, meta):
+    """One set's pseudo-bursts as lists of crops (feat/<src>/bursts.jsonl, next to crops.npz): every
+    crop's vector is kept once and a burst is stretched to the barn's 175 frames only when used."""
     os.makedirs(folder, exist_ok=True)
-    by_cow = collections.defaultdict(list)
-    for b in bursts:
-        by_cow[b["cow"]].append(b)
-    rows = []
-    for clip, (cow, bs) in enumerate(sorted(by_cow.items())):
-        bf = np.zeros((len(bs), SLOTS, feats.shape[1]), np.float16)
-        bt = np.tile(np.arange(SLOTS, dtype=np.float32) / FPS, (len(bs), 1))
-        for i, b in enumerate(bs):
-            bf[i] = feats[np.asarray(b["frames"])[stretch(len(b["frames"]))]]
-            rows.append({"kind": "burst", "clip": str(clip), "i": i, "identity": f"{src}:{cow}",
-                         "track": f"{src}:{cow}:{b['day']}:{b['cam']}", "day": b["day"], "cam": b["cam"],
-                         "posture": -1, "activity": -1, "rumination": -1, "area": 0.05, "uids": [],
-                         "n_frames": len(b["frames"])})
-        np.savez(os.path.join(folder, f"{clip}.npz"), burst_feats=bf, burst_times=bt,
-                 key_feats=np.zeros((0, feats.shape[1]), np.float16))
-        rows.append({"kind": "clip_done", "clip": str(clip)})
-    with open(os.path.join(folder, "index.jsonl"), "w", encoding="utf-8") as fh:
-        fh.writelines(json.dumps(r) + "\n" for r in rows)
+    with open(os.path.join(folder, "bursts.jsonl"), "w", encoding="utf-8") as fh:
+        fh.writelines(json.dumps(dict(b, identity=f"{src}:{b['cow']}")) + "\n" for b in bursts)
     write_json(os.path.join(folder, "meta.json"), dict(meta, source=src))
 
 
@@ -242,9 +228,12 @@ def cmd_extract(args):
         cows = sorted({r["cow"] for r in rows})
         val = set(random.Random(args.seed).sample(cows, max(1, round(len(cows) * args.val_share))))
         bursts = make_bursts(rows, rng, val, tracklets=src == "multicam")
-        for part in ("train", "val"):
-            write_split(os.path.join(args.data, "feat", src, part), [b for b in bursts if b["split"] == part],
-                        feats, src, dict(meta, dim=int(feats.shape[1])))
+        write_bursts(os.path.join(args.data, "feat", src), bursts, src, dict(meta, dim=int(feats.shape[1])))
+        for part in ("train", "val"):                     # an older extract's stretched copies (GBs)
+            old = os.path.join(args.data, "feat", src, part)
+            if os.path.isdir(old):
+                import shutil
+                shutil.rmtree(old)
         n = collections.Counter(b["split"] for b in bursts)
         print(f"[extract] {src}: {len(cows)} cows ({len(val)} held out), {n['train']} train / {n['val']} val "
               f"bursts", flush=True)
@@ -252,30 +241,90 @@ def cmd_extract(args):
 
 # ------------------------------------------------------------------ train
 
-def load_parts(data, sources, part):
-    from train import Split
-    out = None
-    for src in sources:
-        folder = os.path.join(data, "feat", src, part)
-        if os.path.exists(os.path.join(folder, "index.jsonl")):
-            s = Split(folder)
-            out = s if out is None else out.extend(s)
-    return out
+class Bursts:
+    """One part (train / val) of the sets: every crop's vector once (crops.npz), bursts as lists of crops."""
+
+    def __init__(self, data, sources, part):
+        self.feats, self.bursts = {}, []
+        for src in sources:
+            folder = os.path.join(data, "feat", src)
+            rows = read_jsonl(os.path.join(folder, "bursts.jsonl"))
+            if not rows:
+                continue
+            self.feats[src] = np.load(os.path.join(folder, "crops.npz"))["feats"]
+            self.bursts += [dict(r, src=src) for r in rows if r["split"] == part]
+        names = {}
+        self.identity = np.array([names.setdefault(b["identity"], len(names)) for b in self.bursts], np.int64)
+        self.dim = next(iter(self.feats.values())).shape[1] if self.feats else 0
+
+    def frames(self, i):
+        b = self.bursts[i]
+        return self.feats[b["src"]][b["frames"]]
+
+    def whole(self, i):
+        """The burst stretched to the barn's 175 frames."""
+        f = self.frames(i)
+        return f[stretch(len(f))]
 
 
-def embed(model, split, single=False, batch=128):
-    """Every burst whole (or its middle frame alone) -> fingerprints and the quality summary."""
+def sampler(data, P, K, rng):
+    """P bursts a step: P // K cows with two or more bursts, K bursts of each (other days, other cameras)."""
+    groups = collections.defaultdict(list)
+    for i, g in enumerate(data.identity.tolist()):
+        groups[g].append(i)
+    keys = [g for g, v in groups.items() if len(v) > 1]
+    per = max(2, P // K)
+    while True:
+        rng.shuffle(keys)
+        for i in range(0, max(1, len(keys) - per + 1), per):
+            yield [j for g in keys[i:i + per] for j in rng.sample(groups[g], min(K, len(groups[g])))]
+
+
+def views(data, ids, rng, crop_s, single_p, dev, drop=0.15, block=0.3):
+    """A training view of each burst: a random 2-5.6 s of it (at the barn's 25 fps), frames dropped,
+    sometimes a stretch hidden, single_p of them cut to one frame -> (x, t, valid) padded."""
+    import torch
+    xs, vs = [], []
+    for i in ids:
+        f = data.frames(i)
+        idx = stretch(len(f))
+        n = int(round(rng.uniform(crop_s, 7.0 * 0.8) * FPS))
+        s = rng.randint(0, SLOTS - n)
+        v = np.array([rng.random() > drop for _ in range(n)])
+        if rng.random() < block:
+            k = rng.randint(n // 8, n // 3)
+            j = rng.randint(0, n - k)
+            v[j:j + k] = False
+        if rng.random() < single_p:
+            v[:] = False
+        if not v.any():
+            v[rng.randrange(n)] = True
+        xs.append(f[idx[s:s + n]])
+        vs.append(v)
+    n = max(len(v) for v in vs)
+    x = np.zeros((len(xs), n, data.dim), np.float32)
+    m = np.zeros((len(xs), n), bool)
+    for r, (a, v) in enumerate(zip(xs, vs)):
+        x[r, :len(a)], m[r, :len(v)] = a, v
+    t = torch.arange(n, device=dev).float().div(FPS).expand(len(xs), -1)
+    return torch.from_numpy(x).to(dev), t, torch.from_numpy(m).to(dev)
+
+
+def embed(model, data, single=False, batch=128):
+    """Every burst whole (or its middle crop alone) -> fingerprints and the quality summary."""
     import torch
     from common import device
     dev = device()
-    T = split.burst_feats.shape[1]
     fps, qmax, qmean = [], [], []
     model.eval()
     with torch.no_grad():
-        for i in range(0, len(split.bursts), batch):
-            x = torch.from_numpy(split.burst_feats[i:i + batch]).float().to(dev)
+        for i in range(0, len(data.bursts), batch):
+            ids = range(i, min(i + batch, len(data.bursts)))
             if single:
-                x = x[:, T // 2:T // 2 + 1]
+                x = np.stack([data.frames(k)[len(data.frames(k)) // 2][None] for k in ids])
+            else:
+                x = np.stack([data.whole(k) for k in ids])
+            x = torch.from_numpy(x).float().to(dev)
             t = torch.arange(x.shape[1], device=dev).float().div(FPS).expand(len(x), -1)
             v = torch.ones(x.shape[:2], dtype=torch.bool, device=dev)
             o = model(x, t, v)
@@ -352,13 +401,12 @@ def fit_abstain(rows, max_error, out_path):
 
 def cmd_train(args):
     import torch
-    import train as T
     from common import device
     from model import HerdModel, supcon
     base, ck = HerdModel.load(args.model, map_location=device())
-    tr = load_parts(args.data, args.sources, "train")
-    va = load_parts(args.data, args.sources, "val")
-    if tr is None or va is None:
+    tr = Bursts(args.data, args.sources, "train")
+    va = Bursts(args.data, args.sources, "val")
+    if not tr.bursts or not va.bursts:
         sys.exit("no features: reid.py extract first")
     if tr.dim != base.in_dim:
         sys.exit(f"features of {tr.dim} dims, the model takes {base.in_dim}: extract with this model")
@@ -375,7 +423,7 @@ def cmd_train(args):
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
     steps = max(1, len(tr.bursts) // args.P)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, args.lr, total_steps=args.epochs * steps, pct_start=0.05)
-    sampler = T.identity_sampler(tr, args.P, rng, K=args.K)
+    batches = sampler(tr, args.P, args.K, rng)
     os.makedirs(args.out, exist_ok=True)
     best, best_state, best_m, since = -1.0, None, None, 0
     hist = open(os.path.join(args.out, "history.jsonl"), "w", encoding="utf-8")
@@ -383,14 +431,9 @@ def cmd_train(args):
         model.train()
         losses = []
         for _ in range(steps):
-            ids = next(sampler)
-            x, t, v = T.burst_batch(tr, ids, rng, args.crop_s, max_crop_s=7.0)
-            for r in range(len(ids)):              # some views one frame only: mct.py's once a second
-                if rng.random() < args.single_p:
-                    on = torch.nonzero(v[r]).flatten()
-                    keep = on[rng.randrange(len(on))]
-                    v[r] = False
-                    v[r, keep] = True
+            ids = next(batches)
+            # some views one frame only: mct.py follows a cow by one frame a second
+            x, t, v = views(tr, ids, rng, args.crop_s, args.single_p, dev)
             o = model(x, t, v)
             loss = supcon(o["fingerprint"], torch.as_tensor(tr.identity[ids], device=dev), args.temperature)
             opt.zero_grad(set_to_none=True)

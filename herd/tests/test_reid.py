@@ -53,9 +53,11 @@ def test_identity_training_knows_a_cow_on_another_day():
         val = set(cows[:5])
         bursts = reid.make_bursts(rows, random.Random(0), val, tracklets=True)
         meta = {"encoder": "x", "grid": 2, "crop": 224, "margin": 0.1, "dim": dim}
-        for part in ("train", "val"):
-            reid.write_split(os.path.join(d, "feat", "multicam", part), [b for b in bursts if b["split"] == part],
-                             feats, "multicam", meta)
+        folder = os.path.join(d, "feat", "multicam")
+        reid.write_bursts(folder, bursts, "multicam", meta)
+        np.savez(os.path.join(folder, "crops.npz"), feats=feats)          # each crop's vector once
+        tr = reid.Bursts(d, ["multicam"], "train")
+        assert len(tr.bursts) == 15 * 3 * 2 and tr.whole(0).shape == (reid.SLOTS, dim)
         torch.manual_seed(0)
         m = mdl.HerdModel(dim, d=32, layers=1, heads=2)
         mp = os.path.join(d, "model.pt")
