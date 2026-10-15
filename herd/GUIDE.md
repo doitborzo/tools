@@ -530,6 +530,9 @@ be checked on the barn's data.
 
 ## 7. Running in the barn
 
+Step by step, from an empty server (environment, models, masks, systemd, cron, backups):
+`SETUP.md`. In short:
+
 1. `cp herd/config.example.toml barn.toml` and fill in:
    - `[farm]` — time zone, the change-over day and hour;
    - `[[cameras]]` — `id`, `url` (RTSP), `mask` — the polygon of floor that belongs to

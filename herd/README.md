@@ -168,6 +168,7 @@ time on tracks no cow could be given.
 | `show_ids.py` | `herd.py show-ids`: who is who, drawn on a recorded file from the store (video + stills) |
 | `stress.py` | a burst alone, then N cameras live on one GPU: lag, burst time, GPU share |
 | `store.py`, `report.py` | SQLite; per-cow days, CSV, alerts, verdicts |
+| `SETUP.md` | setting up a barn step by step: server, models, masks, systemd, reports |
 | `tests/` | `python herd/tests/run_all.py` |
 
 Stage B (LoRA on the frame encoder, end to end on images) is the next step if
