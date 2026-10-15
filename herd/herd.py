@@ -10,6 +10,7 @@ Training (on CBVD-5 today, on the barn's own footage later):
     herd.py eval                            val scores + cowbench-format results
     herd.py eval-det --run R                the same on the detector's boxes: detector misses count
     herd.py calibrate --detector D          the detector's boxes reshaped to the annotation's habit
+    herd.py show-dets --src DIR --detector D  every box a detector draws on a folder / video, as an HTML gallery
     herd.py abstain                         the NaN model and its cut-off
 
 Running:
@@ -76,6 +77,9 @@ def main():
     if cmd == "calibrate":
         import calib_boxes
         return calib_boxes.main(argv)
+    if cmd == "show-dets":
+        import show_dets
+        return show_dets.main(argv)
     if cmd == "eval-det":
         import eval_det
         return eval_det.main(argv)

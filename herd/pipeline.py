@@ -145,6 +145,21 @@ class Models:
                                          tiles=cfg["detector"].get("tiles"))
         self.lameness = cfg["lameness"]["enabled"]
         self.motion_dim = self.model.motion_dim
+        # rumination.py's model, when the config names one: it reads the same frame vectors
+        # (it must have been trained on this encoder's) and decides rumination in place of the head
+        self.rum_model = None
+        rp = cfg["model"].get("rumination")
+        if rp:
+            from model import TemporalModel
+            rk = torch.load(rp, map_location=self.dev, weights_only=False)
+            want = {k: rk["features"].get(k) for k in ("encoder", "grid", "crop", "margin")}
+            have = {k: self.features_meta.get(k) for k in want}
+            if want != have:
+                raise SystemExit(f"{rp} was trained on frame vectors {want}, the herd model's are {have}")
+            self.rum_model = TemporalModel(rk["in_dim"], **rk["kw"]).to(self.dev).eval()
+            self.rum_model.load_state_dict(rk["state"])
+            self.rum_model_thr = float(rk["threshold"])
+            self.motion_dim = max(self.motion_dim, rk["kw"].get("motion_dim", 0))
         # The cut-off calibrated with the model: "ruminating" per burst, summed
         # into minutes by the reports (the one that keeps the share true).
         try:
@@ -208,12 +223,38 @@ class Models:
                    "posture": POSTURES[int(o["posture"][0].argmax())],
                    "activity": ACTIVITIES[int(o["activity"][0].argmax())],
                    "lameness": float(o["lameness"][0]) if self.lameness else None}
+            if self.rum_model is not None:
+                r = self.rum_model(feats.unsqueeze(0).float(), torch.as_tensor(times, device=self.dev).unsqueeze(0).float(),
+                                   torch.as_tensor(valid, device=self.dev).unsqueeze(0),
+                                   motion=mot if self.rum_model.motion_dim else None)
+                out["rumination"] = float(r["rumination"][0].sigmoid())
+        if self.rum_model is not None:
+            out["ruminating"] = bool(out["rumination"] >= self.rum_model_thr)
+            return out
         # a cow that feeds or drinks is not ruminating, whatever the head says
         out["ruminating"] = bool(out["rumination"] >= self.rum_thr and out["activity"] == "none")
         return out
 
 
 # ------------------------------------------------------------------- camera
+
+def link_chains(stamped, iou_thr):
+    """A burst's detections [(t, [boxes])] in time order -> chains [{t: box}]: each box goes to the
+    chain whose last box overlaps it most (IoU >= iou_thr), the rest start chains of their own."""
+    chains = []
+    for ts, boxes in stamped:
+        used = set()
+        for ch in chains:
+            last_t = max(ch)
+            cands = [(iou(ch[last_t], b), j) for j, b in enumerate(boxes) if j not in used]
+            if cands:
+                v, j = max(cands)
+                if v >= iou_thr:
+                    ch[ts] = boxes[j]
+                    used.add(j)
+        chains += [{ts: b} for j, b in enumerate(boxes) if j not in used]
+    return chains
+
 
 _CROP_POOL = None
 
@@ -344,19 +385,8 @@ class Camera:
         t = time.perf_counter()
         detections = self.models.detect_many([self.blank(img) for _, img in sampled], kind="burst_detect")
         part["detect"] += time.perf_counter() - t
-        chains = []                                       # [{t: box}]
-        for (ts, img), found in zip(sampled, detections):
-            boxes = self.zone(found, img)
-            used = set()
-            for ch in chains:
-                last_t = max(ch)
-                cands = [(iou(ch[last_t], b), j) for j, b in enumerate(boxes) if j not in used]
-                if cands:
-                    v, j = max(cands)
-                    if v >= self.cfg["tracker"]["iou"]:
-                        ch[ts] = boxes[j]
-                        used.add(j)
-            chains += [{ts: b} for j, b in enumerate(boxes) if j not in used]
+        chains = link_chains([(ts, self.zone(found, img)) for (ts, img), found in zip(sampled, detections)],
+                             self.cfg["tracker"]["iou"])
         size = self.models.crop_size
         cows = crops_n = rum_yes = 0
         rum_p = []
