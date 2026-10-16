@@ -494,3 +494,20 @@ def test_report_follows_joined_tracks():
         store.link_tracks(160.0, "t-c", "t-b")
         assert store.track_roots() == {"t-b": "t-a", "t-c": "t-a"}
         assert report.track_map(store) == {"t-a": "A", "t-b": "A", "t-c": "A"}
+
+
+def test_linker_refuses_a_chain_that_joins_cows_apart():
+    """A=B and B=C must not make A=C when A and C stood apart (link_contra)."""
+    import mct
+    pts = [[0, 0, 0, 0], [1, 0, 1000, 0], [1, 1, 1000, 1000], [0, 1, 0, 1000]]
+    cfg = _cfg()
+    cfg["cameras"] = [{"id": c, "mask": [], "floor_points": pts} for c in ("a", "b", "c")]
+    cfg["mct"].update(link_contra=0.3, link_min_s=3, link_share=0.3)
+    lk = mct.TrackletLinker(cfg)
+    box = lambda x: [x - 0.03, 0.45, x + 0.03, 0.5]
+    for k in range(20):
+        # a sees a cow at x=0.2, c a cow at x=0.4 the whole time; b's one track walks from a's cow to c's
+        bx = 0.25 + 0.1 * k / 19
+        out = lk.update_all(float(k), {"a": [{"box": box(0.2)}], "b": [{"box": box(bx)}], "c": [{"box": box(0.4)}]})
+    assert out["a"][0] != out["c"][0]
+    assert lk.stats["linked"] >= 1 and lk.stats["link_contradicted"] >= 1

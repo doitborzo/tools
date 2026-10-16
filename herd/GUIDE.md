@@ -367,7 +367,12 @@ one camera is joined to a track of another when for `link_min_s` (5) seconds the
 other's nearest on the floor within `link_dist` (120 cm, at the height where they agree), in
 `link_share` (60%) of the seconds both were seen — never two tracks one camera saw at the same
 time. Joins are written to `track_links`; reports read every track under the one it was finally
-joined to. With the identity model set `reacquire_sim = 0.9` (its space is tighter: at 0.7 a
+joined to. MmCows (60 min, 4 cameras): IDF1 over all cameras 0.499 (the system without `[mct]`
+0.244, handover by place 0.351), 6.9 tracks a cow (24.2), a cow in two cameras on one track 44%,
+but tracks 73% pure - some joins chain wrong cows (A=B, B=C, so A=C). Strict joining against
+that: `link_margin` (the next cow that much further) and `link_contra` (no join that puts
+together two tracks of other cameras seen together `link_contra_s` seconds yet near in less
+than that share of them). With the identity model set `reacquire_sim = 0.9` (its space is tighter: at 0.7 a
 camera took back the wrong cow).
 
 **By look alone, cows are not passed between cameras.** MmCows (60 min, 4 cameras):

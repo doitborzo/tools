@@ -89,6 +89,9 @@ DEFAULTS = {
             # link_min_s seconds they were each other's nearest on the floor within link_dist, in
             # link_share of the seconds both were seen (mct.TrackletLinker; reports follow track_links)
             "link_dist": 120.0, "link_min_s": 5, "link_share": 0.6,
+            # strict joining (off at 0): the next cow link_margin further; no join of two groups holding
+            # tracks seen together link_contra_s seconds but near in less than link_contra of them
+            "link_margin": 0.0, "link_contra_s": 10, "link_contra": 0.0,
             "body_height_lying": 55.0, "body_height_standing": 90.0},
     "cameras": [],
 }

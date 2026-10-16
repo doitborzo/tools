@@ -579,6 +579,12 @@ class TrackletLinker:
         self.dist = m.get("link_dist", 120.0)
         self.min_s = m.get("link_min_s", 5)
         self.share = m.get("link_share", 0.6)
+        # strict joining: the next cow at least link_margin further than the pair; and no join that would
+        # put together two tracks of other cameras seen at the same time for link_contra_s seconds yet
+        # near in less than link_contra of them (A=B and B=C must not make A=C when A and C stood apart)
+        self.margin = m.get("link_margin", 0.0)
+        self.contra_s = m.get("link_contra_s", 10)
+        self.contra = m.get("link_contra", 0.0)
         self.pen = m.get("height_penalty", 40.0)
         self.parent = {}
         self.members = collections.defaultdict(set)           # root -> tracks
@@ -595,14 +601,24 @@ class TrackletLinker:
             t = self.parent[t]
         return t
 
+    @staticmethod
+    def _key(a, b):
+        return (a, b) if a <= b else (b, a)
+
     def _mergeable(self, ra, rb):
-        """Never two tracks of one camera that lived at the same time."""
+        """Never two tracks of one camera that lived at the same time; with link_contra, never two tracks of
+        other cameras that were seen together long enough and mostly apart."""
         for a in self.members[ra] or {ra}:
             ca, fa, la = self.life[a]
             for b in self.members[rb] or {rb}:
                 cb, fb, lb = self.life[b]
                 if ca == cb and fa <= lb and fb <= la:
                     return False
+                if self.contra and ca != cb:
+                    k = self._key(a, b)
+                    if self.both[k] >= self.contra_s and self.near[k] < self.contra * self.both[k]:
+                        self.stats["link_contradicted"] += 1
+                        return False
         return True
 
     def _union(self, a, b, ts):
@@ -647,13 +663,19 @@ class TrackletLinker:
                     D = np.array([[self._d(p, q) for q in pts[cb]] for p in pts[ca]])
                     for x, ga in enumerate(ids[ca]):
                         for y, gb in enumerate(ids[cb]):
-                            self.both[(ga, gb)] += 1
+                            self.both[self._key(ga, gb)] += 1
                     if D.size == 0:
                         continue
                     bx, by = D.argmin(1), D.argmin(0)
                     for x, y in enumerate(bx):
                         if by[y] == x and D[x, y] <= self.dist:
-                            k = (ids[ca][x], ids[cb][y])
+                            if self.margin:
+                                row = np.delete(D[x], y)
+                                col = np.delete(D[:, y], x)
+                                others = np.concatenate([row, col])
+                                if others.size and others.min() < D[x, y] + self.margin:
+                                    continue
+                            k = self._key(ids[ca][x], ids[cb][y])
                             self.near[k] += 1
                             if self.near[k] >= self.min_s and self.near[k] >= self.share * self.both[k]:
                                 self._union(k[0], k[1], ts)

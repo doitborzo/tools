@@ -592,6 +592,12 @@ def variants(args, has_mats):
               ("fid/link-final", "fid", "link-final", {"reacquire_sim": 0.9})]
         v += [(f"fid/link-final@{d:g}", "fid", "link-final", {"reacquire_sim": 0.9, "link_dist": d})
               for d in args.link_sweep]
+        strict = {"reacquire_sim": 0.9, "link_margin": 50.0, "link_contra": 0.3}
+        v += [("fid/link-final+margin", "fid", "link-final", {"reacquire_sim": 0.9, "link_margin": 50.0}),
+              ("fid/link-final+contra", "fid", "link-final", {"reacquire_sim": 0.9, "link_contra": 0.3}),
+              ("fid/link+strict", "fid", "link", dict(strict)),
+              ("fid/link-final+strict", "fid", "link-final", dict(strict)),
+              ("fid/link-final+strict10", "fid", "link-final", dict(strict, link_min_s=10))]
     if args.appearance:
         v += [("fid/mct", "fid", "mct", {})]
         v += [(f"fid/mct@{x:g}", "fid", "mct", {"handover_min_sim": x, "reacquire_sim": max(x, 0.7)})
@@ -817,7 +823,7 @@ def main(argv=None):
                        help="reacquire_sim tried (the frame id's space differs with an identity model)")
         q.add_argument("--fuse-sweep", type=float, nargs="*", default=[120.0, 200.0], help="fused: fuse_dist tried (cm)")
         q.add_argument("--link-sweep", type=float, nargs="*", default=[80.0, 160.0], help="link: link_dist tried (cm)")
-    s.add_argument("--enroll", nargs="*", default=["fid/still", "fid/geo", "fid/fused", "fid/link-final"],
+    s.add_argument("--enroll", nargs="*", default=["fid/still~0.9", "fid/link-final", "fid/link-final+strict"],
                    help="trackers whose tracks enroll is tried on")
     s.add_argument("--min-bursts", type=int, default=10, help="enroll: bursts a new cow needs")
     s.add_argument("--similarity", type=float, nargs="+", default=[0.55, 0.7, 0.8, 0.9],
