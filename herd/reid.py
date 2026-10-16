@@ -86,10 +86,11 @@ SOURCES = {
                  "licence": "Non-Commercial Government Licence", "cite": "Gao et al., Cows2021, arXiv 2105.01938"},
     "opencows": {"url": None, "licence": "UK Non-Commercial Government Licence v2",
                  "cite": "Andrew et al., OpenCows2020"},          # the url is extra_det's (one zip for both)
+    # Zenodo answers many Range requests with 429: its zips are downloaded whole (0.7 GB; 25 GB) and read locally
     "cobra": {"url": f"{ZENODO}/15018518/files/re_identification_youngstock.zip?download=1", "licence": "CC BY 4.0",
-              "cite": "CoBRA re-identification youngstock, Zenodo 15018518"},
+              "cite": "CoBRA re-identification youngstock, Zenodo 15018518", "whole": True},
     "sideview": {"url": {s: f"{ZENODO}/21605650/files/{s}.zip?download=1" for s in ("snapshots", "barn", "parlor")},
-                 "licence": "CC BY 4.0", "cite": "Moeller, SideViewCows2026, Zenodo 21605650"},
+                 "licence": "CC BY 4.0", "cite": "Moeller, SideViewCows2026, Zenodo 21605650", "whole": True},
     "mmcows": {"url": MMCOWS, "licence": "CC BY-NC-SA 4.0", "cite": "Vu et al., MmCows, NeurIPS 2024"},
 }
 SIDEVIEW_STRIDE = {"snapshots": 1, "barn": 5, "parlor": 10}   # video frames: every k-th (neighbours are alike)
@@ -167,7 +168,7 @@ def as_jpeg(data):
 def cmd_fetch(args):
     sys.path.insert(0, os.path.join(os.path.dirname(HERE), "cowbench"))
     from extra_det import SOURCES as DET_SOURCES
-    from extra_det import RemoteZip
+    from extra_det import LocalZip, RemoteZip, download
     for src in args.sources:
         if src == "mmcows":
             fetch_mmcows(args)
@@ -175,9 +176,21 @@ def cmd_fetch(args):
         url = SOURCES[src]["url"] or DET_SOURCES["opencows"]["url"]
         folder = os.path.join(args.data, "raw", src)
         os.makedirs(folder, exist_ok=True)
-        rows, todo = [], []
-        for url in (url.values() if isinstance(url, dict) else [url]):
-            z = RemoteZip(url)
+        done_mark = os.path.join(folder, "complete.json")
+        if os.path.exists(done_mark) and os.path.exists(os.path.join(folder, "index.jsonl")):
+            print(f"[fetch] {src}: there already ({json.load(open(done_mark))['crops']} crops)", flush=True)
+            continue
+        rows, todo, zips = [], [], []
+        urls = url if isinstance(url, dict) else {"": url}
+        for part, url in urls.items():
+            if SOURCES[src].get("whole"):
+                path = os.path.join(args.data, "zips", f"{src}{'_' + part if part else ''}.zip")
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                print(f"[fetch] {src}{' ' + part if part else ''}: downloading the zip whole", flush=True)
+                z = LocalZip(download(url, path))
+                zips.append(path)
+            else:
+                z = RemoteZip(url)
             names = z.names()
             items = plan(src, names)
             if args.max_per_source:
@@ -218,6 +231,10 @@ def cmd_fetch(args):
         rows = [r for r in rows if os.path.exists(os.path.join(folder, r["file"]))]
         with open(os.path.join(folder, "index.jsonl"), "w", encoding="utf-8") as fh:
             fh.writelines(json.dumps(r) + "\n" for r in rows)
+        if not args.max_per_source:
+            write_json(done_mark, {"crops": len(rows), "cows": len({r["cow"] for r in rows})})
+            for path in zips if not args.keep_zips else []:
+                os.remove(path)                            # the crops are cut: the GBs of zip go
 
 
 # ------------------------------------------------------------------ MmCows (the domain of mct_eval.py)
@@ -399,6 +416,8 @@ def cmd_label(args):
     root = os.path.join(args.data, "mmcows")
     raw = os.path.join(args.data, "raw", "mmcows")
     days = sorted(os.listdir(os.path.join(root, "frames"))) if os.path.isdir(os.path.join(root, "frames")) else []
+    if args.mm_days:                  # only these (fully fetched) days; the index still lists every labelled day
+        days = [d for d in days if d in args.mm_days]
     if not days:
         sys.exit("no MmCows frames: reid.py fetch --sources mmcows first")
     cfg = _copy.deepcopy(DEFAULTS)
@@ -466,6 +485,8 @@ def cmd_label(args):
                   f"{len(mine)} crops with a cow's number ({'human labels' if day == MM_DAY else 'neck tags'})",
                   flush=True)
     os.makedirs(raw, exist_ok=True)
+    done = os.path.join(root, "labelled")
+    rows = [r for f in sorted(os.listdir(done)) if f.endswith(".jsonl") for r in read_jsonl(os.path.join(done, f))]
     with open(os.path.join(raw, "index.jsonl"), "w", encoding="utf-8") as fh:
         fh.writelines(json.dumps(r) + "\n" for r in rows)
     n = collections.Counter((r["by"], r["split"]) for r in rows)
@@ -474,9 +495,10 @@ def cmd_label(args):
     if check["tag_labels"]:
         print(f"[label] check on {MM_DAY}: the neck tags' labels agree with the human ones on "
               f"{check['tag_right'] / check['tag_labels']:.1%} of {check['tag_labels']} boxes", flush=True)
-    if os.path.exists(os.path.join(raw, "index.jsonl")):
-        write_json(os.path.join(root, "label.json"), {"rows": dict((f"{a}/{b}", c) for (a, b), c in n.items()),
-                                                      "tag_check": dict(check)})
+    old = os.path.join(root, "label.json")
+    if not check["tag_labels"] and os.path.exists(old):               # 7/25 labelled by an earlier call
+        check = json.load(open(old, encoding="utf-8")).get("tag_check", {})
+    write_json(old, {"rows": dict((f"{a}/{b}", c) for (a, b), c in n.items()), "tag_check": dict(check)})
 
 
 # ------------------------------------------------------------------ extract
@@ -873,6 +895,7 @@ def main(argv=None):
         q.add_argument("--sources", nargs="+", default=list(SOURCES), choices=list(SOURCES))
     f.add_argument("--workers", type=int, default=48)
     f.add_argument("--max-per-source", type=int, default=0, help="a quick look: only this many crops a set")
+    f.add_argument("--keep-zips", action="store_true", help="keep the zips downloaded whole (Zenodo's)")
     f.add_argument("--mm-uwb-days", nargs="*", default=["0722", "0728", "0801"],
                    help="MmCows days labelled by the neck tags (7/25 is the human-labelled one)")
     f.add_argument("--mm-uwb-every", type=int, default=30, help="seconds between those days' frames (15, 30, 60...)")
@@ -884,6 +907,8 @@ def main(argv=None):
     lb.add_argument("--batch", type=int, default=8)
     lb.add_argument("--mm-share", type=float, default=0.9, help="a track's seconds its tag must win")
     lb.add_argument("--force", action="store_true", help="label again (else each day and camera once)")
+    lb.add_argument("--mm-days", nargs="*", default=None, help="only these days (the pod labels a day while the "
+                    "next one downloads)")
     for q in (e, t):
         q.add_argument("--model", required=True, help="the herd model (its encoder settings; train starts from it)")
         q.add_argument("--seed", type=int, default=0)

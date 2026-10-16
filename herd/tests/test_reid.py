@@ -209,3 +209,12 @@ def test_label_command_human_and_tag_days():
         assert all(os.path.exists(os.path.join(d, "raw", "mmcows", r["file"])) for r in rows)
         check = json.load(open(os.path.join(root, "label.json")))["tag_check"]
         assert check["tag_labels"] > 0 and check["tag_right"] == check["tag_labels"]
+        # one day again (the pod labels a day while the next downloads): the index keeps every day
+        pipeline.Models = Stub
+        try:
+            reid.main(["label", "--data", d, "--model", "unused.pt", "--detector", "unused", "--mm-days", "0722",
+                       "--force"])
+        finally:
+            pipeline.Models = real
+        again = [json.loads(x) for x in open(os.path.join(d, "raw", "mmcows", "index.jsonl"))]
+        assert len(again) == len(rows) and json.load(open(os.path.join(root, "label.json")))["tag_check"] == check

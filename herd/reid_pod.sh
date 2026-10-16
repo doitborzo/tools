@@ -4,11 +4,13 @@
 #
 #   1. the environment (run_pod.sh step 1), the models from herd_models_*.tgz (export_pod.sh) and the
 #      identity model already trained from herd_reid_*.tgz (this script's earlier export) in WORK
-#   2. fetch: the crops of the sets in SOURCES, read in place from their zips
+#   2. fetch: the crops of the sets in SOURCES (Zenodo's zips are downloaded whole, the others read in
+#      place); Zenodo, Bristol and the last step's MmCows frames download in the background while
+#      MmCows' training days are fetched one at a time, each labelled (GPU) as the next downloads
 #        mmcows    MmCows (the evaluation's own pen and cameras): 7/25 with its human labels outside
 #                  mct_eval's 12:00-15:00 (cows 1-10 train, 11-16 held out), and 3 other days every 30 s
 #        cobra     CoBRA youngstock: 48 heifers from a roof camera, standing and lying (733 MB)
-#        sideview  SideViewCows2026: 110 cows from the side, parlor / barn / snapshots (~6 GB read)
+#        sideview  SideViewCows2026: 110 cows from the side, parlor / barn / snapshots (25 GB of zips)
 #        multicam cows2021 opencows   the top-down sets the first model was trained on
 #   3. label (GPU, mmcows): the detector on its frames; 7/25's boxes by the human labels, the other
 #      days' by the cows' UWB neck tags (tracks voted by the tag's position, ~95% right on 7/25)
@@ -125,19 +127,71 @@ if [ -n "${DET:-}" ] && grep -qs '"kind": *"rfdetr"' "$DET/det_train_meta.json";
 fi
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
-step "Fetch the crops with cow ids ($SOURCES)"
-"$PY" "$HERE/reid.py" fetch --data "$R" --sources $SOURCES --mm-uwb-days ${UWB_DAYS:-0722 0728 0801} \
-    --mm-uwb-every "${UWB_EVERY:-30}"
+# The downloads overlap the GPU: Zenodo's zips (whole, ~26 GB) and the Bristol crops come in the
+# background, while MmCows is fetched a day at a time and each day is labelled (GPU) as the next downloads.
+want() { [[ " $SOURCES " == *" $1 "* ]]; }
+bg_fetch() {   # name, sources... -> a background fetch with its own log; its pid in BG_<name>
+    local name="$1"; shift
+    local srcs=()
+    for s_ in "$@"; do want "$s_" && srcs+=("$s_"); done
+    [ ${#srcs[@]} -gt 0 ] || return 0
+    echo "fetching ${srcs[*]} in the background (log: $R/fetch_$name.log)"
+    "$PY" "$HERE/reid.py" fetch --data "$R" --sources "${srcs[@]}" > "$R/fetch_$name.log" 2>&1 &
+    printf -v "BG_$name" '%s' "$!"
+}
+bg_wait() {    # name, sources... -> wait for it, then extract its sets (a failed fetch: said, and left out)
+    local name="$1"; shift
+    local pid_var="BG_$name"
+    [ -n "${!pid_var:-}" ] || return 0
+    step "Waiting for the background fetch of $*"
+    if wait "${!pid_var}"; then
+        tail -n 4 "$R/fetch_$name.log" | tr '\r' '\n' | grep -v '^ *$' | tail -n 4
+        local srcs=()
+        for s_ in "$@"; do want "$s_" && srcs+=("$s_"); done
+        "$PY" "$HERE/reid.py" extract --data "$R" --sources "${srcs[@]}" --model "$H/$RUN/model.pt"
+    else
+        echo "!! the fetch of $* failed (the end of $R/fetch_$name.log below); training goes on without them"
+        tail -n 15 "$R/fetch_$name.log" | tr '\r' '\n' | grep -v '^ *$' | tail -n 15
+        echo "   (bash $0 again resumes it)"
+    fi
+}
 
-if [[ " $SOURCES " == *" mmcows "* ]]; then
-    step "Label MmCows: the detector's boxes by the human labels (7/25) and the neck tags (other days) (GPU)"
-    [ -n "${DET:-}" ] && [ -f "$DET/det_train_meta.json" ] || { echo "!! no detector best/ under $H (DET=<it>)"; exit 1; }
-    echo "detector $DET"
-    "$PY" "$HERE/reid.py" label --data "$R" --model "$H/$RUN/model.pt" --detector "$DET"
+step "Fetch the crops with cow ids ($SOURCES)"
+bg_fetch zenodo cobra sideview
+bg_fetch bristol multicam cows2021 opencows
+MCT_PID=""
+if [ "${MCT:-1}" = "1" ]; then                      # the last step's frames (mct_pod.sh fetches only what is missing)
+    echo "fetching MmCows' frames for the check in the background (log: $R/fetch_mct.log)"
+    "$PY" "$HERE/mct_eval.py" fetch --data "$WORK/mct" --minutes "${MINUTES:-60}" > "$R/fetch_mct.log" 2>&1 &
+    MCT_PID=$!
 fi
 
-step "Extract: DINOv2 on every crop, pseudo-bursts (GPU)"
-"$PY" "$HERE/reid.py" extract --data "$R" --sources $SOURCES --model "$H/$RUN/model.pt"
+if want mmcows; then
+    [ -n "${DET:-}" ] && [ -f "$DET/det_train_meta.json" ] || { echo "!! no detector best/ under $H (DET=<it>)"; exit 1; }
+    echo "detector $DET"
+    DAYS=(${UWB_DAYS:-0722 0728 0801})
+    mm_fetch() { "$PY" "$HERE/reid.py" fetch --data "$R" --sources mmcows --mm-uwb-days "$@" \
+                     --mm-uwb-every "${UWB_EVERY:-30}"; }
+    mm_label() { "$PY" "$HERE/reid.py" label --data "$R" --model "$H/$RUN/model.pt" --detector "$DET" --mm-days "$@"; }
+    step "MmCows 0725 (human labels): fetch"
+    mm_fetch                                        # 7/25 only (no other day)
+    prev=0725
+    for d in "${DAYS[@]}"; do
+        step "MmCows: label $prev (GPU) while $d downloads"
+        mm_label "$prev" &
+        lpid=$!
+        mm_fetch "$d"
+        wait "$lpid"
+        prev="$d"
+    done
+    step "MmCows: label $prev (GPU)"
+    mm_label "$prev"
+    step "Extract MmCows: DINOv2 on every crop, pseudo-bursts (GPU)"
+    "$PY" "$HERE/reid.py" extract --data "$R" --sources mmcows --model "$H/$RUN/model.pt"
+fi
+
+bg_wait bristol multicam cows2021 opencows
+bg_wait zenodo cobra sideview
 
 step "Train the identity model ${initarg[*]:-(fresh)}"
 "$PY" "$HERE/reid.py" train --data "$R" --sources $SOURCES --model "$H/$RUN/model.pt" --epochs "${EPOCHS:-20}" \
@@ -145,6 +199,7 @@ step "Train the identity model ${initarg[*]:-(fresh)}"
 
 if [ "${MCT:-1}" = "1" ]; then
     step "MmCows with the identity model (mct_pod.sh)"
+    [ -z "$MCT_PID" ] || wait "$MCT_PID" || echo "!! the background fetch of the check's frames failed: mct_pod.sh retries"
     HERD_MCT_IN_TMUX=1 WORK="$WORK" RUN="$RUN" DET="${DET:-}" MINUTES="${MINUTES:-60}" \
         IDENTITY="$OUT/identity.pt" bash "$HERE/mct_pod.sh" || echo "!! the MmCows step failed (see above)"
 fi

@@ -108,7 +108,7 @@ class RemoteZip:
             except (urllib.error.URLError, IOError, TimeoutError, ConnectionError) as e:
                 if k == self.tries - 1:
                     raise
-                time.sleep(2 ** k)
+                time.sleep(_wait(e, k))
                 print(f"\n  retry {k + 1} ({e.__class__.__name__}: {e})", flush=True)
 
     def names(self):
@@ -158,7 +158,16 @@ def download(url, path, tries=8):
             if k == tries - 1:
                 raise
             print(f"\n  retry {k + 1} ({e.__class__.__name__}: {e})", flush=True)
-            time.sleep(2 ** k)
+            time.sleep(_wait(e, k))
+
+
+def _wait(e, k):
+    """Seconds before retry k: doubling, or what a 429 / 503 asks for (Retry-After) when it asks for more."""
+    after = getattr(e, "headers", None) and e.headers.get("Retry-After")
+    try:
+        return max(2 ** k, min(600.0, float(after))) if after else 2 ** k
+    except ValueError:
+        return 2 ** k
 
 
 def open_zip(url, cache_dir, name, whole_below=1 << 30):
