@@ -28,7 +28,7 @@
 #
 # Knobs: WORK=/workspace  RUN=run9  DET=<best/> (default: the newest)  INIT=<identity.pt> (none: fresh)
 #        SOURCES="mmcows cobra sideview multicam cows2021 opencows"  EPOCHS=20  MCT=1  MINUTES=60
-#        UWB_DAYS="0722 0728 0801"  UWB_EVERY=30
+#        UWB_DAYS="0722 0728 0801"  UWB_EVERY=30  WAIT_MIN=20 (how long the GPU waits for a background download)
 # Every step resumes. Licences: MmCows CC BY-NC-SA, CoBRA and SideViewCows CC BY 4.0, the Bristol sets NCGL.
 
 set -euo pipefail
@@ -58,7 +58,7 @@ if [ -z "${HERD_REID_IN_TMUX:-}" ]; then
     fi
     mkdir -p "$R"
     knobs=""
-    for v in WORK RUN DET SOURCES EPOCHS MCT MINUTES MODELS INIT UWB_DAYS UWB_EVERY; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
+    for v in WORK RUN DET SOURCES EPOCHS MCT MINUTES MODELS INIT UWB_DAYS UWB_EVERY WAIT_MIN; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env HERD_REID_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/reid_pod.sh"); echo; echo '[reid finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log   ($LOG)"
@@ -139,20 +139,40 @@ bg_fetch() {   # name, sources... -> a background fetch with its own log; its pi
     "$PY" "$HERE/reid.py" fetch --data "$R" --sources "${srcs[@]}" > "$R/fetch_$name.log" 2>&1 &
     printf -v "BG_$name" '%s' "$!"
 }
-bg_wait() {    # name, sources... -> wait for it, then extract its sets (a failed fetch: said, and left out)
+bg_wait() {    # name, sources... -> wait for it (at most WAIT_MIN minutes, its progress each minute), then
+               # extract the sets it finished; one not finished (failed, or too slow) is left out of this
+               # training - the next run of this script resumes its download
     local name="$1"; shift
     local pid_var="BG_$name"
-    [ -n "${!pid_var:-}" ] || return 0
-    step "Waiting for the background fetch of $*"
-    if wait "${!pid_var}"; then
-        tail -n 4 "$R/fetch_$name.log" | tr '\r' '\n' | grep -v '^ *$' | tail -n 4
-        local srcs=()
-        for s_ in "$@"; do want "$s_" && srcs+=("$s_"); done
+    local pid="${!pid_var:-}"
+    [ -n "$pid" ] || return 0
+    step "Waiting for the background fetch of $* (at most ${WAIT_MIN:-20} min; log $R/fetch_$name.log)"
+    local waited=0 ok=1
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$waited" -ge "${WAIT_MIN:-20}" ]; then
+            echo "!! $* still downloading after ${WAIT_MIN:-20} min: training goes on without what is not in yet"
+            echo "   (the download stops here and resumes where it was on the next run of this script)"
+            kill "$pid" 2>/dev/null; sleep 2; pkill -P "$pid" 2>/dev/null || true
+            ok=0
+            break
+        fi
+        sleep 60
+        waited=$((waited + 1))
+        echo "  ${waited} min: $(tail -c 300 "$R/fetch_$name.log" | tr '\r' '\n' | grep -v '^ *$' | tail -n 1)"
+    done
+    if [ "$ok" = 1 ] && ! wait "$pid"; then
+        echo "!! the fetch of $* failed (the end of $R/fetch_$name.log below)"
+        tail -n 15 "$R/fetch_$name.log" | tr '\r' '\n' | grep -v '^ *$' | tail -n 15
+    fi
+    local srcs=()
+    for s_ in "$@"; do
+        want "$s_" && [ -f "$R/raw/$s_/index.jsonl" ] && [ -f "$R/raw/$s_/complete.json" ] && srcs+=("$s_")
+    done
+    if [ ${#srcs[@]} -gt 0 ]; then
+        echo "in: ${srcs[*]}"
         "$PY" "$HERE/reid.py" extract --data "$R" --sources "${srcs[@]}" --model "$H/$RUN/model.pt"
     else
-        echo "!! the fetch of $* failed (the end of $R/fetch_$name.log below); training goes on without them"
-        tail -n 15 "$R/fetch_$name.log" | tr '\r' '\n' | grep -v '^ *$' | tail -n 15
-        echo "   (bash $0 again resumes it)"
+        echo "none of $* is in: training goes on without them"
     fi
 }
 
