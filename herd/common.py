@@ -91,7 +91,9 @@ DEFAULTS = {
             "link_dist": 120.0, "link_min_s": 5, "link_share": 0.6,
             # strict joining (off at 0): the next cow link_margin further; no join of two groups holding
             # tracks seen together link_contra_s seconds but near in less than link_contra of them
-            "link_margin": 0.0, "link_contra_s": 10, "link_contra": 0.0,
+            # MmCows: link_margin 50 halved the wrong joins (2330 -> 1309) at the same IDF1 (0.498);
+            # link_contra barely helped and with the margin cost IDF1 - off
+            "link_margin": 50.0, "link_contra_s": 10, "link_contra": 0.0,
             "body_height_lying": 55.0, "body_height_standing": 90.0},
     "cameras": [],
 }

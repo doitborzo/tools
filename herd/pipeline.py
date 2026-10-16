@@ -41,8 +41,8 @@ import time
 
 import numpy as np
 
-from common import (ACTIVITIES, POSTURES, blank_excluded, crop, device, in_mask, in_zone, interpolate_box, iou,
-                    load_config)
+from common import (ACTIVITIES, DEFAULTS, POSTURES, blank_excluded, crop, device, in_mask, in_zone, interpolate_box,
+                    iou, load_config)
 from motion import motion_features
 
 
@@ -700,6 +700,10 @@ def run(cfg, start=None, models=None, max_wall_s=None):
             for i, c in enumerate(cfg["cameras"])]
     if cfg["mct"]["enabled"]:
         from mct import FloorTracker, FusedSeconds, GlobalTracker, TrackletLinker
+        if getattr(models, "id_model", None) is not None and cfg["mct"]["reacquire_sim"] == DEFAULTS["mct"]["reacquire_sim"]:
+            # the identity model's space is tighter: at 0.7 a camera took back the wrong cow (MmCows: 0.9 best)
+            cfg["mct"]["reacquire_sim"] = 0.9
+            print("[run] [mct] reacquire_sim 0.9 with the identity model", flush=True)
         mode = cfg["mct"].get("mode")
         if mode in ("fused", "link"):               # all cameras at once, a second at a time
             t = (FloorTracker if mode == "fused" else TrackletLinker)(cfg, store, shared.separate)

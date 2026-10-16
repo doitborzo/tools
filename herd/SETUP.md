@@ -208,8 +208,9 @@ The vet's answers (`verdict`) are what tell whether the alerts are worth anythin
   2. measure their X, Y in cm from one origin shared by all cameras;
   3. write them into the camera: `floor_points = [[u, v, X, Y], …]`, where u, v is the
      mark's place on the still, 0–1;
-  4. set `[mct] enabled = true` and give each camera a `tracking_mask` slightly wider
-     than its `mask`.
+  4. set `[mct] enabled = true`, `mode = "link"` (each camera tracks on its own; tracks
+     are joined once their floor points agree for a few seconds — the best mode on
+     MmCows), and give each camera a `tracking_mask` slightly wider than its `mask`.
 
   Without calibration do not turn it on: by look alone cows are not passed between
   cameras. How many handovers happened shows in the `track_handovers` table (kind
