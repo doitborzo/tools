@@ -464,6 +464,37 @@ camera's cows at that second is hers). In the barn: `[model] identity = ".../ide
 gallery and mct.py take its fingerprint, the gallery its `abstain.json`; a gallery built with the
 old fingerprints must be enrolled again (its prototypes are in the old space). All three sets are
 non-commercial: for a commercial product the barn's own data (`[training_cache]`) is the clean path.
+
+**Results of the first model** (held-out cows of the three sets): another day 77.3 → 97.7%, another
+camera 61 → 95.2%, one frame 59.8 → 88.7%. But on MmCows a cow seen from one high corner camera was
+found among another camera's cows only 17.3% of the time (chance 9.8%): the three sets look straight
+down, MmCows (and a barn) looks at an angle, from the side, at cows lying.
+
+**Fine-tuning on the barn's view** (`--init`, the default of `reid_pod.sh` when an identity model is
+there): three more sources, all with an angled or side view:
+
+| set | cows | what | licence |
+|---|---|---|---|
+| MmCows, 7/25 (human labels) | 16 | the evaluation's own pen and 4 corner cameras; outside mct_eval's 12:00-15:00; cows 1-10 trained on, **11-16 held out** | CC BY-NC-SA |
+| MmCows, other days (`--mm-uwb-days`, default 7/22, 7/28, 8/01, a frame every 30 s) | 10 | labelled by the cows' UWB neck tags (below) | CC BY-NC-SA |
+| CoBRA youngstock (Zenodo 15018518) | 48 | heifers from a roof camera, standing / lying left / lying right (the posture is the "day") | CC BY 4.0 |
+| SideViewCows2026 (Zenodo 21605650) | 110 | from the side: parlor camera, handheld barn video, snapshots (some lying in cubicles) | CC BY 4.0 |
+
+- **Labels from the neck tags** (`reid.py label`, `tag_tracks`): MmCows' other days have no human
+  labels, but cows 1-10 wear a UWB tag whose position (cm, the cameras' world) is logged every 15 s.
+  The tag sits on the neck, ~1 m from the body's centre along the stall, and a box's floor point
+  is ~1 m off too, so one second is not enough (74-85% right). Per camera: an IoU tracker on the
+  detector's boxes (lying cows keep their box for hours); every second the tags in view go to the
+  boxes by the Hungarian assignment on floor distance (the distance along the stall forgiven by
+  60 cm); a track takes a tag only when that tag won it at 90% of its seconds. Checked on 7/25
+  against the human labels: **95% right** (96% at a frame every 15 s), about a seventh of the
+  tagged cows' boxes kept; the mistakes are mostly an untagged cow lying next to a tagged one.
+  `label` repeats the check on its 7/25 frames and prints it.
+- `train --init <identity.pt>` starts from the model already trained (lr 3e-5) and keeps the
+  three top-down sets in the mix so it does not forget them; the best epoch is chosen on the
+  held-out cows of every set **and** MmCows' cows 11-16 from another camera.
+- `mct_eval` now splits its look check: cows 1-10 (trained on, other hours of the day) and cows
+  11-16 (never seen) — the second is the honest number for a new barn.
 ---
 
 ## 5. Training on the pod (CBVD-5)
@@ -793,7 +824,7 @@ model sees fine detail: coat pattern, the jaw.
 | `mct.py` | one track per cow across cameras (GlobalTracker) |
 | `mct_eval.py`, `mct_pod.sh` | that tracker scored on MmCows' four cameras |
 | `show_ids.py` | `herd.py show-ids`: who is who drawn on a recorded file (from the store) |
-| `reid.py`, `reid_pod.sh` | identity taught on public sets with cow ids (section 4.9) |
+| `reid.py`, `reid_pod.sh` | identity taught on sets with cow ids; MmCows labelled by its neck tags (section 4.9) |
 | `store.py` | SQLite: seconds, bursts, events, alerts, verdicts |
 | `report.py` | days per cow, CSV, alerts, verdicts |
 | `eval_det.py` | the whole path on the detector's boxes, threshold sweep |

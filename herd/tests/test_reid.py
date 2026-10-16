@@ -73,3 +73,139 @@ def test_identity_training_knows_a_cow_on_another_day():
         x = torch.randn(2, 5, dim)
         out = idm(x, torch.zeros(2, 5), torch.ones(2, 5, dtype=torch.bool))
         assert out["fingerprint"].shape == (2, mdl.ID_DIM) and abl["threshold"] == ab["threshold"]
+        # fine-tuning that model (--init): it starts where the first training ended
+        reid.main(["train", "--data", d, "--sources", "multicam", "--model", mp, "--epochs", "2", "--P", "16",
+                   "--init", os.path.join(d, "id_model", "identity.pt"), "--out", os.path.join(d, "id_model_ft")])
+        ev2 = json.load(open(os.path.join(d, "id_model_ft", "eval.json")))
+        assert abs(ev2["before"]["other_day_top1"] - ev["after"]["other_day_top1"]) < 1e-6
+        assert ev2["after"]["score"] >= ev2["before"]["score"]
+        ck = torch.load(os.path.join(d, "id_model_ft", "identity.pt"), weights_only=False)
+        assert ck["init"].endswith("identity.pt") and ck["sources"] == ["multicam"]
+
+
+def test_plan_reads_cobra_and_sideview():
+    import reid
+    names = ["lying_right/0017/0002.png", "standing/0023/0101.jpg", "lying_right/0017/0002.json",
+             "barn/images/594/594_0977.jpg", "barn/images/594/594_0980.jpg", "barn/masks/594/594_0980.png",
+             "parlor/images/12/12_0020.jpg", "parlor/images/12/12_0025.jpg", "snapshots/images/7/7_0003.jpg"]
+    assert reid.plan("cobra", names) == [("0017", "lying_right", "0", 2, names[0]),
+                                         ("0023", "standing", "0", 101, names[1])]   # the posture is its "day"
+    got = reid.plan("sideview", names)
+    # video frames thinned (barn every 5th, parlor every 10th), the subset is the "day", masks left out
+    assert [(g[0], g[1], g[3]) for g in got] == [("594", "barn", 980), ("12", "parlor", 20), ("7", "snapshots", 3)]
+
+
+def test_mask_crop_cuts_the_masked_cow():
+    import io
+    from PIL import Image
+    import reid
+    img = np.zeros((300, 400, 3), np.uint8)
+    img[100:200, 50:250] = 200
+    mask = np.zeros((300, 400), np.uint8)
+    mask[100:200, 50:250] = 255
+    enc = lambda a, f: (lambda b: (Image.fromarray(a).save(b, f), b.getvalue())[1])(io.BytesIO())
+    out = Image.open(io.BytesIO(reid.mask_crop(enc(img, "JPEG"), enc(mask, "PNG"))))
+    assert 200 <= out.size[0] <= 220 and 100 <= out.size[1] <= 112
+    assert reid.mask_crop(enc(img, "JPEG"), enc(np.zeros_like(mask), "PNG")) is None    # no cow, no crop
+    assert reid.as_jpeg(enc(img, "PNG"))[:3] == b"\xff\xd8\xff"
+
+
+def test_tag_tracks_labels_the_tagged_cows_only():
+    """Three cows lying still, two with a neck tag ~80 cm along the stall from their body's centre, one
+    without; a camera looking straight down (world cm -> pixels of MmCows' 4480 x 2800 frame)."""
+    import reid
+    from common import DEFAULTS, floor_mapper
+    P = [2.0, 0, 0, 2000, 0, 2.0, 0, 1400, 0, 0, 0, 1]
+    floor = floor_mapper({"proj_mat": P, "proj_size": reid.MM_PROJ}, DEFAULTS["mct"])
+    P = np.asarray(P).reshape(3, 4)
+    body = {1: (-300.0, 0.0), 2: (0.0, 0.0), 13: (300.0, 0.0)}           # cow 13 wears no tag
+
+    def box(x, y):
+        u, v = (x + 1000) * 2 / 4480, (y + 700) * 2 / 2800
+        return [u - 0.04, v - 0.05, u + 0.04, v + 0.05]
+    rng = np.random.default_rng(0)
+    frames, tags, truth = [], {}, {}
+    for k in range(40):
+        ts = 1690000011 + 15 * k
+        order = [1, 2, 13] if k % 2 else [13, 2, 1]                          # the detector's order varies
+        frames.append((ts, [box(*body[c]) for c in order]))
+        truth.update({(ts, j): c for j, c in enumerate(order)})
+        tags[ts] = [(t, [body[t][0] + rng.normal(0, 30), body[t][1] + 80 + rng.normal(0, 30), 100.0]) for t in (1, 2)]
+    got = reid.tag_tracks(frames, tags, floor, P)
+    assert got and all(truth[key] == t for key, t in got.items())
+    assert {t for t in got.values()} == {1, 2} and 13 not in got.values()
+    assert sum(1 for key in got if truth[key] == 1) == 40                    # every second of her track
+    assert reid._every(1690000011, 30) != reid._every(1690000026, 30) and reid._every(1690000011, 15)
+
+
+def test_preset_split_keeps_mmcows_held_out_cows():
+    import reid
+    rows = [{"cow": c, "day": "0725", "cam": cam, "order": k, "k": i, "split": "val" if c == "13" else "train"}
+            for i, (c, cam, k) in enumerate((c, cam, k) for c in ("01", "13") for cam in ("cam_1", "cam_2")
+                                            for k in range(16))]
+    bs = reid.make_bursts(rows, random.Random(0), set(), tracklets=False)
+    assert {b["split"] for b in bs if b["cow"] == "13"} == {"val"}
+    assert {b["split"] for b in bs if b["cow"] == "01"} == {"train"}
+    assert all(len(b["frames"]) == reid.PICS for b in bs)
+
+
+def test_label_command_human_and_tag_days():
+    """reid.py label end to end with a stand-in detector: 7/25 by the human labels (cow 13, untagged,
+    held out), another day by the neck tags, and 7/25's tag labels checked against the human ones."""
+    from PIL import Image
+    import pipeline
+    import reid
+    body = {1: (-300.0, 0.0), 2: (0.0, 0.0), 13: (300.0, 0.0)}
+
+    def box(x, y):
+        u, v = (x + 1000) * 2 / 4480, (y + 700) * 2 / 2800
+        return [u - 0.04, v - 0.05, u + 0.04, v + 0.05]
+    xml = ("<?xml version=\"1.0\" ?>\n<opencv_storage>\n<projection_matrix type_id=\"opencv-matrix\">\n<rows>3</rows>"
+           "<cols>4</cols><dt>d</dt>\n<data>2.0 0 0 2000 0 2.0 0 1400 0 0 0 1</data></projection_matrix>\n</opencv_storage>\n")
+
+    class Stub:
+        crop_size, margin = 32, 0.1
+
+        def __init__(self, cfg):
+            pass
+
+        def detect_many(self, imgs, batch=8):
+            return [[box(*body[c]) for c in (13, 1, 2)] for _ in imgs]
+    with tempfile.TemporaryDirectory() as d:
+        root = os.path.join(d, "mmcows")
+        for day in ("0725", "0722"):
+            os.makedirs(os.path.join(root, "proj_mat", day))
+            for c in range(1, 5):
+                open(os.path.join(root, "proj_mat", day, f"proj_mat_cam{c}.xml"), "w").write(xml)
+            for t in (1, 2):
+                os.makedirs(os.path.join(root, "uwb", day), exist_ok=True)
+                with open(os.path.join(root, "uwb", day, f"T{t:02d}.csv"), "w") as fh:
+                    fh.write("timestamp,coord_x_cm,coord_y_cm,coord_z_cm\n")
+                    for k in range(12):
+                        fh.write(f"{1690000011 + 30 * k}.0,{body[t][0]},{body[t][1] + 70},100.0\n")
+            for cam in ("cam_1", "cam_2"):
+                os.makedirs(os.path.join(root, "frames", day, cam))
+                os.makedirs(os.path.join(root, "labels", cam), exist_ok=True)
+                for k in range(12):
+                    ts = 1690000011 + 30 * k
+                    Image.new("RGB", (448, 280), (90, 90, 90)).save(os.path.join(root, "frames", day, cam, f"{ts}.jpg"))
+                    if day == "0725":
+                        with open(os.path.join(root, "labels", cam, f"{ts}.txt"), "w") as fh:
+                            for c, (x, y) in body.items():
+                                b = box(x, y)
+                                fh.write(f"{c} {(b[0] + b[2]) / 2} {(b[1] + b[3]) / 2} {b[2] - b[0]} {b[3] - b[1]}\n")
+        real = pipeline.Models
+        pipeline.Models = Stub
+        try:
+            reid.main(["label", "--data", d, "--model", "unused.pt", "--detector", "unused"])
+        finally:
+            pipeline.Models = real
+        rows = [json.loads(x) for x in open(os.path.join(d, "raw", "mmcows", "index.jsonl"))]
+        human = [r for r in rows if r["by"] == "human"]
+        assert {(r["cow"], r["split"]) for r in human} == {("01", "train"), ("02", "train"), ("13", "val")}
+        assert len(human) == 3 * 2 * 12
+        tagged = [r for r in rows if r["by"] == "uwb"]
+        assert tagged and {r["cow"] for r in tagged} == {"01", "02"} and {r["day"] for r in tagged} == {"0722"}
+        assert all(os.path.exists(os.path.join(d, "raw", "mmcows", r["file"])) for r in rows)
+        check = json.load(open(os.path.join(root, "label.json")))["tag_check"]
+        assert check["tag_labels"] > 0 and check["tag_right"] == check["tag_labels"]

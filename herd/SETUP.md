@@ -215,9 +215,11 @@ The vet's answers (`verdict`) are what tell whether the alerts are worth anythin
   Without calibration do not turn it on: by look alone cows are not passed between
   cameras. How many handovers happened shows in the `track_handovers` table (kind
   `floor`); there is no tool yet to check the calibration itself.
-- **A better identity model** (public sets with cow ids, `GUIDE.md` 4.9): on a pod
-  `bash herd/reid_pod.sh`, then copy `reid/id_model/` (identity.pt, abstain.json) to the server and
-  set `[model] identity = "/srv/herd/reid/id_model/identity.pt"`. Do it before the herd is enrolled
+- **A better identity model** (sets with cow ids, `GUIDE.md` 4.9): on a pod, with
+  `herd_models_*.tgz` (and `herd_reid_*.tgz` of an earlier run, to fine-tune it) in `/workspace`,
+  `bash herd/reid_pod.sh`; then copy `reid/id_model_ft/` (or `reid/id_model/` on a first run:
+  identity.pt, abstain.json) to the server and set
+  `[model] identity = "/srv/herd/reid/id_model_ft/identity.pt"`. Do it before the herd is enrolled
   (or move `gallery/` aside and let it enrol again): the fingerprints change.
 - **Training on your own cows**: `[training_cache] enabled = true` keeps every 10th
   burst. After a few weeks:

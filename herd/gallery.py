@@ -176,7 +176,9 @@ class Gallery:
         ids = list(self.cows)
         S = np.stack([self._sims(fp)[1] for fp in fps])                  # (items, cows)
         banned = np.array([[c in ex for c in ids] for ex in exclude], bool)
-        cost = np.where(banned, 10.0, -S)
+        # exp(sim / 0.05), not sim: a near-certain match is never given away to lift a weaker one's
+        # similarity (summed sims would swap A 1.0 / B 0.8 against a second burst's A 0.95 / B 0.7)
+        cost = np.where(banned, 10.0, -np.exp((np.clip(S, -1.0, 1.0) - 1.0) / 0.05))
         try:
             from scipy.optimize import linear_sum_assignment
             rows, cols = linear_sum_assignment(cost)

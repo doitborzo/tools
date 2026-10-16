@@ -59,6 +59,7 @@ HF = "https://huggingface.co/datasets/neis-lab/mmcows/resolve/main"
 DAY = "0725"
 CAMS = ("cam_1", "cam_2", "cam_3", "cam_4")
 DAY_START = 1690304400                       # 7/25 12:00:00 local, the first frame of the 3 h set
+TAGGED = set(range(1, 11))                   # the cows with a UWB neck tag (sensor_data T01-T10)
 
 
 # ------------------------------------------------------------------ fetch
@@ -307,6 +308,7 @@ def look_check(gt_map, dets):
             at[ts].append((cam, cow, np.asarray(e, np.float32)))
     hit = n = 0
     chance = []
+    group = collections.Counter()
     for v in at.values():
         for c1, w1, e1 in v:
             for c2 in {c for c, _, _ in v if c != c1}:
@@ -317,8 +319,16 @@ def look_check(gt_map, dets):
                 hit += best == w1
                 n += 1
                 chance.append(1 / len(cands))
-    return {"look_cross_cam_top1": hit / n if n else None, "chance": float(np.mean(chance)) if chance else None,
-            "queries": n}
+                g = "tagged" if int(w1) in TAGGED else "untagged"
+                group[g, "n"] += 1
+                group[g, "hit"] += best == w1
+    out = {"look_cross_cam_top1": hit / n if n else None, "chance": float(np.mean(chance)) if chance else None,
+           "queries": n}
+    # cows 1-10 wear UWB tags: reid.py may train on them (other days); cows 11-16 it never sees
+    for g in ("tagged", "untagged"):
+        if group[g, "n"]:
+            out[f"look_cross_cam_top1_{g}"] = group[g, "hit"] / group[g, "n"]
+    return out
 
 
 def floor_check(gt_map, dets, mats):
@@ -637,7 +647,11 @@ def cmd_score(args):
             results["data"]["look"] = lk = look_check(gt_map, dets)
             if lk["queries"]:
                 print(f"[score] by look: a cow in one camera, the nearest frame id among another camera's cows "
-                      f"at that second is hers in {lk['look_cross_cam_top1']:.1%} (chance {lk['chance']:.1%})", flush=True)
+                      f"at that second is hers in {lk['look_cross_cam_top1']:.1%} (chance {lk['chance']:.1%}"
+                      + "".join(f"; {name} {lk[k]:.1%}" for k, name in (
+                          ("look_cross_cam_top1_tagged", "cows 1-10"),
+                          ("look_cross_cam_top1_untagged", "cows 11-16 that reid.py never trains on")) if k in lk)
+                      + ")", flush=True)
             if mats:
                 results["data"]["floor_points"] = fc = floor_check(gt_map, dets, mats)
                 if fc:

@@ -1,24 +1,33 @@
 #!/usr/bin/env bash
-# The identity model on a GPU pod (herd/reid.py): public sets with real cow ids -> a fingerprint that knows
-# a cow across days and cameras -> checked on MmCows' four cameras (mct_pod.sh) with it.
+# The identity model on a GPU pod (herd/reid.py): sets with real cow ids -> a fingerprint that knows a cow
+# across days, postures and cameras -> checked on MmCows' four cameras (mct_pod.sh) with it.
 #
-#   1. the environment (run_pod.sh step 1) and the models from herd_models_*.tgz (export_pod.sh) in WORK
-#   2. fetch: MultiCamCows2024's crops (90 cows, 3 cameras, 7 days; 3.6 GB of its 36.5 GB zip),
-#      Cows2021's identification test set (181 cows), OpenCows2020's identification part (46 cows)
-#   3. extract (GPU): DINOv2 on every crop as the barn does; pseudo-bursts with cow ids; a sixth of
-#      each set's cows held out (never trained on)
-#   4. train: a copy of RUN's temporal transformer taught on the cow ids (other days, other cameras,
-#      single frames) -> WORK/reid/id_model/identity.pt + abstain.json + eval.json (before / after)
-#   5. MmCows (mct_pod.sh, IDENTITY=it): the same trackers and the look across cameras, now with it
-#   6. WORK/export/herd_reid_<date>.tgz: id_model/, the logs, MmCows' mct_eval.json and show/
+#   1. the environment (run_pod.sh step 1), the models from herd_models_*.tgz (export_pod.sh) and the
+#      identity model already trained from herd_reid_*.tgz (this script's earlier export) in WORK
+#   2. fetch: the crops of the sets in SOURCES, read in place from their zips
+#        mmcows    MmCows (the evaluation's own pen and cameras): 7/25 with its human labels outside
+#                  mct_eval's 12:00-15:00 (cows 1-10 train, 11-16 held out), and 3 other days every 30 s
+#        cobra     CoBRA youngstock: 48 heifers from a roof camera, standing and lying (733 MB)
+#        sideview  SideViewCows2026: 110 cows from the side, parlor / barn / snapshots (~6 GB read)
+#        multicam cows2021 opencows   the top-down sets the first model was trained on
+#   3. label (GPU, mmcows): the detector on its frames; 7/25's boxes by the human labels, the other
+#      days' by the cows' UWB neck tags (tracks voted by the tag's position, ~95% right on 7/25)
+#   4. extract (GPU): DINOv2 on every crop as the barn does; pseudo-bursts with cow ids
+#   5. train: the identity model fine-tuned (INIT, default reid/id_model/identity.pt) on all of them
+#      -> WORK/reid/id_model_ft/identity.pt + abstain.json + eval.json (before / after); without an
+#      INIT, a fresh one from RUN's transformer -> reid/id_model/
+#   6. MmCows (mct_pod.sh, IDENTITY=it): the trackers and the look across cameras - cows 1-10 (trained
+#      on, other hours) and 11-16 (never seen) apart
+#   7. WORK/export/herd_reid_<date>.tgz: the new id model, the logs, MmCows' mct_eval.json and show/
 #
 #   bash herd/reid_pod.sh          start in tmux "herd-reid"
 #   bash herd/reid_pod.sh log      follow it
 #   bash herd/reid_pod.sh stop
 #
-# Knobs: WORK=/workspace  RUN=run9  DET=<best/> (MmCows step)  SOURCES="multicam cows2021 opencows"
-#        EPOCHS=30  MCT=1 (0: skip the MmCows step)  MINUTES=60 (MmCows)
-# Every step resumes. Licences: all three sets are non-commercial (NCGL), as MmCows (CC BY-NC-SA).
+# Knobs: WORK=/workspace  RUN=run9  DET=<best/> (default: the newest)  INIT=<identity.pt> (none: fresh)
+#        SOURCES="mmcows cobra sideview multicam cows2021 opencows"  EPOCHS=20  MCT=1  MINUTES=60
+#        UWB_DAYS="0722 0728 0801"  UWB_EVERY=30
+# Every step resumes. Licences: MmCows CC BY-NC-SA, CoBRA and SideViewCows CC BY 4.0, the Bristol sets NCGL.
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,7 +56,7 @@ if [ -z "${HERD_REID_IN_TMUX:-}" ]; then
     fi
     mkdir -p "$R"
     knobs=""
-    for v in WORK RUN DET SOURCES EPOCHS MCT MINUTES MODELS; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
+    for v in WORK RUN DET SOURCES EPOCHS MCT MINUTES MODELS INIT UWB_DAYS UWB_EVERY; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env HERD_REID_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/reid_pod.sh"); echo; echo '[reid finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log   ($LOG)"
@@ -60,7 +69,7 @@ step() { echo; echo "=== $*   [$(date '+%F %T')]"; }
 PY="$H/.venv/bin/python"
 export HF_HOME="$WORK/hf-cache"
 export PATH="$HOME/.local/bin:$PATH"
-SOURCES="${SOURCES:-multicam cows2021 opencows}"
+SOURCES="${SOURCES:-mmcows cobra sideview multicam cows2021 opencows}"
 
 step "Models from the uploaded archive"
 for a in ${MODELS:-$(ls -t "$WORK"/herd_models_*.tgz 2>/dev/null | head -1)}; do
@@ -80,31 +89,72 @@ for a in ${MODELS:-$(ls -t "$WORK"/herd_models_*.tgz 2>/dev/null | head -1)}; do
 done
 [ -f "$H/$RUN/model.pt" ] || { echo "!! no $H/$RUN/model.pt - upload herd_models_*.tgz to $WORK (or RUN=<run>)"; exit 1; }
 
+step "The identity model to fine-tune"
+if [ -z "${INIT:-}" ] && [ ! -f "$R/id_model/identity.pt" ]; then
+    a="$(ls -t "$WORK"/herd_reid_*.tgz 2>/dev/null | head -1)"
+    if [ -n "$a" ]; then
+        echo "unpacking $a"
+        U="$WORK/_unpack_reid"
+        rm -rf "$U" && mkdir -p "$U"
+        tar -xzf "$a" -C "$U"
+        m="$(find "$U" -path '*id_model/identity.pt' -not -path '*id_model_ft*' -print -quit)"
+        [ -n "$m" ] || m="$(find "$U" -name identity.pt -print -quit)"
+        [ -n "$m" ] && { mkdir -p "$R/id_model"; cp -a "$(dirname "$m")/." "$R/id_model/"; }
+        rm -rf "$U"
+    fi
+fi
+INIT="${INIT:-$R/id_model/identity.pt}"
+if [ -f "$INIT" ]; then
+    echo "fine-tuning $INIT"
+    OUT="$R/id_model_ft"
+    initarg=(--init "$INIT")
+else
+    echo "no identity model (upload herd_reid_*.tgz to $WORK, or INIT=<identity.pt>): training a fresh one"
+    OUT="$R/id_model"
+    initarg=()
+fi
+if [ -z "${DET:-}" ]; then
+    DET="$(find "$H" -maxdepth 3 -name det_train_meta.json -path '*/best/*' -printf '%T@ %h\n' 2>/dev/null \
+           | sort -rn | head -1 | cut -d' ' -f2-)"
+fi
+
 step "Environment (run_pod.sh step 1)"
 HERD_IN_TMUX=1 SETUP_ONLY=env WORK="$WORK" RUN=setup bash "$HERE/run_pod.sh"
+if [ -n "${DET:-}" ] && grep -qs '"kind": *"rfdetr"' "$DET/det_train_meta.json"; then
+    "$PY" -c "import rfdetr" 2>/dev/null || uv pip install --python "$PY" rfdetr
+fi
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 step "Fetch the crops with cow ids ($SOURCES)"
-"$PY" "$HERE/reid.py" fetch --data "$R" --sources $SOURCES
+"$PY" "$HERE/reid.py" fetch --data "$R" --sources $SOURCES --mm-uwb-days ${UWB_DAYS:-0722 0728 0801} \
+    --mm-uwb-every "${UWB_EVERY:-30}"
+
+if [[ " $SOURCES " == *" mmcows "* ]]; then
+    step "Label MmCows: the detector's boxes by the human labels (7/25) and the neck tags (other days) (GPU)"
+    [ -n "${DET:-}" ] && [ -f "$DET/det_train_meta.json" ] || { echo "!! no detector best/ under $H (DET=<it>)"; exit 1; }
+    echo "detector $DET"
+    "$PY" "$HERE/reid.py" label --data "$R" --model "$H/$RUN/model.pt" --detector "$DET"
+fi
 
 step "Extract: DINOv2 on every crop, pseudo-bursts (GPU)"
 "$PY" "$HERE/reid.py" extract --data "$R" --sources $SOURCES --model "$H/$RUN/model.pt"
 
-step "Train the identity model"
-"$PY" "$HERE/reid.py" train --data "$R" --sources $SOURCES --model "$H/$RUN/model.pt" --epochs "${EPOCHS:-30}"
+step "Train the identity model ${initarg[*]:-(fresh)}"
+"$PY" "$HERE/reid.py" train --data "$R" --sources $SOURCES --model "$H/$RUN/model.pt" --epochs "${EPOCHS:-20}" \
+    --out "$OUT" "${initarg[@]}"
 
 if [ "${MCT:-1}" = "1" ]; then
     step "MmCows with the identity model (mct_pod.sh)"
     HERD_MCT_IN_TMUX=1 WORK="$WORK" RUN="$RUN" DET="${DET:-}" MINUTES="${MINUTES:-60}" \
-        IDENTITY="$R/id_model/identity.pt" bash "$HERE/mct_pod.sh" || echo "!! the MmCows step failed (see above)"
+        IDENTITY="$OUT/identity.pt" bash "$HERE/mct_pod.sh" || echo "!! the MmCows step failed (see above)"
 fi
 
 mkdir -p "$WORK/export"
 T="$WORK/export/herd_reid_$(date +%Y%m%d_%H%M).tgz"
 parts=()
-for p in "$R/id_model" "$LOG" "$WORK/mct/mct_eval.json" "$WORK/mct/log.txt" "$WORK/mct/show"; do
+for p in "$OUT" "$R/mmcows/label.json" "$LOG" "$WORK/mct/mct_eval.json" "$WORK/mct/log.txt" "$WORK/mct/show"; do
     [ -e "$p" ] && parts+=("${p#"$WORK"/}")
 done
 (cd "$WORK" && tar -czf "$T" "${parts[@]}")
 echo "identity model + results: $T   (scp -P <port> root@<ip>:$T .)"
-echo "in the barn: [model] identity = \".../reid/id_model/identity.pt\" (abstain.json next to it is used)"
+echo "in the barn: [model] identity = \".../reid/$(basename "$OUT")/identity.pt\" (abstain.json next to it is used)"
