@@ -2,8 +2,7 @@
 # The identity model on a GPU pod (herd/reid.py): sets with real cow ids -> a fingerprint that knows a cow
 # across days, postures and cameras -> checked on MmCows' four cameras (mct_pod.sh) with it.
 #
-#   1. the environment (run_pod.sh step 1), the models from herd_models_*.tgz (export_pod.sh) and the
-#      identity model already trained from herd_reid_*.tgz (this script's earlier export) in WORK
+#   1. the environment (run_pod.sh step 1), the models from herd_models_*.tgz (export_pod.sh) in WORK
 #   2. fetch: the crops of the sets in SOURCES (Zenodo's zips are downloaded whole, the others read in
 #      place); Zenodo, Bristol and the last step's MmCows frames download in the background while
 #      MmCows' training days are fetched one at a time, each labelled (GPU) as the next downloads
@@ -15,9 +14,10 @@
 #   3. label (GPU, mmcows): the detector on its frames; 7/25's boxes by the human labels, the other
 #      days' by the cows' UWB neck tags (tracks voted by the tag's position, ~95% right on 7/25)
 #   4. extract (GPU): DINOv2 on every crop as the barn does; pseudo-bursts with cow ids
-#   5. train: the identity model fine-tuned (INIT, default reid/id_model/identity.pt) on all of them
-#      -> WORK/reid/id_model_ft/identity.pt + abstain.json + eval.json (before / after); without an
-#      INIT, a fresh one from RUN's transformer -> reid/id_model/
+#   5. train: the identity model from scratch (a copy of RUN's temporal transformer) on all of them,
+#      the best epoch by the held-out cows of every set and MmCows' cows 11-16 from another camera
+#      -> WORK/reid/id_model_all/identity.pt + abstain.json + eval.json (before / after);
+#      INIT=<identity.pt> fine-tunes that one instead -> reid/id_model_ft/
 #   6. MmCows (mct_pod.sh, IDENTITY=it): the trackers and the look across cameras - cows 1-10 (trained
 #      on, other hours) and 11-16 (never seen) apart
 #   7. WORK/export/herd_reid_<date>.tgz: the new id model, the logs, MmCows' mct_eval.json and show/
@@ -26,8 +26,8 @@
 #   bash herd/reid_pod.sh log      follow it
 #   bash herd/reid_pod.sh stop
 #
-# Knobs: WORK=/workspace  RUN=run9  DET=<best/> (default: the newest)  INIT=<identity.pt> (none: fresh)
-#        SOURCES="mmcows cobra sideview multicam cows2021 opencows"  EPOCHS=20  MCT=1  MINUTES=60
+# Knobs: WORK=/workspace  RUN=run9  DET=<best/> (default: the newest)  INIT=<identity.pt> (fine-tune it; default: from scratch)
+#        SOURCES="mmcows cobra sideview multicam cows2021 opencows"  EPOCHS=30  MCT=1  MINUTES=60
 #        UWB_DAYS="0722 0728 0801"  UWB_EVERY=30  WAIT_MIN=20 (how long the GPU waits for a background download)
 # Every step resumes. Licences: MmCows CC BY-NC-SA, CoBRA and SideViewCows CC BY 4.0, the Bristol sets NCGL.
 
@@ -91,28 +91,18 @@ for a in ${MODELS:-$(ls -t "$WORK"/herd_models_*.tgz 2>/dev/null | head -1)}; do
 done
 [ -f "$H/$RUN/model.pt" ] || { echo "!! no $H/$RUN/model.pt - upload herd_models_*.tgz to $WORK (or RUN=<run>)"; exit 1; }
 
-step "The identity model to fine-tune"
-if [ -z "${INIT:-}" ] && [ ! -f "$R/id_model/identity.pt" ]; then
-    a="$(ls -t "$WORK"/herd_reid_*.tgz 2>/dev/null | head -1)"
-    if [ -n "$a" ]; then
-        echo "unpacking $a"
-        U="$WORK/_unpack_reid"
-        rm -rf "$U" && mkdir -p "$U"
-        tar -xzf "$a" -C "$U"
-        m="$(find "$U" -path '*id_model/identity.pt' -not -path '*id_model_ft*' -print -quit)"
-        [ -n "$m" ] || m="$(find "$U" -name identity.pt -print -quit)"
-        [ -n "$m" ] && { mkdir -p "$R/id_model"; cp -a "$(dirname "$m")/." "$R/id_model/"; }
-        rm -rf "$U"
-    fi
-fi
-INIT="${INIT:-$R/id_model/identity.pt}"
-if [ -f "$INIT" ]; then
-    echo "fine-tuning $INIT"
+step "The identity model: trained from scratch"
+# From RUN's temporal transformer on every set at once (not the earlier identity model fine-tuned: that
+# one has already fitted the top-down sets, and a second pass on top of it over-fits). INIT=<identity.pt>
+# fine-tunes one instead.
+if [ -n "${INIT:-}" ]; then
+    [ -f "$INIT" ] || { echo "!! INIT=$INIT: no such file"; exit 1; }
+    echo "fine-tuning $INIT (INIT given)"
     OUT="$R/id_model_ft"
     initarg=(--init "$INIT")
 else
-    echo "no identity model (upload herd_reid_*.tgz to $WORK, or INIT=<identity.pt>): training a fresh one"
-    OUT="$R/id_model"
+    echo "from $H/$RUN/model.pt's transformer, on all of: $SOURCES"
+    OUT="$R/id_model_all"
     initarg=()
 fi
 if [ -z "${DET:-}" ]; then
@@ -214,7 +204,7 @@ bg_wait bristol multicam cows2021 opencows
 bg_wait zenodo cobra sideview
 
 step "Train the identity model ${initarg[*]:-(fresh)}"
-"$PY" "$HERE/reid.py" train --data "$R" --sources $SOURCES --model "$H/$RUN/model.pt" --epochs "${EPOCHS:-20}" \
+"$PY" "$HERE/reid.py" train --data "$R" --sources $SOURCES --model "$H/$RUN/model.pt" --epochs "${EPOCHS:-30}" \
     --out "$OUT" "${initarg[@]}"
 
 if [ "${MCT:-1}" = "1" ]; then

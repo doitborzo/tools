@@ -166,7 +166,7 @@ time on tracks no cow could be given.
 | `mct.py` | one track per cow across cameras (`[mct]`; a frame id from the herd model on one frame) |
 | `mct_eval.py`, `mct_pod.sh` | that tracker scored on MmCows' four synchronised cameras (GUIDE 4.8) |
 | `show_ids.py` | `herd.py show-ids`: who is who, drawn on a recorded file from the store (video + stills) |
-| `reid.py`, `reid_pod.sh` | identity taught on sets with cow ids (MultiCamCows2024, Cows2021, OpenCows2020, CoBRA, SideViewCows2026, MmCows by its human labels and neck tags), `--init` to fine-tune; `[model] identity` |
+| `reid.py`, `reid_pod.sh` | identity taught on sets with cow ids (MultiCamCows2024, Cows2021, OpenCows2020, CoBRA, SideViewCows2026, MmCows by its human labels and neck tags), trained from scratch on all of them (`--init` fine-tunes); `[model] identity` |
 | `stress.py` | a burst alone, then N cameras live on one GPU: lag, burst time, GPU share |
 | `store.py`, `report.py` | SQLite; per-cow days, CSV, alerts, verdicts |
 | `SETUP.md` | setting up a barn step by step: server, models, masks, systemd, reports |

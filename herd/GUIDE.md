@@ -470,8 +470,9 @@ camera 61 → 95.2%, one frame 59.8 → 88.7%. But on MmCows a cow seen from one
 found among another camera's cows only 17.3% of the time (chance 9.8%): the three sets look straight
 down, MmCows (and a barn) looks at an angle, from the side, at cows lying.
 
-**Fine-tuning on the barn's view** (`--init`, the default of `reid_pod.sh` when an identity model is
-there): three more sources, all with an angled or side view:
+**Training on the barn's view** (`reid_pod.sh` trains from scratch — a copy of the herd model's
+transformer — on all six sets at once; fine-tuning the first identity model on top, `INIT=`, risks
+over-fitting what it has already fitted): three more sources, all with an angled or side view:
 
 | set | cows | what | licence |
 |---|---|---|---|
@@ -490,9 +491,10 @@ there): three more sources, all with an angled or side view:
   against the human labels: **95% right** (96% at a frame every 15 s), about a seventh of the
   tagged cows' boxes kept; the mistakes are mostly an untagged cow lying next to a tagged one.
   `label` repeats the check on its 7/25 frames and prints it.
-- `train --init <identity.pt>` starts from the model already trained (lr 3e-5) and keeps the
-  three top-down sets in the mix so it does not forget them; the best epoch is chosen on the
-  held-out cows of every set **and** MmCows' cows 11-16 from another camera.
+- `train` (from scratch, lr 1e-4) takes the top-down and the angled sets together; the best epoch
+  is chosen on the held-out cows of every set **and** MmCows' cows 11-16 from another camera, and
+  training stops when that has not improved for 6 epochs. `train --init <identity.pt>` (lr 3e-5,
+  `INIT=` in the pod script) fine-tunes an existing model instead.
 - `mct_eval` now splits its look check: cows 1-10 (trained on, other hours of the day) and cows
   11-16 (never seen) — the second is the honest number for a new barn.
 ---
