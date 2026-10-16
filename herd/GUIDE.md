@@ -358,6 +358,18 @@ two cameras' points are one cow at the height where they agree, the posture head
 13% mixed, against 1.31 and 20% with the posture taken as it comes. Live, the cameras' threads
 meet once a second (`mct.FusedSeconds`; a camera down does not hold the others).
 
+**Joined tracks (`[mct] mode = "link"`, calibrated cameras).** On MmCows the one canvas
+put a cow seen by two cameras on one track 77% of the time (handover by place: 23%), but its
+floor tracker, matching points a second at a time, swapped cows lying a metre or two apart
+(33 switches a cow an hour, tracks 50% pure). Within a camera boxes are reliable (IoU tracks
+93% pure), so `mct.TrackletLinker` keeps both: each camera follows its own cows, and a track of
+one camera is joined to a track of another when for `link_min_s` (5) seconds they were each
+other's nearest on the floor within `link_dist` (120 cm, at the height where they agree), in
+`link_share` (60%) of the seconds both were seen — never two tracks one camera saw at the same
+time. Joins are written to `track_links`; reports read every track under the one it was finally
+joined to. With the identity model set `reacquire_sim = 0.9` (its space is tighter: at 0.7 a
+camera took back the wrong cow).
+
 **By look alone, cows are not passed between cameras.** MmCows (60 min, 4 cameras):
 a cow seen by two cameras at once got one track in 0.1–1.4% of the cases, and every
 looser `handover_min_sim` only merged different cows (1285 false merges at 0.5) —

@@ -699,9 +699,11 @@ def run(cfg, start=None, models=None, max_wall_s=None):
     cams = [Camera(c, i, len(cfg["cameras"]), cfg, models, shared, store, start_ts)
             for i, c in enumerate(cfg["cameras"])]
     if cfg["mct"]["enabled"]:
-        from mct import FloorTracker, FusedSeconds, GlobalTracker
-        if cfg["mct"].get("mode") == "fused":       # all cameras on one floor plan, a second at a time
-            glob = FusedSeconds(FloorTracker(cfg, store, shared.separate), [c["id"] for c in cfg["cameras"]])
+        from mct import FloorTracker, FusedSeconds, GlobalTracker, TrackletLinker
+        mode = cfg["mct"].get("mode")
+        if mode in ("fused", "link"):               # all cameras at once, a second at a time
+            t = (FloorTracker if mode == "fused" else TrackletLinker)(cfg, store, shared.separate)
+            glob = FusedSeconds(t, [c["id"] for c in cfg["cameras"]])
         else:
             glob = GlobalTracker(cfg, store, shared.separate)
         for cam in cams:

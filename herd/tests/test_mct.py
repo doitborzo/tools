@@ -388,6 +388,9 @@ def test_geo_hands_cows_over_by_place_alone():
         f = r["fid/fused"]                                  # one canvas: each cow one point, one track
         assert f["cross_cam_same_track"] == 1.0 and f["false_merges"] == 0 and f["tracks_per_cow"] == 1.0, f
         assert f["tracker"]["fused"] >= 4 * 100
+        k = r["fid/link-final"]                              # each camera's tracks joined by floor evidence
+        assert k["cross_cam_same_track"] == 1.0 and k["false_merges"] == 0 and k["tracks_per_cow"] == 1.0, k
+        assert r["fid/link"]["tracker"]["linked"] == 4
         mct_eval.main(["show", "--data", d, "--minutes", "0.5", "--still-every", "10"])
         out = os.path.join(d, "show", "fid_geo")
         assert os.path.getsize(os.path.join(out, "ids.mp4")) > 1000 and len(os.listdir(os.path.join(out, "stills"))) == 3
@@ -478,3 +481,16 @@ def test_fused_seconds_waits_for_every_camera():
     [t.start() for t in th]
     [t.join() for t in th]
     assert got["a"] == got["b"] and fs.stats["fused"] >= 1          # one cow: one point, one track
+
+
+def test_report_follows_joined_tracks():
+    import report
+    from store import Store
+    with tempfile.TemporaryDirectory() as d:
+        store = Store(os.path.join(d, "s.sqlite"))
+        for k in range(3):
+            store.burst(("cam1", "t-a", 100.0 + k, "confirmed", "A", 0.9, 0.2, 0.9, 0.1, "lying", "none", None, 0.5, 100))
+        store.link_tracks(150.0, "t-b", "t-a")              # cam2's track: the same cow
+        store.link_tracks(160.0, "t-c", "t-b")
+        assert store.track_roots() == {"t-b": "t-a", "t-c": "t-a"}
+        assert report.track_map(store) == {"t-a": "A", "t-b": "A", "t-c": "A"}

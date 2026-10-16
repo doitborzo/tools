@@ -361,15 +361,15 @@ def run_tracker(dets, kind, mct_over=None, mats=None):
     cfg["mct"].update(mct_over or {})
     if kind == "mct":
         cfg["mct"]["neighbours"] = [[a, b] for i, a in enumerate(cams) for b in cams[i + 1:]]
-    if kind in ("geo", "fused"):
+    if kind in ("geo", "fused", "link", "link-final"):
         for c in cfg["cameras"]:
             if c["id"] in (mats or {}):
                 c.update(proj_mat=mats[c["id"]], proj_size=list(PROJ_SIZE))
     co = mct.CoSeen(cfg["identity"]["cannot_link_min_s"], cfg["identity"]["cannot_link_max_iou"])
     trackers = ({c: pipeline.Tracker(c, cfg["tracker"]["iou"], cfg["tracker"]["max_age_s"]) for c in cams}
                 if kind == "iou" else None)
-    if kind == "fused":
-        return _run_fused(dets, cfg, co)
+    if kind in ("fused", "link", "link-final"):
+        return _run_fused(dets, cfg, co, kind)
     glob = mct.GlobalTracker(cfg, apart=lambda pairs, ts: links.update((min(a, b), max(a, b)) for a, b in pairs)) \
         if kind != "iou" else None
     for ts in seconds:
@@ -395,10 +395,12 @@ def run_tracker(dets, kind, mct_over=None, mats=None):
     return got, links, (dict(glob.stats) if glob else {})
 
 
-def _run_fused(dets, cfg, co):
-    """All cameras of a second at once on the floor plan (mct.FloorTracker)."""
+def _run_fused(dets, cfg, co, kind="fused"):
+    """All cameras of a second at once: on one floor plan (mct.FloorTracker), or each camera's tracks
+    joined by floor evidence (mct.TrackletLinker; link-final: as the reports see them, every track
+    under the one it was finally joined to)."""
     import mct
-    ft = mct.FloorTracker(cfg)
+    ft = mct.FloorTracker(cfg) if kind == "fused" else mct.TrackletLinker(cfg)
     got, links = {}, set()
     cams = sorted(dets)
     for ts in sorted({t for per in dets.values() for t in per}):
@@ -409,6 +411,9 @@ def _run_fused(dets, cfg, co):
             for j, g in enumerate(ids):
                 got[(c, ts, j)] = g
             links.update(co.add(ids, [d["box"] for d in per[c]]))
+    if kind == "link-final":
+        got = {k: ft.root(g) for k, g in got.items()}
+        links = {(min(ft.root(a), ft.root(b)), max(ft.root(a), ft.root(b))) for a, b in links if ft.root(a) != ft.root(b)}
     return got, links, dict(ft.stats)
 
 
@@ -583,6 +588,10 @@ def variants(args, has_mats):
         v += [("fid/fused", "fid", "fused", dict(area))]
         v += [(f"fid/fused@{d:g}", "fid", "fused", dict(area, fuse_dist=d)) for d in args.fuse_sweep]
         v += [("fid/fused-noarea", "fid", "fused", {})] if area else []
+        v += [("fid/link", "fid", "link", {"reacquire_sim": 0.9}),
+              ("fid/link-final", "fid", "link-final", {"reacquire_sim": 0.9})]
+        v += [(f"fid/link-final@{d:g}", "fid", "link-final", {"reacquire_sim": 0.9, "link_dist": d})
+              for d in args.link_sweep]
     if args.appearance:
         v += [("fid/mct", "fid", "mct", {})]
         v += [(f"fid/mct@{x:g}", "fid", "mct", {"handover_min_sim": x, "reacquire_sim": max(x, 0.7)})
@@ -807,7 +816,8 @@ def main(argv=None):
         q.add_argument("--reacquire-sweep", type=float, nargs="*", default=[0.8, 0.9],
                        help="reacquire_sim tried (the frame id's space differs with an identity model)")
         q.add_argument("--fuse-sweep", type=float, nargs="*", default=[120.0, 200.0], help="fused: fuse_dist tried (cm)")
-    s.add_argument("--enroll", nargs="*", default=["fid/still", "fid/geo", "fid/fused"],
+        q.add_argument("--link-sweep", type=float, nargs="*", default=[80.0, 160.0], help="link: link_dist tried (cm)")
+    s.add_argument("--enroll", nargs="*", default=["fid/still", "fid/geo", "fid/fused", "fid/link-final"],
                    help="trackers whose tracks enroll is tried on")
     s.add_argument("--min-bursts", type=int, default=10, help="enroll: bursts a new cow needs")
     s.add_argument("--similarity", type=float, nargs="+", default=[0.55, 0.7, 0.8, 0.9],

@@ -552,3 +552,113 @@ class FusedSeconds:
     @property
     def stats(self):
         return self.ft.stats
+
+
+class TrackletLinker:
+    """Each camera follows its own cows (GlobalTracker without neighbours: IoU, cows lying still held, the
+    frame id to take a hidden cow back) - within a camera boxes are reliable (MmCows: IoU tracks 93%
+    pure). Across cameras the tracks are joined by where the cows stand, on evidence gathered over
+    time rather than a second at a time: a track of one camera and one of another are one cow when for
+    link_min_s seconds they were each other's nearest on the floor (within link_dist, at the height
+    where they agree, the posture a prior) and so in most (link_share) of the seconds both were seen.
+    Two tracks of one camera seen at the same time are never in one cow. A floor tracker matching
+    points a second at a time swapped close cows (MmCows: 33 switches a cow an hour).
+
+    update_all(ts, {cam: dets}) -> {cam: [gid]}: the joined track as known now (online); `root(track)`
+    gives the final one - what the reports see, the store keeping the links (track_links)."""
+
+    def __init__(self, cfg, store=None, apart=None):
+        m = cfg["mct"]
+        self.m = m
+        # each camera on its own: no neighbours, and no floor (the joining is done here, on evidence)
+        solo = dict(cfg, mct=dict(m, neighbours=[], portals=[], disjoint=[]),
+                    cameras=[{k: v for k, v in c.items() if k not in ("proj_mat", "floor_points")}
+                             for c in cfg["cameras"]])
+        self.cam_tracker = GlobalTracker(solo, None, None)
+        self.floor = {c["id"]: floor_mapper(c, m) for c in cfg["cameras"]}
+        self.dist = m.get("link_dist", 120.0)
+        self.min_s = m.get("link_min_s", 5)
+        self.share = m.get("link_share", 0.6)
+        self.pen = m.get("height_penalty", 40.0)
+        self.parent = {}
+        self.members = collections.defaultdict(set)           # root -> tracks
+        self.life = {}                                         # track -> (cam, first, last)
+        self.near = collections.Counter()                      # (a, b) -> seconds mutual nearest
+        self.both = collections.Counter()                      # (a, b) -> seconds both seen
+        self.store, self.apart = store, apart
+        self.stats = collections.Counter()
+        self.lock = threading.Lock()
+
+    def root(self, t):
+        while self.parent.get(t, t) != t:
+            self.parent[t] = self.parent.get(self.parent[t], self.parent[t])
+            t = self.parent[t]
+        return t
+
+    def _mergeable(self, ra, rb):
+        """Never two tracks of one camera that lived at the same time."""
+        for a in self.members[ra] or {ra}:
+            ca, fa, la = self.life[a]
+            for b in self.members[rb] or {rb}:
+                cb, fb, lb = self.life[b]
+                if ca == cb and fa <= lb and fb <= la:
+                    return False
+        return True
+
+    def _union(self, a, b, ts):
+        ra, rb = self.root(a), self.root(b)
+        if ra == rb:
+            return
+        if not self._mergeable(ra, rb):
+            self.stats["link_refused"] += 1
+            return
+        keep, gone = (ra, rb) if self.life[ra][1] <= self.life[rb][1] else (rb, ra)
+        self.parent[gone] = keep
+        self.members[keep] |= (self.members.pop(gone, set()) or {gone}) | {keep}
+        self.stats["linked"] += 1
+        if self.store is not None:
+            self.store.link_tracks(ts, gone, keep)
+
+    def _points(self, cam, ds):
+        f = self.floor.get(cam)
+        if f is None:
+            return None
+        return [(f(d["box"], 1.0), f(d["box"], 0.0), d.get("p_lying", 0.5)) for d in ds]
+
+    def _d(self, p, q):
+        best = np.inf
+        for h, like in ((0, lambda r: r[2]), (1, lambda r: 1 - r[2])):
+            d = np.hypot(p[h][0] - q[h][0], p[h][1] - q[h][1]) + self.pen * (2 - like(p) - like(q)) / 2
+            best = min(best, d)
+        return best
+
+    def update_all(self, ts, per_cam):
+        with self.lock:
+            ids = {cam: self.cam_tracker.update(cam, ts, ds) for cam, ds in per_cam.items()}
+            for cam, gs in ids.items():
+                for g in gs:
+                    c, first, _ = self.life.get(g, (cam, ts, ts))
+                    self.life[g] = (cam, first, ts)
+                    self.members.setdefault(g, set())
+            pts = {cam: self._points(cam, per_cam[cam]) for cam in per_cam}
+            cams = [c for c in per_cam if pts[c] is not None and pts[c]]
+            for i, ca in enumerate(cams):
+                for cb in cams[i + 1:]:
+                    D = np.array([[self._d(p, q) for q in pts[cb]] for p in pts[ca]])
+                    for x, ga in enumerate(ids[ca]):
+                        for y, gb in enumerate(ids[cb]):
+                            self.both[(ga, gb)] += 1
+                    if D.size == 0:
+                        continue
+                    bx, by = D.argmin(1), D.argmin(0)
+                    for x, y in enumerate(bx):
+                        if by[y] == x and D[x, y] <= self.dist:
+                            k = (ids[ca][x], ids[cb][y])
+                            self.near[k] += 1
+                            if self.near[k] >= self.min_s and self.near[k] >= self.share * self.both[k]:
+                                self._union(k[0], k[1], ts)
+            return {cam: [self.root(g) for g in gs] for cam, gs in ids.items()}
+
+    def track_at(self, cam, ts, box):
+        t = self.cam_tracker.track_at(cam, ts, box)
+        return None if t is None else self.root(t)

@@ -9,6 +9,7 @@
     cannot_link   pairs of tracks seen at the same time (so two different cows)
     cow_aliases   one cow's split profile merged into another (old -> canonical)
     track_handovers   a track passed from one camera to another (mct.py)
+    track_links   one camera's track joined to another's: the same cow (mct.TrackletLinker)
     alerts    raised alerts;  verdicts  the vet's answer to each
 
 Rows are written by track, not by cow: which cow a track is gets decided from
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, created
 CREATE TABLE IF NOT EXISTS verdicts (alert_id INTEGER, ts REAL, confirmed INTEGER, diagnosis TEXT, note TEXT);
 CREATE TABLE IF NOT EXISTS cannot_link (track_a TEXT, track_b TEXT, ts REAL, PRIMARY KEY (track_a, track_b));
 CREATE TABLE IF NOT EXISTS cow_aliases (old_cow TEXT PRIMARY KEY, canonical_cow TEXT, ts REAL);
+CREATE TABLE IF NOT EXISTS track_links (ts REAL, track TEXT PRIMARY KEY, joined_to TEXT);
 CREATE TABLE IF NOT EXISTS track_handovers (ts REAL, gid TEXT, from_cam TEXT, to_cam TEXT, kind TEXT,
                                             dist_m REAL, sim REAL);
 """
@@ -106,6 +108,24 @@ class Store:
 
     def aliases(self):
         return dict(self.query("SELECT old_cow, canonical_cow FROM cow_aliases"))
+
+    def link_tracks(self, ts, track, joined_to):
+        """track is the same cow as joined_to (mct.TrackletLinker): reports read them as one track."""
+        with self.lock:
+            self.db.execute("INSERT OR REPLACE INTO track_links VALUES (?,?,?)", (ts, track, joined_to))
+            self.db.commit()
+
+    def track_roots(self):
+        """track -> the track it was finally joined to (links followed to the end)."""
+        links = dict(self.query("SELECT track, joined_to FROM track_links"))
+        out = {}
+        for t in links:
+            r, seen = t, set()
+            while r in links and r not in seen:
+                seen.add(r)
+                r = links[r]
+            out[t] = r
+        return out
 
     def handover(self, ts, gid, from_cam, to_cam, kind, dist_m=None, sim=None):
         with self.lock:

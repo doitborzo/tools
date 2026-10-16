@@ -61,16 +61,21 @@ def day_expr(cfg):
 def track_map(store, min_share=2 / 3):
     """track -> cow from its confirmed bursts; tracks without a clear majority are left out."""
     aliases = store.aliases() if hasattr(store, "aliases") else {}   # a merged profile counts as its cow
+    roots = store.track_roots() if hasattr(store, "track_roots") else {}   # tracks joined across cameras
     votes = {}
     for track, cow, n in store.query("SELECT track, cow, COUNT(*) FROM bursts WHERE state='confirmed' "
                                      "GROUP BY track, cow"):
         cow = aliases.get(cow, cow)
-        votes.setdefault(track, {})[cow] = votes.get(track, {}).get(cow, 0) + n
+        key = roots.get(track, track)
+        votes.setdefault(key, {})[cow] = votes.get(key, {}).get(cow, 0) + n
     out = {}
     for track, v in votes.items():
         cow, n = max(v.items(), key=lambda kv: kv[1])
         if n >= min_share * sum(v.values()):
             out[track] = cow
+    for track, root in roots.items():                          # every joined track is its root's cow
+        if root in out:
+            out[track] = out[root]
     return out
 
 

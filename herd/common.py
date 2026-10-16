@@ -85,6 +85,10 @@ DEFAULTS = {
             # polygon in floor units) are phantoms and stay with their camera
             "mode": "handover", "fuse_dist": 160.0, "fuse_gate": 150.0, "max_speed": 80.0,
             "edge_margin": 0.01, "edge_weight": 0.15, "floor_area": [], "height_penalty": 40.0,
+            # mode "link": each camera tracks its own cows, tracks of two cameras are joined when for
+            # link_min_s seconds they were each other's nearest on the floor within link_dist, in
+            # link_share of the seconds both were seen (mct.TrackletLinker; reports follow track_links)
+            "link_dist": 120.0, "link_min_s": 5, "link_share": 0.6,
             "body_height_lying": 55.0, "body_height_standing": 90.0},
     "cameras": [],
 }
