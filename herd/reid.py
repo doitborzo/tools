@@ -212,16 +212,22 @@ def cmd_fetch(args):
             z, member, mask, name = job
             path = os.path.join(folder, name)
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            data = mask_crop(z.read(member), z.read(mask)) if mask else as_jpeg(z.read(member))
+            try:
+                data = mask_crop(z.read(member), z.read(mask)) if mask else as_jpeg(z.read(member))
+            except Exception as e:                         # retried already: this one is left for the next run
+                return f"{member}: {e.__class__.__name__}: {e}"
             if data is None:                               # an empty mask: no cow to cut
                 open(path + ".empty", "w").close()
-                return
+                return None
             open(path + ".part", "wb").write(data)
             os.replace(path + ".part", path)
+            return None
 
-        t0, done = time.time(), 0
+        t0, done, failed = time.time(), 0, []
         with cf.ThreadPoolExecutor(args.workers) as ex:
-            for _ in ex.map(one, todo):
+            for err in ex.map(one, todo):
+                if err:
+                    failed.append(err)
                 done += 1
                 if done % 2000 == 0 or done == len(todo):
                     el = time.time() - t0
@@ -231,7 +237,10 @@ def cmd_fetch(args):
         rows = [r for r in rows if os.path.exists(os.path.join(folder, r["file"]))]
         with open(os.path.join(folder, "index.jsonl"), "w", encoding="utf-8") as fh:
             fh.writelines(json.dumps(r) + "\n" for r in rows)
-        if not args.max_per_source:
+        if failed:
+            print(f"[fetch] {src}: {len(failed)} crops could not be read (e.g. {failed[0]}); the {len(rows)} others "
+                  f"are used, a new run fetches the rest", flush=True)
+        if not args.max_per_source and not failed:
             write_json(done_mark, {"crops": len(rows), "cows": len({r["cow"] for r in rows})})
             for path in zips if not args.keep_zips else []:
                 os.remove(path)                            # the crops are cut: the GBs of zip go
