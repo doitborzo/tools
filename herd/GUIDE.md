@@ -343,6 +343,21 @@ model then uses the head.) A box gets its global track (`gid`):
    `max_s`) — at `handover_min_sim + portal_extra_sim`;
 5. otherwise a new `gid`.
 
+**One canvas (`[mct] mode = "fused"`, calibrated cameras).** Instead of tracking in each
+camera and handing over, every second all cameras are put on one floor plan
+(`mct.FloorTracker`): each box becomes a floor point, points of different cameras within
+`fuse_dist` (160 cm) are one cow — never two of one camera — and one tracker follows the cows
+on the floor (gate `fuse_gate` + `max_speed` × time lost; a lost cow keeps her place for
+`still_s`). Each box takes its cow's track. The spread is cut where it comes from: a box cut by
+the frame's edge weighs `edge_weight`; a point off `floor_area` (the pen's floor, a polygon in
+floor units) is a phantom — a box on two cows, a cow of the next pen — and stays with its
+camera's own IoU tracking; and the height: a lying cow's centre is ~55 cm up, a standing one's
+~90, and a wrong posture throws the point a metre off, so each point is kept at both heights and
+two cameras' points are one cow at the height where they agree, the posture head only a prior
+(`height_penalty`). On MmCows' labelled boxes with 30% of postures wrong: 1.18 clusters a cow and
+13% mixed, against 1.31 and 20% with the posture taken as it comes. Live, the cameras' threads
+meet once a second (`mct.FusedSeconds`; a camera down does not hold the others).
+
 **By look alone, cows are not passed between cameras.** MmCows (60 min, 4 cameras):
 a cow seen by two cameras at once got one track in 0.1–1.4% of the cases, and every
 looser `handover_min_sim` only merged different cows (1285 false merges at 0.5) —

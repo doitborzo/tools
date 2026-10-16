@@ -96,6 +96,9 @@ still_iou = 0.5                 # still_iou) within still_s is her, whatever she
 handover_dist = 100             # floor distance (the floor_points' units, e.g. cm) to be the same cow
 handover_dist_margin = 50       # and the next cow at least this much further
 apart_dist = 0                  # > 0: two cameras' cows this far apart at the same second are two cows
+# mode = "fused"                # all calibrated cameras on one floor plan, one tracker on the floor
+# fuse_dist = 160               # fused: points of different cameras this close (cm) are one cow
+# floor_area = [[0, 0], [2400, 0], [2400, 1200], [0, 1200]]   # fused: the pen's floor (cm); off it = phantom
 # a blind passage between two cameras: a cow lost by `from` min_s..max_s ago may come out in `to`
 # [[mct.portals]]
 # from = "cam2"

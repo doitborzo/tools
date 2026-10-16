@@ -320,7 +320,7 @@ def test_mct_eval_scores_one_track_across_cameras():
         assert m["cross_cam_same_track"] > 0.95 and m["idf1_global"] > 0.95, m
         assert m["false_merges"] == 0 and m["false_cannot_link"] == 0
         assert r["fid/cam"]["tracks_per_cow"] < r["iou"]["tracks_per_cow"]      # the hidden cow comes back
-        e = m["enroll"]["with_cannot_link"]
+        e = m["enroll"]["with_cannot_link@0.55"]
         assert e["cows_made"] == 4 and e["purity"] == 1.0
 
 
@@ -385,6 +385,9 @@ def test_geo_hands_cows_over_by_place_alone():
         g = r["fid/geo"]
         assert g["cross_cam_same_track"] == 1.0 and g["false_merges"] == 0 and g["tracks_per_cow"] == 1.0, g
         assert r["fid/still"]["cross_cam_same_track"] == 0.0
+        f = r["fid/fused"]                                  # one canvas: each cow one point, one track
+        assert f["cross_cam_same_track"] == 1.0 and f["false_merges"] == 0 and f["tracks_per_cow"] == 1.0, f
+        assert f["tracker"]["fused"] >= 4 * 100
         mct_eval.main(["show", "--data", d, "--minutes", "0.5", "--still-every", "10"])
         out = os.path.join(d, "show", "fid_geo")
         assert os.path.getsize(os.path.join(out, "ids.mp4")) > 1000 and len(os.listdir(os.path.join(out, "stills"))) == 3
@@ -437,3 +440,41 @@ def test_show_ids_draws_the_store_on_the_recording():
         assert os.path.getsize(os.path.join(out, "ids.mp4")) > 1000
         assert len(os.listdir(os.path.join(out, "stills"))) == 3                  # seconds 0, 5, 10
         assert "50%" in open(os.path.join(out, "index.html")).read()              # trk-a has a cow, trk-b is NaN
+
+
+def test_floor_tracker_fuses_cameras_and_leaves_phantoms_aside():
+    import mct
+    cfg = _cfg()
+    cfg["cameras"] = [{"id": c, "mask": [], "floor_points": pts} for c, pts in (
+        ("a", [[0, 0, 0, 0], [1, 0, 1000, 0], [1, 1, 1000, 1000], [0, 1, 0, 1000]]),
+        ("b", [[0, 0, 1000, 1000], [1, 0, 0, 1000], [1, 1, 0, 0], [0, 1, 1000, 0]]))]   # b sees it turned round
+    cfg["mct"].update(floor_area=[[0, 0], [1000, 0], [1000, 1000], [0, 1000]])
+    ft = mct.FloorTracker(cfg)
+    box = lambda cx, by: [cx - 0.05, by - 0.1, cx + 0.05, by]            # the floor point is the bottom centre
+    g = None
+    for k in range(10):
+        x = 0.3 + 0.01 * k
+        out = ft.update_all(float(k), {"a": [{"box": box(x, 0.5)}, {"box": box(0.5, 1.4)}],   # 2nd: off the floor
+                                       "b": [{"box": box(1 - x, 0.5)}]})
+        assert out["a"][0] == out["b"][0]                                 # one cow, both cameras
+        assert g is None or out["a"][0] == g
+        g = out["a"][0]
+        assert out["a"][1] != g and out["a"][1].startswith("a-off")
+    assert ft.stats["fused"] == 10 and ft.stats["off_floor"] == 10
+
+
+def test_fused_seconds_waits_for_every_camera():
+    import threading
+    import mct
+    cfg = _cfg()
+    cfg["cameras"] = [{"id": c, "mask": [], "floor_points": [[0, 0, 0, 0], [1, 0, 1000, 0], [1, 1, 1000, 1000],
+                                                             [0, 1, 0, 1000]]} for c in ("a", "b")]
+    fs = mct.FusedSeconds(mct.FloorTracker(cfg), ["a", "b"], wait_s=2.0)
+    box = [0.45, 0.4, 0.55, 0.5]
+    fs.update("a", 0.0, [{"box": box}])
+    fs.update("b", 0.0, [{"box": box}])                  # both alive from now on
+    got = {}
+    th = [threading.Thread(target=lambda c=c: got.__setitem__(c, fs.update(c, 1.0, [{"box": box}]))) for c in "ab"]
+    [t.start() for t in th]
+    [t.join() for t in th]
+    assert got["a"] == got["b"] and fs.stats["fused"] >= 1          # one cow: one point, one track

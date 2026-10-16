@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import collections
 import threading
+import time
 
 import numpy as np
 
@@ -334,3 +335,220 @@ class GlobalTracker:
                     if v > score:
                         best, score = gid, v
             return best if score >= self.min_iou else None
+
+
+# ------------------------------------------------------------------ all cameras on one floor plan
+
+class FloorTracker:
+    """All calibrated cameras on one floor plan ("one canvas"), a second at a time: every box becomes a
+    point on the floor (common.floor_mapper), the points of different cameras within fuse_dist of each
+    other become one cow (never two points of one camera), and one tracker follows the cows on the
+    floor - so a cow seen by three cameras is one point and one track, with no handover at all.
+
+    The spread of the points is what makes it fail, so it is cut where it comes from:
+      - a box cut by the frame's edge (a cow half out of view) has its centre in the wrong place:
+        it weighs edge_weight in the cow's position and is not fused on its own say;
+      - a point off the pen's floor (floor_area, a polygon in floor units) is a phantom - a box on
+        two cows, a cow of the next pen - and is left to its camera's own small IoU tracker;
+      - the cow's height: a box's centre lands on the floor at another place for a lying (55 cm) and a
+        standing (90 cm) cow, and a wrong posture throws the point a metre off. So each point is
+        kept at both heights, and two cameras' points are one cow at the height where they agree,
+        the posture head only a prior (height_penalty, cm, against the height it does not say).
+        MmCows' labels with 30% of postures wrong: 1.18 clusters a cow, 13% mixed - with the
+        posture taken as it comes, 1.31 and 20%.
+    A cow lost (hidden, missed) keeps her place for still_s, the gate growing with max_speed."""
+
+    def __init__(self, cfg, store=None, apart=None):
+        m = cfg["mct"]
+        self.m = m
+        self.cams = {c["id"]: c for c in cfg["cameras"]}
+        self.floor = {cid: floor_mapper(c, m) for cid, c in self.cams.items()}
+        self.area = m.get("floor_area") or []
+        self.fuse_dist = m.get("fuse_dist", 120.0)
+        self.gate = m.get("fuse_gate", 150.0)
+        self.speed = m.get("max_speed", 80.0)                 # floor units (cm) a second
+        self.keep_s = m.get("still_s", 60.0)
+        self.edge = m.get("edge_margin", 0.01)
+        self.edge_w = m.get("edge_weight", 0.15)
+        self.min_iou = cfg["tracker"]["iou"]
+        self.tracks = {}                                       # gid -> {"xy", "v", "last", "n"}
+        self.local = collections.defaultdict(dict)             # cam -> gid -> (box, last): off-floor boxes
+        self.history = collections.defaultdict(lambda: collections.defaultdict(lambda: collections.deque(maxlen=120)))
+        self.store, self.apart = store, apart
+        self.n = 0
+        self.stats = collections.Counter()
+        self.lock = threading.Lock()
+
+    def _new(self, ts, prefix="f"):
+        self.n += 1
+        return f"{prefix}-{int(ts)}-{self.n}"
+
+    def _point(self, cam, d):
+        """-> ({"xy": (lying, standing), "prior": p(lying), "mix": the posture's own point}, weight),
+        or (None, 0) off the floor or for an uncalibrated camera."""
+        f = self.floor.get(cam)
+        if f is None:
+            return None, 0.0
+        pl = d.get("p_lying", 0.5)
+        pt = {"xy": (f(d["box"], 1.0), f(d["box"], 0.0)), "prior": pl, "mix": f(d["box"], pl)}
+        if self.area and not any(in_polygon(x, y, self.area) for x, y in pt["xy"]):
+            return None, 0.0
+        b = d["box"]
+        cut = min(b[0], b[1], 1 - b[2], 1 - b[3]) < self.edge
+        return pt, (self.edge_w if cut else 1.0)
+
+    def _fuse(self, pts):
+        """pts [(cam, j, point, w)] -> clusters [([index into pts], height 0 lying / 1 standing / None)]:
+        the closest pairs of different cameras first, at the height where they agree (plus the
+        posture prior's penalty); a cluster never holds two points of one camera, nor two points
+        fuse_dist * 1.5 apart, and keeps one height."""
+        n = len(pts)
+        pen = self.m.get("height_penalty", 40.0)
+        Dh = []
+        for h in (0, 1):
+            P = np.array([p[2]["xy"][h] for p in pts], float).reshape(-1, 2)
+            Dh.append(np.hypot(P[:, None, 0] - P[None, :, 0], P[:, None, 1] - P[None, :, 1]) if n else np.zeros((0, 0)))
+        like = lambda p, h: p[2]["prior"] if h == 0 else 1 - p[2]["prior"]
+        cand = sorted((Dh[h][i, k] + pen * (2 - like(pts[i], h) - like(pts[k], h)) / 2, i, k, h)
+                      for i in range(n) for k in range(i + 1, n) for h in (0, 1)
+                      if pts[i][0] != pts[k][0] and Dh[h][i, k] <= self.fuse_dist)
+        groups = {i: ([i], None) for i in range(n)}
+        owner = list(range(n))
+        for _, i, k, h in cand:
+            a, b = owner[i], owner[k]
+            if a == b:
+                continue
+            (ga, ha), (gb, hb) = groups[a], groups[b]
+            if (ha is not None and ha != h) or (hb is not None and hb != h):
+                continue
+            if {pts[x][0] for x in ga} & {pts[x][0] for x in gb}:
+                continue
+            if max(Dh[h][x, y] for x in ga for y in gb) > self.fuse_dist * 1.5:
+                continue
+            groups[a] = (ga + gb, h)
+            for x in gb:
+                owner[x] = a
+            del groups[b]
+        return list(groups.values())
+
+    def update_all(self, ts, per_cam):
+        """per_cam {cam: [{"box", "emb", "p_lying"}]} for one second -> {cam: [gid per box]}."""
+        with self.lock:
+            out = {cam: [None] * len(ds) for cam, ds in per_cam.items()}
+            pts, off = [], []
+            for cam, ds in per_cam.items():
+                for j, d in enumerate(ds):
+                    xy, w = self._point(cam, d)
+                    (pts.append((cam, j, xy, w)) if xy is not None else off.append((cam, j)))
+            fused = self._fuse(pts)
+            clusters = [c for c, _ in fused]
+            # a cow's place: the weighted mean of her points at the height her cameras agree on (a box
+            # cut by the edge barely counts); seen by one camera, her posture's own point
+            pos = []
+            for c, h in fused:
+                w = np.array([pts[i][3] for i in c])
+                xy = np.array([pts[i][2]["xy"][h] if h is not None else pts[i][2]["mix"] for i in c], float)
+                pos.append(tuple((xy * w[:, None]).sum(0) / w.sum()))
+            live = [g for g, t in self.tracks.items() if ts - t["last"] <= self.keep_s]
+            S = np.full((len(live), len(clusters)), NEG)
+            for a, g in enumerate(live):
+                t = self.tracks[g]
+                dt = max(0.0, ts - t["last"])
+                px, py = t["xy"][0] + t["v"][0] * min(dt, 2.0), t["xy"][1] + t["v"][1] * min(dt, 2.0)
+                gate = self.gate + self.speed * dt
+                for b, (x, y) in enumerate(pos):
+                    dist = np.hypot(px - x, py - y)
+                    if dist <= gate:
+                        S[a, b] = -dist
+            matched = {}
+            for a, b in assign(S):
+                matched[b] = live[a]
+            for b, (x, y) in enumerate(pos):
+                g = matched.get(b)
+                if g is None:
+                    g = self._new(ts)
+                    self.tracks[g] = {"xy": (x, y), "v": (0.0, 0.0), "last": ts, "n": 0}
+                    self.stats["new"] += 1
+                else:
+                    t = self.tracks[g]
+                    dt = max(1e-3, ts - t["last"])
+                    vx, vy = (x - t["xy"][0]) / dt, (y - t["xy"][1]) / dt
+                    t["v"] = (0.5 * t["v"][0] + 0.5 * vx, 0.5 * t["v"][1] + 0.5 * vy) if dt <= 2 else (0.0, 0.0)
+                    t["xy"], t["last"] = (x, y), ts
+                    self.stats["followed"] += 1
+                self.tracks[g]["n"] += 1
+                cams_here = {pts[i][0] for i in clusters[b]}
+                if len(cams_here) > 1:
+                    self.stats["fused"] += 1
+                for i in clusters[b]:
+                    cam, j = pts[i][0], pts[i][1]
+                    out[cam][j] = g
+            # off the floor (or an uncalibrated camera): the camera's own IoU tracking, its own ids
+            for cam, j in off:
+                box = per_cam[cam][j]["box"]
+                loc = self.local[cam]
+                best = max(((iou(b, box), g) for g, (b, last) in loc.items() if ts - last <= 5.0), default=(0, None))
+                g = best[1] if best[0] >= self.min_iou and best[1] not in out[cam] else self._new(ts, f"{cam}-off")
+                loc[g] = (box, ts)
+                out[cam][j] = g
+                self.stats["off_floor"] += 1
+            for cam, ds in per_cam.items():
+                for g, d in zip(out[cam], ds):
+                    self.history[cam][g].append((ts, list(d["box"])))
+            self.tracks = {g: t for g, t in self.tracks.items() if ts - t["last"] <= self.keep_s}
+            for cam in list(self.local):
+                self.local[cam] = {g: v for g, v in self.local[cam].items() if ts - v[1] <= 5.0}
+            for cam, h in self.history.items():
+                for g in [g for g, q in h.items() if q and ts - q[-1][0] > 120]:
+                    del h[g]
+            return out
+
+    def track_at(self, cam, ts, box):
+        with self.lock:
+            best, score = None, 0.0
+            for gid, h in self.history.get(cam, {}).items():
+                near = min(h, key=lambda x: abs(x[0] - ts), default=None)
+                if near and abs(near[0] - ts) <= 2.0:
+                    v = iou(near[1], box)
+                    if v > score:
+                        best, score = gid, v
+            return best if score >= self.min_iou else None
+
+
+class FusedSeconds:
+    """The barn's cameras run in threads of their own: each hands in its second here and waits; when every
+    camera alive (handed in within alive_s) has, or wait_s has passed, FloorTracker takes them all at
+    once and each camera gets its boxes' tracks back. A camera that is down does not hold the others."""
+
+    def __init__(self, tracker, cams, wait_s=0.8, alive_s=10.0):
+        self.ft, self.wait, self.alive_s = tracker, wait_s, alive_s
+        self.alive = {c: None for c in cams}
+        self.pending, self.done = {}, {}
+        self.cv = threading.Condition()
+
+    def update(self, cam, ts, dets):
+        deadline = time.monotonic() + self.wait
+        with self.cv:
+            self.alive[cam] = ts
+            self.pending.setdefault(ts, {})[cam] = dets
+            expect = {c for c, t in self.alive.items() if t is not None and ts - t <= self.alive_s}
+            while not (ts in self.done and cam in self.done[ts]):
+                ready = set(self.pending.get(ts, {})) >= expect
+                if ready or time.monotonic() >= deadline:
+                    per = self.pending.pop(ts, {})
+                    if per:
+                        self.done.setdefault(ts, {}).update(self.ft.update_all(ts, per))
+                    self.cv.notify_all()
+                    continue
+                self.cv.wait(timeout=max(0.01, deadline - time.monotonic()))
+            out = self.done[ts][cam]
+            for t in [t for t in self.done if t < ts - 30]:
+                del self.done[t]
+        return out
+
+    def track_at(self, cam, ts, box):
+        return self.ft.track_at(cam, ts, box)
+
+    @property
+    def stats(self):
+        return self.ft.stats

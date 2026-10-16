@@ -361,13 +361,15 @@ def run_tracker(dets, kind, mct_over=None, mats=None):
     cfg["mct"].update(mct_over or {})
     if kind == "mct":
         cfg["mct"]["neighbours"] = [[a, b] for i, a in enumerate(cams) for b in cams[i + 1:]]
-    if kind == "geo":
+    if kind in ("geo", "fused"):
         for c in cfg["cameras"]:
             if c["id"] in (mats or {}):
                 c.update(proj_mat=mats[c["id"]], proj_size=list(PROJ_SIZE))
     co = mct.CoSeen(cfg["identity"]["cannot_link_min_s"], cfg["identity"]["cannot_link_max_iou"])
     trackers = ({c: pipeline.Tracker(c, cfg["tracker"]["iou"], cfg["tracker"]["max_age_s"]) for c in cams}
                 if kind == "iou" else None)
+    if kind == "fused":
+        return _run_fused(dets, cfg, co)
     glob = mct.GlobalTracker(cfg, apart=lambda pairs, ts: links.update((min(a, b), max(a, b)) for a, b in pairs)) \
         if kind != "iou" else None
     for ts in seconds:
@@ -391,6 +393,34 @@ def run_tracker(dets, kind, mct_over=None, mats=None):
                 got[(cam, ts, j)] = g
             links.update(co.add(ids, [d[0] for d in ds]))
     return got, links, (dict(glob.stats) if glob else {})
+
+
+def _run_fused(dets, cfg, co):
+    """All cameras of a second at once on the floor plan (mct.FloorTracker)."""
+    import mct
+    ft = mct.FloorTracker(cfg)
+    got, links = {}, set()
+    cams = sorted(dets)
+    for ts in sorted({t for per in dets.values() for t in per}):
+        per = {c: [{"box": d[0], "emb": d[1], "p_lying": 0.5 if d[2] is None else d[2]} for d in dets[c][ts]]
+               for c in cams if ts in dets[c]}
+        out = ft.update_all(float(ts), per)
+        for c, ids in out.items():
+            for j, g in enumerate(ids):
+                got[(c, ts, j)] = g
+            links.update(co.add(ids, [d["box"] for d in per[c]]))
+    return got, links, dict(ft.stats)
+
+
+def floor_area(data, grow=150.0):
+    """The pen's floor as MmCows' own cow positions cover it: their hull, grown by `grow` cm."""
+    pos = [p for v in cow_positions(data).values() for p in v.values() if np.isfinite(p).all()]
+    if len(pos) < 3:
+        return []
+    h = np.array(hull(pos), float)
+    c = h.mean(0)
+    d = h - c
+    return (c + d * (1 + grow / np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-6))).tolist()
 
 
 def match_gt(gt, dets, thr=0.5):
@@ -544,10 +574,15 @@ def variants(args, has_mats):
     v = [("iou", "fid", "iou", {}),
          ("fid/cam", "fid", "cam", {"still_s": 0}),           # stage B as it was
          ("fid/still", "fid", "cam", {})]                      # + a cow lying still held by her place
+    v += [(f"fid/still~{r:g}", "fid", "cam", {"reacquire_sim": r}) for r in args.reacquire_sweep]
     if has_mats:
         v += [("fid/geo", "fid", "geo", {}),
               (f"fid/geo+apart{args.apart:g}", "fid", "geo", {"apart_dist": args.apart})]
         v += [(f"fid/geo@{d:g}", "fid", "geo", {"handover_dist": d}) for d in args.dist_sweep]
+        area = {"floor_area": args.floor_area} if args.floor_area else {}
+        v += [("fid/fused", "fid", "fused", dict(area))]
+        v += [(f"fid/fused@{d:g}", "fid", "fused", dict(area, fuse_dist=d)) for d in args.fuse_sweep]
+        v += [("fid/fused-noarea", "fid", "fused", {})] if area else []
     if args.appearance:
         v += [("fid/mct", "fid", "mct", {})]
         v += [(f"fid/mct@{x:g}", "fid", "mct", {"handover_min_sim": x, "reacquire_sim": max(x, 0.7)})
@@ -559,6 +594,7 @@ def variants(args, has_mats):
 
 def load_all(args):
     meta = json.load(open(os.path.join(args.data, "meta.json"), encoding="utf-8"))
+    args.floor_area = floor_area(args.data)
     cams = meta["cams"]
     gt = read_labels(args.data, cams)
     emb, outside = in_pen(load_emb(args.data, cams), pen_masks(gt))
@@ -603,7 +639,9 @@ def cmd_score(args):
         r, major = score_run(got, links, gt_map, gt, dets, n_gt, n_det)
         r.update(tracker=stats, tracks=len(set(got.values())), seconds=round(time.time() - t, 1), mct=over, kind=kind)
         if name in args.enroll:
-            r["enroll"] = enroll_eval(pseudo_bursts(got, dets), links, major, args.min_bursts, args.similarity)
+            pb = pseudo_bursts(got, dets)
+            r["enroll"] = {f"{k}@{sim:g}": e for sim in args.similarity
+                           for k, e in enroll_eval(pb, links, major, args.min_bursts, sim).items()}
         results[name] = r
         rows.append((name, r))
         print(f"[score] {name:18s} IDF1 camera {r['idf1_camera']:.3f} global {r['idf1_global']:.3f}  "
@@ -626,8 +664,8 @@ def cmd_score(args):
               f"{r['false_cannot_link']} of {r['cannot_link_pairs']} | {r['track_purity']:.1%} |")
     for key, r in rows:
         if "enroll" in r:
-            print(f"\nNew cows from {key}'s tracks (gallery.enroll on 7 s pseudo-bursts, "
-                  f"similarity {args.similarity}, min {args.min_bursts} bursts):")
+            print(f"\nNew cows from {key}'s tracks (gallery.enroll on 7 s pseudo-bursts, min {args.min_bursts} "
+                  f"bursts; name@new_cow_similarity):")
             for name, e in r["enroll"].items():
                 print(f"  {name:17s} {e['cows_made']} cows made for {e['true_cows']}; ids per cow "
                       f"{e['ids_per_cow'] or 0:.2f}; cows with no id {e['cows_without_id']}; purity "
@@ -766,9 +804,14 @@ def main(argv=None):
         q.add_argument("--appearance", action="store_true", help="also hand over by look (stage B) with --sweep")
         q.add_argument("--sweep", type=float, nargs="*", default=[0.6, 0.8], help="handover_min_sim tried with --appearance")
         q.add_argument("--dino", action="store_true", help="also DINOv2's CLS as the vector")
-    s.add_argument("--enroll", nargs="*", default=["fid/still", "fid/geo"], help="trackers whose tracks enroll is tried on")
+        q.add_argument("--reacquire-sweep", type=float, nargs="*", default=[0.8, 0.9],
+                       help="reacquire_sim tried (the frame id's space differs with an identity model)")
+        q.add_argument("--fuse-sweep", type=float, nargs="*", default=[120.0, 200.0], help="fused: fuse_dist tried (cm)")
+    s.add_argument("--enroll", nargs="*", default=["fid/still", "fid/geo", "fid/fused"],
+                   help="trackers whose tracks enroll is tried on")
     s.add_argument("--min-bursts", type=int, default=10, help="enroll: bursts a new cow needs")
-    s.add_argument("--similarity", type=float, default=DEFAULTS["identity"]["new_cow_similarity"])
+    s.add_argument("--similarity", type=float, nargs="+", default=[0.55, 0.7, 0.8, 0.9],
+                   help="new_cow_similarity values tried by enroll (an identity model's space differs)")
     v.add_argument("--variant", default="fid/geo", help="the tracker drawn (a name from score's table)")
     v.add_argument("--from-min", type=float, default=0.0)
     v.add_argument("--minutes", type=float, default=10.0)

@@ -79,6 +79,12 @@ DEFAULTS = {
             # handover_dist_margin further (units of the calibration, e.g. cm). apart_dist > 0:
             # cows seen at the same second this far apart by two cameras are two cows
             "handover_dist": 100.0, "handover_dist_margin": 50.0, "apart_dist": 0.0,
+            # mode "fused" (calibrated cameras): every second all cameras on one floor plan - points of
+            # different cameras within fuse_dist are one cow, one tracker on the floor (mct.FloorTracker);
+            # boxes cut by the frame's edge (edge_margin) weigh edge_weight; points off floor_area (a
+            # polygon in floor units) are phantoms and stay with their camera
+            "mode": "handover", "fuse_dist": 160.0, "fuse_gate": 150.0, "max_speed": 80.0,
+            "edge_margin": 0.01, "edge_weight": 0.15, "floor_area": [], "height_penalty": 40.0,
             "body_height_lying": 55.0, "body_height_standing": 90.0},
     "cameras": [],
 }
