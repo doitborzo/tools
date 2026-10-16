@@ -497,6 +497,31 @@ over-fitting what it has already fitted): three more sources, all with an angled
   `INIT=` in the pod script) fine-tunes an existing model instead.
 - `mct_eval` now splits its look check: cows 1-10 (trained on, other hours of the day) and cows
   11-16 (never seen) — the second is the honest number for a new barn.
+
+**What that run showed, and what changed.** Trained from scratch on five sets (SideViewCows not yet
+in), the model knew a held-out cow on another day 96% of the time and MmCows' cows 11-16 from
+another camera 57.5% by burst — but one frame against one frame at the same second (what the
+tracker asks) only 15.5% (chance 9.8%), no better than the first model, and its similarities sat
+high for every cow (same cow 0.96, two cows 0.9+), so the tracker's fixed thresholds let everything
+through: within-camera purity 88 → 77%, IDF1 over all cameras 0.499 → 0.413. Three changes:
+
+- **Frame against frame in training** (`--frame-w 1`, `--moments 8`): besides the bursts, each step
+  takes 8 of MmCows' seconds and every cow every camera saw then, one frame each — the same cow from
+  another camera at that second is the positive, the cows beside her the negatives (cows 1-10; cows
+  11-16 held out). Scored as `moment_cross_cam_top1` (frame vs frame, the look check on held-out
+  cows), and the best epoch counts it.
+- **Thresholds per model** (`thresholds.json` next to `identity.pt`, `reid.calibrate`): on the held-out
+  cows, each threshold sits above 98% of the pairs of two different cows (handover 95%, the gallery's
+  merge 99.5%) — `reacquire_sim` (one frame, same camera), `handover_min_sim` (another camera, same
+  second), `late_sim` (means of 3 frames), `new_cow_similarity` and `merge_similarity` (bursts); the log
+  prints how many same-cow pairs still pass. `pipeline.run` and `mct_eval` take them wherever the
+  config keeps the default. The NaN model of a one-day set (MmCows) is now fitted on its other-camera
+  queries too.
+- **Late reacquire** (`mct.py`, `[mct] late_*`): a new track, once it has 3 frame ids over 3 s, is
+  compared by its own fingerprint (the mean of its frame ids) with the tracks its camera lost in the
+  60 s before it began, near where it began; the clearly nearest above `late_sim` is the same cow — the
+  new gid continues the old one (`track_links`, the reports follow). Off without a calibration;
+  `mct_eval` scores `fid/still-nolate` and `fid/link-final-nolate` to compare.
 ---
 
 ## 5. Training on the pod (CBVD-5)

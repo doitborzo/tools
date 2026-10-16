@@ -161,7 +161,9 @@ def cmd_embed(args):
     source = ("the identity model (reid.py) on one frame" if models.id_model is not None else
               "the trained head" if models.model.frame_id else "the herd transformer on one frame")
     print(f"[embed] detector threshold {getattr(models.detector, 'threshold', '?')}; frame id: {source}", flush=True)
-    stamp = {"frame_id": source, "identity": os.path.abspath(args.identity) if args.identity else ""}
+    from reid import identity_thresholds
+    stamp = {"frame_id": source, "identity": os.path.abspath(args.identity) if args.identity else "",
+             "thresholds": identity_thresholds(args.identity) if args.identity else {}}
     os.makedirs(os.path.join(args.data, "emb"), exist_ok=True)
     for cam in meta["cams"]:
         out = os.path.join(args.data, "emb", f"{cam}.npz")
@@ -402,6 +404,10 @@ def run_tracker(dets, kind, mct_over=None, mats=None):
             for j, g in enumerate(ids):
                 got[(cam, ts, j)] = g
             links.update(co.add(ids, [d[0] for d in ds]))
+    if glob is not None and glob.alias:          # cows taken back late: as the reports see them
+        got = {k: glob.root(g) for k, g in got.items()}
+        links = {(min(glob.root(a), glob.root(b)), max(glob.root(a), glob.root(b))) for a, b in links
+                 if glob.root(a) != glob.root(b)}
     return got, links, (dict(glob.stats) if glob else {})
 
 
@@ -584,8 +590,20 @@ def enroll_eval(bursts, links, major, min_bursts, similarity, max_units=600):
     return res
 
 
-def variants(args, has_mats):
-    """(name, vector, kind, [mct] overrides) of every tracker scored."""
+def load_thresholds(data, cams):
+    """The identity model's calibrated thresholds the embeddings were made with ({} for the herd model)."""
+    for cam in cams:
+        path = os.path.join(data, "emb", f"{cam}.npz")
+        if os.path.exists(path):
+            z = np.load(path)
+            if "stamp" in z.files:
+                return json.loads(str(z["stamp"])).get("thresholds", {}) or {}
+    return {}
+
+
+def variants(args, has_mats, cal=None):
+    """(name, vector, kind, [mct] overrides) of every tracker scored; with an identity model's calibrated
+    thresholds (cal), every fid tracker starts from them (late reacquire on), the sweeps still set theirs."""
     v = [("iou", "fid", "iou", {}),
          ("fid/cam", "fid", "cam", {"still_s": 0}),           # stage B as it was
          ("fid/still", "fid", "cam", {})]                      # + a cow lying still held by her place
@@ -598,12 +616,16 @@ def variants(args, has_mats):
         v += [("fid/fused", "fid", "fused", dict(area))]
         v += [(f"fid/fused@{d:g}", "fid", "fused", dict(area, fuse_dist=d)) for d in args.fuse_sweep]
         v += [("fid/fused-noarea", "fid", "fused", {})] if area else []
-        v += [("fid/link", "fid", "link", {"reacquire_sim": 0.9}),
-              ("fid/link-final", "fid", "link-final", {"reacquire_sim": 0.9})]
-        v += [(f"fid/link-final@{d:g}", "fid", "link-final", {"reacquire_sim": 0.9, "link_dist": d})
-              for d in args.link_sweep]
-        v += [("fid/link-final-nomargin", "fid", "link-final", {"reacquire_sim": 0.9, "link_margin": 0.0}),
-              ("fid/link-final+contra", "fid", "link-final", {"reacquire_sim": 0.9, "link_contra": 0.3})]
+        r9 = {} if cal and "reacquire_sim" in cal else {"reacquire_sim": 0.9}   # uncalibrated: 0.9 was best
+        v += [("fid/link", "fid", "link", dict(r9)),
+              ("fid/link-final", "fid", "link-final", dict(r9))]
+        v += [(f"fid/link-final@{d:g}", "fid", "link-final", dict(r9, link_dist=d)) for d in args.link_sweep]
+        v += [("fid/link-final-nomargin", "fid", "link-final", dict(r9, link_margin=0.0)),
+              ("fid/link-final+contra", "fid", "link-final", dict(r9, link_contra=0.3))]
+        if cal and cal.get("late_sim"):
+            v += [("fid/link-final-nolate", "fid", "link-final", {"late_sim": 0.0})]
+    if cal and cal.get("late_sim"):
+        v += [("fid/still-nolate", "fid", "cam", {"late_sim": 0.0})]
     if args.appearance:
         v += [("fid/mct", "fid", "mct", {})]
         v += [(f"fid/mct@{x:g}", "fid", "mct", {"handover_min_sim": x, "reacquire_sim": max(x, 0.7)})
@@ -633,9 +655,20 @@ def cmd_score(args):
     results = {"data": {"cams": cams, "minutes": (meta["end_ts"] - meta["start_ts"]) / 60, "step_s": meta["step"],
                         "labelled_frames": sum(len(p) for p in gt.values()), "outside_pen": outside,
                         "cannot_link_rule": {k: DEFAULTS["identity"][k] for k in ("cannot_link_min_s", "cannot_link_max_iou")}}}
+    cal = load_thresholds(args.data, cams)
+    from reid import MCT_KEYS
+    cal_mct = {k: cal[k] for k in MCT_KEYS if k in cal}
+    if cal_mct:
+        print("[score] the identity model's calibrated thresholds: " + ", ".join(f"{k} {v:.3f}" for k, v in cal_mct.items())
+              + (f", new_cow_similarity {cal['new_cow_similarity']:.3f}" if "new_cow_similarity" in cal else ""), flush=True)
+        results["data"]["thresholds"] = cal
+        if "new_cow_similarity" in cal:
+            args.similarity = sorted(set(args.similarity) | {round(cal["new_cow_similarity"], 3)})
     prepared = {}
     rows = []
-    for name, vec, kind, over in variants(args, bool(mats)):
+    for name, vec, kind, over in variants(args, bool(mats), cal):
+        if vec == "fid" and cal_mct:
+            over = dict(cal_mct, **over)
         if vec not in prepared:
             prepared[vec] = prepare(emb, vec)
         dets = prepared[vec]

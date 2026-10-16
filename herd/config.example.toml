@@ -88,6 +88,11 @@ handover_min_sim = 0.5          # frame id vs the track's running average, and a
 handover_margin = 0.05          # this much above the next candidate (else a new track)
 reacquire_s = 10.0              # a cow hidden this long is taken back near where she was ...
 reacquire_sim = 0.7             # ... if her frame id is this close
+# late_sim = 0                  # a new track, after a few seconds, against the tracks its camera lost just
+                                # before (near): by the mean of her frame ids. Off at 0; an identity model
+                                # ([model] identity) sets it - and reacquire_sim, handover_min_sim, the
+                                # gallery's new_cow_similarity / merge_similarity - from its thresholds.json
+                                # wherever this file leaves the default
 still_s = 60                    # a cow lying / standing still: her box back at the same place (IoU >=
 still_iou = 0.5                 # still_iou) within still_s is her, whatever she looks like
 # Calibrated cameras (per camera floor_points, see below): cows are passed between cameras by where

@@ -165,11 +165,12 @@ class Models:
             self.motion_dim = max(self.motion_dim, rk["kw"].get("motion_dim", 0))
         # reid.py's identity model, when the config names one: the fingerprint (bursts, and one frame a
         # second for mct.py) comes from it - taught on cows with ids - and the gallery takes its abstain.json
-        self.id_model, self.id_abstain = None, None
+        self.id_model, self.id_abstain, self.id_thresholds = None, None, {}
         ip = cfg["model"].get("identity")
         if ip:
-            from reid import load_identity
+            from reid import identity_thresholds, load_identity
             self.id_model, self.id_abstain = load_identity(ip, self.features_meta, self.dev)
+            self.id_thresholds = identity_thresholds(ip)   # its own similarity thresholds (reid.calibrate)
         # The cut-off calibrated with the model: "ruminating" per burst, summed
         # into minutes by the reports (the one that keeps the share true).
         try:
@@ -695,15 +696,19 @@ def run(cfg, start=None, models=None, max_wall_s=None):
     models = models or Models(cfg)
     if getattr(models, "id_model", None) is not None:
         abstain = models.id_abstain          # the NaN model fitted on the identity model's fingerprints
+        from reid import apply_thresholds
+        # each model's similarities sit elsewhere: its calibrated thresholds, where barn.toml left the default
+        if not apply_thresholds(cfg, getattr(models, "id_thresholds", {}) or {}, DEFAULTS,
+                                lambda x: print(f"[run] {x}", flush=True)) \
+                and cfg["mct"]["reacquire_sim"] == DEFAULTS["mct"]["reacquire_sim"]:
+            # an identity model without a calibration (an older reid.py): MmCows' best for the first one
+            cfg["mct"]["reacquire_sim"] = 0.9
+            print("[run] [mct] reacquire_sim 0.9 with the identity model (no thresholds.json)", flush=True)
     shared = SharedGallery(gallery_mod.Gallery(folder, cfg, abstain), store, cfg, start_ts)
     cams = [Camera(c, i, len(cfg["cameras"]), cfg, models, shared, store, start_ts)
             for i, c in enumerate(cfg["cameras"])]
     if cfg["mct"]["enabled"]:
         from mct import FloorTracker, FusedSeconds, GlobalTracker, TrackletLinker
-        if getattr(models, "id_model", None) is not None and cfg["mct"]["reacquire_sim"] == DEFAULTS["mct"]["reacquire_sim"]:
-            # the identity model's space is tighter: at 0.7 a camera took back the wrong cow (MmCows: 0.9 best)
-            cfg["mct"]["reacquire_sim"] = 0.9
-            print("[run] [mct] reacquire_sim 0.9 with the identity model", flush=True)
         mode = cfg["mct"].get("mode")
         if mode in ("fused", "link"):               # all cameras at once, a second at a time
             t = (FloorTracker if mode == "fused" else TrackletLinker)(cfg, store, shared.separate)

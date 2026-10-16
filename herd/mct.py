@@ -21,7 +21,9 @@ that one frame - the frame's guess of its burst fingerprint). GlobalTracker.upda
   3. a portal            [[mct.portals]] from -> to with min_s..max_s: a blind stretch between two
                          cameras (a passage); a cow lost by `from` that long ago, by frame id at
                          handover_min_sim + portal_extra_sim; `exit` / `entry` polygons optional
-  4. a new gid
+  4. a new gid; with late_sim > 0 (an identity model's calibration), once it has a few seconds of
+                         frame ids, a cow this camera lost just before it, near, whose own
+                         fingerprint (the mean of her frame ids) is clearly the nearest: taken back
 
 The same camera at the same second: two of its gids are two cows (cannot_link) once seen together
 for some seconds with boxes apart (CoSeen: one cow with two boxes is not two cows). Across cameras
@@ -103,13 +105,19 @@ class CoSeen:
 
 
 class GlobalTrack:
-    __slots__ = ("gid", "cams", "emb", "first", "last", "last_cam", "n", "xy", "xy_ts")
+    __slots__ = ("gid", "cams", "emb", "first", "last", "last_cam", "n", "xy", "xy_ts", "acc", "acc_n",
+                 "born", "late_done")
 
     def __init__(self, gid, ts):
         self.gid, self.cams, self.emb = gid, {}, None
         self.first = self.last = ts
         self.last_cam, self.n = None, 0
         self.xy, self.xy_ts = None, None
+        self.acc, self.acc_n = None, 0            # the sum of its frame ids: the track's own fingerprint
+        self.born, self.late_done = None, False    # (camera, first box) where it began; late check made
+
+    def mean(self):
+        return None if self.acc is None else self.acc / (np.linalg.norm(self.acc) + 1e-12)
 
 
 class GlobalTracker:
@@ -124,7 +132,8 @@ class GlobalTracker:
         self.disjoint = {frozenset(p) for p in m.get("disjoint", [])}
         self.portals = list(m.get("portals", []))
         self.keep_s = max([self.max_age, m["reacquire_s"], m["handover_s"], m.get("still_s", 0)] +
-                          [p["max_s"] for p in self.portals])
+                          [p["max_s"] for p in self.portals] +
+                          [m.get("late_window_s", 60.0) + m.get("late_s", 3.0) + 2] * (m.get("late_sim", 0) > 0))
         self.floor = {cid: floor_mapper(c, m) for cid, c in self.cams.items()}
         self.store, self.apart = store, apart
         self.tracks = {}
@@ -133,6 +142,14 @@ class GlobalTracker:
         self.lock = threading.Lock()
         self.n = 0
         self.stats = collections.Counter()
+        self.alias = {}                     # gid taken back late -> the gid it continues
+        self.late_links = []                # (late gid, earlier gid) not yet handed on (TrackletLinker)
+
+    def root(self, g):
+        """The gid a (late taken back) gid continues: what the reports see (store.track_links)."""
+        while g in self.alias:
+            g = self.alias[g]
+        return g
 
     # ---------------------------------------------------------------- one camera, one second
     def update(self, cam, ts, dets):
@@ -151,10 +168,13 @@ class GlobalTracker:
                 if out[j] is None:
                     self.n += 1
                     t = GlobalTrack(f"g-{int(ts)}-{self.n}", ts)
+                    t.born = (cam, list(d["box"]))
                     self.tracks[t.gid] = t
                     out[j] = t.gid
                     self.stats["new"] += 1
                 self._observe(self.tracks[out[j]], cam, ts, d)
+            if self.m.get("late_sim", 0) > 0:
+                self._late(cam, ts, out)
             self._prune(ts)
             links = self._disjoint_links(cam, ts, out, dets)
         if links and self.apart is not None:
@@ -291,7 +311,70 @@ class GlobalTracker:
             a = self.m["ema"]
             t.emb = e if t.emb is None else (1 - a) * t.emb + a * e
             t.emb = t.emb / (np.linalg.norm(t.emb) + 1e-12)
+            t.acc = e.copy() if t.acc is None else t.acc + e
+            t.acc_n += 1
         self.history[cam][t.gid].append((ts, list(d["box"])))
+
+    def _late(self, cam, ts, out):
+        """A cow taken back late, by the track's own fingerprint: a new track of this camera, once it has
+        late_n frame ids over late_s seconds, against the tracks this camera lost in the late_window_s
+        before it began (near where it began, late_dist): the mean of its frame ids against theirs - a
+        few seconds of a cow tell her apart far better than one frame (MmCows, the identity model: 57%
+        against 36% from another camera). Taken back when at least late_sim and late_margin above the
+        next: the new gid continues the old one (alias, store.track_links, late_links)."""
+        m = self.m
+        for t in [self.tracks[g] for g in set(out) if g in self.tracks]:
+            if t.late_done or t.born is None or t.born[0] != cam:
+                continue
+            if t.acc_n < m.get("late_n", 3) or ts - t.first < m.get("late_s", 3.0):
+                continue
+            t.late_done = True
+            mine = t.mean()
+            (bx, by) = _centre(t.born[1])
+            cands = []
+            for o in self.tracks.values():
+                seen = o.cams.get(cam)
+                if o is t or seen is None or o.acc_n < m.get("late_n", 3) or seen["last"] >= t.first:
+                    continue
+                if t.first - seen["last"] > m.get("late_window_s", 60.0):
+                    continue
+                (ox, oy) = _centre(seen["box"])
+                if ((ox - bx) ** 2 + (oy - by) ** 2) ** 0.5 > m.get("late_dist", 0.3):
+                    continue
+                cands.append((float(np.dot(mine, o.mean())), o))
+            if not cands:
+                continue
+            cands.sort(key=lambda x: -x[0])
+            best, o = cands[0]
+            if best < m["late_sim"] or (len(cands) > 1 and best - cands[1][0] < m.get("late_margin", 0.03)):
+                self.stats["late_refused"] += 1
+                continue
+            self._absorb(o, t, cam, ts, out, best)
+
+    def _absorb(self, o, t, cam, ts, out, sim):
+        """Track t (late) continues o: o takes over t's state, t's gid becomes an alias of o's."""
+        o.cams[cam] = t.cams[cam]
+        for c, v in t.cams.items():
+            if c not in o.cams or v["last"] > o.cams[c]["last"]:
+                o.cams[c] = v
+        o.last, o.last_cam, o.n = max(o.last, t.last), t.last_cam, o.n + t.n
+        if t.xy is not None:
+            o.xy, o.xy_ts = t.xy, t.xy_ts
+        o.emb = t.emb if t.emb is not None else o.emb
+        o.acc = t.acc if o.acc is None else o.acc + t.acc
+        o.acc_n += t.acc_n
+        h = self.history[cam]
+        if t.gid in h:
+            h[o.gid].extend(h.pop(t.gid))
+        del self.tracks[t.gid]
+        self.alias[t.gid] = o.gid
+        self.late_links.append((t.gid, o.gid))
+        for j, g in enumerate(out):
+            if g == t.gid:
+                out[j] = o.gid
+        self.stats["late_reacquired"] += 1
+        if self.store is not None:
+            self.store.link_tracks(ts, t.gid, o.gid)
 
     def _prune(self, ts):
         gone = [g for g, t in self.tracks.items() if ts - t.last > self.keep_s]
@@ -651,6 +734,10 @@ class TrackletLinker:
     def update_all(self, ts, per_cam):
         with self.lock:
             ids = {cam: self.cam_tracker.update(cam, ts, ds) for cam, ds in per_cam.items()}
+            for late, earlier in self.cam_tracker.late_links:    # a cow taken back late: before life grows
+                if late in self.life and earlier in self.life:
+                    self._union(late, earlier, ts)
+            self.cam_tracker.late_links.clear()
             for cam, gs in ids.items():
                 for g in gs:
                     c, first, _ = self.life.get(g, (cam, ts, ts))

@@ -71,6 +71,11 @@ DEFAULTS = {
     "mct": {"enabled": False, "neighbours": [], "disjoint": [], "portals": [],
             "w_iou": 0.65, "ema": 0.2,
             "reacquire_s": 10.0, "reacquire_sim": 0.7, "reacquire_dist": 0.15,
+            # late: a new track with late_n frame ids over late_s s against the tracks its camera lost in
+            # the late_window_s before, near (late_dist) - track fingerprint against track fingerprint
+            # (mean of frame ids); off at late_sim 0, set by an identity model's calibration (reid.py)
+            "late_sim": 0.0, "late_margin": 0.03, "late_n": 3, "late_s": 3.0, "late_window_s": 60.0,
+            "late_dist": 0.3,
             # a cow lying or standing still: her box back at the same place within still_s is her
             "still_s": 60.0, "still_iou": 0.5,
             "handover_s": 2.5, "handover_min_sim": 0.5, "handover_margin": 0.05, "portal_extra_sim": 0.08,

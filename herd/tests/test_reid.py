@@ -218,3 +218,59 @@ def test_label_command_human_and_tag_days():
             pipeline.Models = real
         again = [json.loads(x) for x in open(os.path.join(d, "raw", "mmcows", "index.jsonl"))]
         assert len(again) == len(rows) and json.load(open(os.path.join(root, "label.json")))["tag_check"] == check
+
+
+def test_moments_loss_and_the_models_own_thresholds():
+    """MmCows-like seconds (each cow seen by 3 cameras, each camera its own look of her): training with
+    the frame-against-frame loss, the moment metric on held-out cows, and thresholds calibrated on them
+    - stored with the model and applied where the config keeps the default."""
+    import copy as _copy
+    import torch
+    import model as mdl
+    import reid
+    from common import DEFAULTS
+    rng = np.random.default_rng(1)
+    dim, cows, cams = 24, [f"{i:02d}" for i in range(1, 15)], ["cam_1", "cam_2", "cam_3"]
+    vec = {c: rng.normal(size=dim) * 1.5 for c in cows}
+    look = {(c, cam): rng.normal(size=dim) * 0.8 for c in cows for cam in cams}
+    rows, feats = [], []
+    for day in ("0722", "0725"):
+        for s in range(30):
+            ts = 1690000011 + 60 * s
+            for c in cows:
+                held = int(c) > 10
+                if held and day != "0725":
+                    continue
+                for cam in cams:
+                    rows.append({"cow": c, "day": day, "cam": cam, "order": ts, "file": f"{c}/{day}_{cam}_{ts}.jpg",
+                                 "ready": True, "split": "val" if held else "train", "k": len(feats)})
+                    feats.append(vec[c] + look[(c, cam)] + rng.normal(size=dim) * 0.4)
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "raw", "mmcows"))
+        with open(os.path.join(d, "raw", "mmcows", "index.jsonl"), "w") as fh:
+            fh.writelines(json.dumps({k: v for k, v in r.items() if k != "k"}) + "\n" for r in rows)
+        meta = {"encoder": "x", "grid": 2, "crop": 224, "margin": 0.1, "dim": dim}
+        folder = os.path.join(d, "feat", "mmcows")
+        reid.write_bursts(folder, reid.make_bursts(rows, random.Random(0), set(), tracklets=False), "mmcows", meta)
+        np.savez(os.path.join(folder, "crops.npz"), feats=np.array(feats, np.float16))
+        mo = reid.Moments(d, "val")
+        assert len(mo) == 30 and set(mo.ids) == {"11", "12", "13", "14"}
+        torch.manual_seed(0)
+        m = mdl.HerdModel(dim, d=32, layers=1, heads=2)
+        mp = os.path.join(d, "model.pt")
+        m.save(mp, {"features": meta, "crop_s": 3.5, "dev_clips": []})
+        reid.main(["train", "--data", d, "--sources", "mmcows", "--model", mp, "--epochs", "4", "--P", "16",
+                   "--patience", "4", "--moments", "4"])
+        ev = json.load(open(os.path.join(d, "id_model", "eval.json")))
+        assert "moment_cross_cam_top1" in ev["after"] and ev["after"]["moment_queries"] > 0
+        assert ev["after"]["moment_cross_cam_top1"] >= ev["before"]["moment_cross_cam_top1"]
+        th = reid.identity_thresholds(os.path.join(d, "id_model", "identity.pt"))
+        for k in ("reacquire_sim", "handover_min_sim", "late_sim", "new_cow_similarity", "merge_similarity"):
+            assert -1 <= th[k] <= 1 and 0 <= th["recall"][k] <= 1, (k, th)
+        assert th["merge_similarity"] >= th["new_cow_similarity"]
+        cfg = _copy.deepcopy(DEFAULTS)
+        cfg["mct"]["handover_min_sim"] = 0.42                     # set in barn.toml: kept
+        changed = reid.apply_thresholds(cfg, th, DEFAULTS, say=None)
+        assert cfg["mct"]["reacquire_sim"] == th["reacquire_sim"] and cfg["mct"]["late_sim"] == th["late_sim"]
+        assert cfg["mct"]["handover_min_sim"] == 0.42 and cfg["identity"]["new_cow_similarity"] == th["new_cow_similarity"]
+        assert not any(c.startswith("mct.handover_min_sim") for c in changed)

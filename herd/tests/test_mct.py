@@ -1,6 +1,7 @@
 """Who-was-where-when in identification: cows seen at the same moment are different cows."""
 import _paths  # noqa: F401
 import copy
+import json
 import os
 import tempfile
 
@@ -511,3 +512,57 @@ def test_linker_refuses_a_chain_that_joins_cows_apart():
         out = lk.update_all(float(k), {"a": [{"box": box(0.2)}], "b": [{"box": box(bx)}], "c": [{"box": box(0.4)}]})
     assert out["a"][0] != out["c"][0]
     assert lk.stats["linked"] >= 1 and lk.stats["link_contradicted"] >= 1
+
+
+def test_late_reacquire_by_the_tracks_own_fingerprint():
+    """Two cows hidden 15 s (past reacquire_s), back near where they were: one frame is too noisy to
+    take them back, a few seconds of each are not - the new tracks continue the old ones; a third cow
+    that looks like neither stays new. The linker follows the same late links."""
+    import mct
+    rng = np.random.default_rng(11)
+    cows = {c: _unit(rng.normal(size=64)) for c in "ABC"}
+    frame = lambda c: _unit(cows[c] + 0.15 * rng.normal(size=64))          # one frame: cos ~0.6 to her
+    where = {"A": _box(0.3), "B": _box(0.7), "C": _box(0.5, 0.2)}
+    cfg = _mct_cfg([("cam1", {})], still_s=0.0, reacquire_sim=0.9, late_sim=0.5)
+    gt = mct.GlobalTracker(cfg)
+    old = None
+    for k in range(6):
+        old = gt.update("cam1", float(k), [{"box": where[c], "emb": frame(c)} for c in "AB"])
+    new = None
+    for k in range(21, 26):                                                 # back after 15 s, C new
+        new = gt.update("cam1", float(k), [{"box": where[c], "emb": frame(c)} for c in "ABC"])
+    assert new[0] == old[0] and new[1] == old[1] and new[2] not in old
+    assert gt.stats["late_reacquired"] == 2 and gt.stats["reacquired"] == 0
+    assert set(gt.alias.values()) == set(old)
+
+    # the linker: the same late links joined (one camera)
+    lk = mct.TrackletLinker(cfg)
+    rng = np.random.default_rng(11)
+    cows = {c: _unit(rng.normal(size=64)) for c in "ABC"}
+    first = None
+    for k in range(6):
+        out = lk.update_all(float(k), {"cam1": [{"box": where[c], "emb": frame(c)} for c in "AB"]})["cam1"]
+        first = first or out
+    for k in range(21, 26):
+        out = lk.update_all(float(k), {"cam1": [{"box": where[c], "emb": frame(c)} for c in "ABC"]})["cam1"]
+    assert out[:2] == first and lk.stats["linked"] == 2
+
+
+def test_mct_eval_uses_the_identity_models_thresholds():
+    import types
+    import mct_eval
+    args = types.SimpleNamespace(reacquire_sweep=[0.9], apart=500.0, dist_sweep=[], floor_area=[], fuse_sweep=[],
+                                 link_sweep=[], appearance=False, sweep=[], dino=False)
+    plain = {n: o for n, _, _, o in mct_eval.variants(args, True)}
+    assert plain["fid/link-final"] == {"reacquire_sim": 0.9} and "fid/still-nolate" not in plain
+    cal = {"reacquire_sim": 0.97, "late_sim": 0.98}
+    v = {n: o for n, _, _, o in mct_eval.variants(args, True, cal)}
+    # calibrated: no fixed 0.9 (cmd_score lays the thresholds under every fid tracker), and the late check
+    # can be compared with it off
+    assert v["fid/link-final"] == {} and v["fid/still-nolate"] == {"late_sim": 0.0}
+    assert v["fid/link-final-nolate"] == {"late_sim": 0.0} and v["fid/still~0.9"] == {"reacquire_sim": 0.9}
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "emb"))
+        np.savez(os.path.join(d, "emb", "cam_1.npz"), ts=np.zeros(0), stamp=json.dumps({"thresholds": cal}))
+        assert mct_eval.load_thresholds(d, ["cam_1"]) == cal
+        assert mct_eval.load_thresholds(d, ["cam_9"]) == {}

@@ -717,6 +717,196 @@ def embed(model, data, single=False, batch=128):
     return np.concatenate(fps), np.concatenate(qmax), np.concatenate(qmean)
 
 
+class Moments:
+    """MmCows' crops of one second: every cow every camera saw then, one frame each - the tracker's
+    question (this cow, from another camera, now). part "train": cows 1-10 (7/25 outside mct_eval's
+    hours, and the neck-tag days); "val": cows 11-16 (never trained on). Seconds where some cow is seen
+    by two cameras or more are kept: same cow other camera = positive, the cows beside her = negatives."""
+
+    def __init__(self, data, part):
+        self.groups, self.feats, self.ids = [], None, {}
+        rows = read_jsonl(os.path.join(data, "raw", "mmcows", "index.jsonl"))
+        cache = os.path.join(data, "feat", "mmcows", "crops.npz")
+        if not rows or not os.path.exists(cache):
+            return
+        feats = np.load(cache)["feats"]
+        if len(feats) != len(rows):
+            print(f"[moments] mmcows: {len(feats)} vectors for {len(rows)} crops - reid.py extract again", flush=True)
+            return
+        by = collections.defaultdict(list)
+        for k, r in enumerate(rows):
+            if r.get("split") == part:
+                by[(r["day"], int(r["order"]))].append((r["cow"], r["cam"], k))
+        for key in sorted(by):
+            items = by[key]
+            cams_of = collections.defaultdict(set)
+            for c, cam, _ in items:
+                cams_of[c].add(cam)
+            if any(len(v) >= 2 for v in cams_of.values()):
+                self.groups.append((key, items))
+        self.feats = feats
+        self.ids = {c: i for i, c in enumerate(sorted({c for _, it in self.groups for c, _, _ in it}))}
+        self.rows = rows if part == "val" else None
+
+    def __len__(self):
+        return len(self.groups)
+
+    def sample(self, rng, n):
+        """n seconds -> (frames (N, D), cow labels (N,))."""
+        picked = [self.groups[rng.randrange(len(self.groups))] for _ in range(n)]
+        items = [x for _, it in picked for x in it]
+        return (self.feats[[k for _, _, k in items]].astype(np.float32),
+                np.array([self.ids[c] for c, _, _ in items], np.int64))
+
+
+def embed_frames(model, feats, batch=512):
+    """(N, D) frame vectors -> (N, ID_DIM) fingerprints of one frame each (the tracker's frame id)."""
+    import torch
+    from common import device
+    dev = device()
+    out = []
+    model.eval()
+    with torch.no_grad():
+        for i in range(0, len(feats), batch):
+            x = torch.from_numpy(np.asarray(feats[i:i + batch], np.float32)).to(dev)[:, None]
+            o = model(x, x.new_zeros(len(x), 1), torch.ones(len(x), 1, dtype=torch.bool, device=dev))
+            out.append(o["fingerprint"].float().cpu().numpy())
+    return np.concatenate(out) if out else np.zeros((0, 0), np.float32)
+
+
+def moment_scores(model, mo):
+    """Frame against frame at the same second, another camera (mct_eval's look check, on cows 11-16):
+    is the nearest of that camera's cows hers? -> metrics, and the similarities the calibration uses."""
+    if mo is None or not len(mo):
+        return {}, None
+    ks = sorted({k for _, it in mo.groups for _, _, k in it})
+    pos = {k: i for i, k in enumerate(ks)}
+    E = embed_frames(model, mo.feats[ks])
+    hit = n = 0
+    chance = []
+    for _, items in mo.groups:
+        for c, cam, k in items:
+            for cam2 in {x[1] for x in items if x[1] != cam}:
+                cands = [(c2, k2) for c2, x2, k2 in items if x2 == cam2]
+                if c not in [c2 for c2, _ in cands]:
+                    continue
+                best = max(cands, key=lambda x: float(E[pos[x[1]]] @ E[pos[k]]))[0]
+                hit += best == c
+                n += 1
+                chance.append(1 / len(cands))
+    return ({"moment_cross_cam_top1": hit / n if n else 0.0, "moment_chance": float(np.mean(chance)) if chance else 0.0,
+             "moment_queries": n}, (E, pos))
+
+
+def _q(v, q):
+    return float(np.quantile(v, q)) if len(v) else None
+
+
+def calibrate(model, split, mo):
+    """The tracker's and the gallery's similarity thresholds for THIS model's space (another model's
+    0.9 is not this one's): from cows never trained on, the similarities of different cows that a
+    threshold must keep apart, and how many of the same cow's it still lets through.
+      reacquire_sim     one frame vs another of the same camera: above 98% of two cows side by side
+      handover_min_sim  one frame vs one of another camera at that second: above 95% of two cows
+      late_sim          a few frames' mean vs another few of the same camera: above 98% of two cows
+      new_cow_similarity, merge_similarity   burst vs burst (the gallery): above 98% / 99.5% of two
+                        cows of one set
+    -> {key: value, "recall": {key: share of the same cow's pairs at or above it}, "pairs": {...}}"""
+    out, recall, pairs = {}, {}, {}
+    if mo is not None and len(mo):
+        _, (E, pos) = moment_scores(model, mo)
+        cross_p, cross_n, cam_n = [], [], []
+        for _, items in mo.groups:
+            for i, (c, cam, k) in enumerate(items):
+                for c2, cam2, k2 in items[i + 1:]:
+                    v = float(E[pos[k]] @ E[pos[k2]])
+                    if cam2 != cam:
+                        (cross_p if c2 == c else cross_n).append(v)
+                    elif c2 != c:
+                        cam_n.append(v)
+        # one cow, one camera, later (the val frames are a minute apart): reacquire's positives; and
+        # tracks' means over 3 of them for the late check
+        seq = collections.defaultdict(list)
+        for (day, ts), items in mo.groups:
+            for c, cam, k in items:
+                seq[(day, c, cam)].append((ts, k))
+        cam_p, late_p, pieces = [], [], collections.defaultdict(list)
+        for (day, c, cam), v in seq.items():
+            v.sort()
+            cam_p += [float(E[pos[a]] @ E[pos[b]]) for (_, a), (_, b) in zip(v, v[1:])]
+            for i in range(0, len(v) - 2, 3):
+                m = E[[pos[k] for _, k in v[i:i + 3]]].mean(0)
+                pieces[(day, cam)].append((c, v[i][0], v[i + 2][0], m / (np.linalg.norm(m) + 1e-12)))
+        late_n = []
+        for ps in pieces.values():
+            for i, (c, a0, a1, ma) in enumerate(ps):
+                for c2, b0, b1, mb in ps[i + 1:]:
+                    v = float(ma @ mb)
+                    if c2 == c:
+                        late_p.append(v)
+                    elif a0 <= b1 and b0 <= a1:                 # two cows the camera saw at the same time
+                        late_n.append(v)
+        for key, neg, posv, q in (("reacquire_sim", cam_n, cam_p, 0.98), ("handover_min_sim", cross_n, cross_p, 0.95),
+                                  ("late_sim", late_n, late_p, 0.98)):
+            if len(neg) >= 20 and posv:
+                out[key] = round(_q(neg, q), 4)
+                recall[key] = float(np.mean(np.array(posv) >= out[key]))
+                pairs[key] = {"same_cow": len(posv), "two_cows": len(neg), "same_cow_median": _q(posv, 0.5),
+                              "two_cows_median": _q(neg, 0.5)}
+    fp, _, _ = embed(model, split)
+    ident = np.array([b["identity"] for b in split.bursts])
+    src = np.array([i.split(":")[0] for i in ident])
+    S = fp @ fp.T
+    iu = np.triu_indices(len(fp), 1)
+    same_src = src[iu[0]] == src[iu[1]]
+    same_cow = ident[iu[0]] == ident[iu[1]]
+    neg, posv = S[iu][same_src & ~same_cow], S[iu][same_cow]
+    if len(neg) >= 20 and len(posv):
+        for key, q in (("new_cow_similarity", 0.98), ("merge_similarity", 0.995)):
+            out[key] = round(_q(neg, q), 4)
+            recall[key] = float(np.mean(posv >= out[key]))
+        pairs["bursts"] = {"same_cow": int(len(posv)), "two_cows": int(len(neg)), "same_cow_median": _q(posv, 0.5),
+                           "two_cows_median": _q(neg, 0.5)}
+    return dict(out, recall=recall, pairs=pairs) if out else {}
+
+
+def identity_thresholds(path):
+    """The calibrated thresholds of an identity.pt (its thresholds.json, or inside it), {} if none."""
+    if not path:
+        return {}
+    js = os.path.join(os.path.dirname(os.path.abspath(path)), "thresholds.json")
+    if os.path.exists(js):
+        return json.load(open(js, encoding="utf-8"))
+    import torch
+    return torch.load(path, map_location="cpu", weights_only=False).get("thresholds", {}) if os.path.exists(path) else {}
+
+
+MCT_KEYS = ("reacquire_sim", "handover_min_sim", "late_sim")
+GALLERY_KEYS = ("new_cow_similarity", "merge_similarity")
+
+
+def apply_thresholds(cfg, th, defaults, say=print):
+    """An identity model's calibrated thresholds into cfg wherever cfg still has the default (a value set
+    in barn.toml wins) -> the keys changed."""
+    changed = []
+    for sec, keys in (("mct", MCT_KEYS), ("identity", GALLERY_KEYS)):
+        for k in keys:
+            if k in th and cfg[sec].get(k) == defaults[sec].get(k):
+                cfg[sec][k] = th[k]
+                changed.append(f"{sec}.{k} {th[k]:.3f}")
+    if changed and say:
+        say("[identity] thresholds of this model: " + ", ".join(changed))
+    return changed
+
+
+def one_day_sets(day, src):
+    """The sets seen on one day only (MmCows' 7/25): their NaN-model rows come from the other cameras."""
+    days = collections.defaultdict(set)
+    for d, s_ in zip(day.tolist(), src.tolist()):
+        days[s_].add(d)
+    return {s_ for s_, v in days.items() if len(v) == 1}
+
+
 def reid_scores(split, fp, qfp=None, qmax=None, qmean=None):
     """Each burst (or its single frame: qfp) against the bursts of OTHER days (and, on its day, of other
     cameras): is the nearest one the same cow? -> metrics, and the rows the NaN model is fitted on."""
@@ -742,8 +932,9 @@ def reid_scores(split, fp, qfp=None, qmax=None, qmean=None):
             m = askable & (src == s_)
             if m.any():
                 res[f"{scope}_top1_{s_}"] = float(hit[m].mean())
-        if scope == "other_day":
-            for q in np.where(askable)[0]:
+        one_day = one_day_sets(day, src)
+        for q in np.where(askable)[0]:
+            if scope == "other_day" or src[q] in one_day:
                 b = best[q]
                 other = s[q][ident != ident[b]]
                 second = float(other.max()) if other.size and other.max() > -2 else -1.0
@@ -753,15 +944,18 @@ def reid_scores(split, fp, qfp=None, qmax=None, qmean=None):
     return res, rows
 
 
-def evaluate(model, split):
+def evaluate(model, split, moments=None):
     fp, qmax, qmean = embed(model, split)
     m, rows = reid_scores(split, fp, qmax=qmax, qmean=qmean)
     one, _, _ = embed(model, split, single=True)
     m1, _ = reid_scores(split, fp, qfp=one)
     m.update({f"frame_{k}": v for k, v in m1.items()})
+    m.update(moment_scores(model, moments)[0])
     parts = [m.get("other_day_top1", 0.0), m.get("frame_other_day_top1", 0.0)]
     if "other_camera_top1_mmcows" in m:        # MmCows' held-out cows 11-16 from another camera: the barn's view
         parts += [m["other_camera_top1_mmcows"], m.get("frame_other_camera_top1_mmcows", 0.0)]
+    if "moment_cross_cam_top1" in m:           # and frame against frame at the same second: the tracker's question
+        parts.append(m["moment_cross_cam_top1"])
     m["score"] = float(np.mean(parts))
     return m, rows
 
@@ -771,9 +965,11 @@ def mm_line(m, before=None):
     if "other_camera_top1_mmcows" not in m:
         return ""
     was = lambda k: f" (was {before.get(k, 0):.1%})" if before else ""
+    mom = (f", frame vs frame at one second {m['moment_cross_cam_top1']:.1%}{was('moment_cross_cam_top1')} "
+           f"(chance {m.get('moment_chance', 0):.0%})" if "moment_cross_cam_top1" in m else "")
     return (f"; MmCows cows 11-16 another camera {m['other_camera_top1_mmcows']:.1%}"
             f"{was('other_camera_top1_mmcows')}, one frame {m.get('frame_other_camera_top1_mmcows', 0):.1%}"
-            f"{was('frame_other_camera_top1_mmcows')}")
+            f"{was('frame_other_camera_top1_mmcows')}{mom}")
 
 
 def fit_abstain(rows, max_error, out_path):
@@ -789,7 +985,7 @@ def fit_abstain(rows, max_error, out_path):
     out = {"features": list(abstain.FEATURES), **m, "max_error": max_error, "threshold": th[max_error],
            "scope": "all", "dev_queries": len(rows), "dev_top1": float(y.mean()),
            "same_cow_sim_p05": float(np.percentile(same, 5)) if len(same) else None,
-           "fitted_on": "reid.py val cows, other days",
+           "fitted_on": "reid.py val cows, other days (one-day sets: other cameras)",
            "dev": abstain.coverage_table(p, y, [(f"{e:.0%}", th[e]) for e in budgets])}
     write_json(out_path, out)
     return out
@@ -808,13 +1004,22 @@ def cmd_train(args):
         sys.exit(f"features of {tr.dim} dims, the model takes {base.in_dim}: extract with this model")
     print(f"[train] {len(tr.bursts)} bursts of {len(set(tr.identity.tolist()))} cows; val {len(va.bursts)} bursts "
           f"of {len({b['identity'] for b in va.bursts})} unseen cows", flush=True)
+    # MmCows' seconds: one frame of a cow from two cameras at once, the cows beside her the negatives
+    mo_tr = Moments(args.data, "train") if "mmcows" in args.sources and args.frame_w > 0 else None
+    mo_va = Moments(args.data, "val") if "mmcows" in args.sources else None
+    if mo_tr is not None and len(mo_tr):
+        print(f"[train] + frame against frame at the same second: {len(mo_tr)} MmCows seconds of {len(mo_tr.ids)} "
+              f"cows (weight {args.frame_w}, {args.moments} seconds a step); val {len(mo_va) if mo_va else 0} "
+              f"seconds of cows 11-16", flush=True)
+    else:
+        mo_tr = None
     dev = device()
     model = copy.deepcopy(base.temporal).to(dev)
     if args.init:                              # fine-tune an identity model already trained (reid.py train)
         ck0 = torch.load(args.init, map_location="cpu", weights_only=False)
         model.load_state_dict(ck0["state"])
         print(f"[train] from {args.init} (trained on {', '.join(ck0.get('sources', []))})", flush=True)
-    m0, _ = evaluate(model, va)
+    m0, _ = evaluate(model, va, mo_va)
     print(f"[train] before: same cow another day {m0.get('other_day_top1', 0):.1%}, another camera "
           f"{m0.get('other_camera_top1', 0):.1%}, one frame vs another day {m0.get('frame_other_day_top1', 0):.1%}"
           f"{mm_line(m0)}", flush=True)
@@ -836,13 +1041,19 @@ def cmd_train(args):
             x, t, v = views(tr, ids, rng, args.crop_s, args.single_p, dev)
             o = model(x, t, v)
             loss = supcon(o["fingerprint"], torch.as_tensor(tr.identity[ids], device=dev), args.temperature)
+            if mo_tr is not None:
+                fx, fy = mo_tr.sample(rng, args.moments)
+                fx = torch.from_numpy(fx).to(dev)[:, None]
+                o2 = model(fx, fx.new_zeros(len(fx), 1), torch.ones(len(fx), 1, dtype=torch.bool, device=dev))
+                loss = loss + args.frame_w * supcon(o2["fingerprint"], torch.as_tensor(fy, device=dev),
+                                                    args.temperature)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             sched.step()
             losses.append(float(loss.detach()))
-        m, _ = evaluate(model, va)
+        m, _ = evaluate(model, va, mo_va)
         hist.write(json.dumps({"epoch": epoch + 1, "loss": float(np.mean(losses)), **m}) + "\n")
         hist.flush()
         print(f"[train] epoch {epoch + 1}/{args.epochs}  loss {np.mean(losses):.3f}  val: another day "
@@ -856,13 +1067,15 @@ def cmd_train(args):
             break
     hist.close()
     model.load_state_dict(best_state)
-    _, rows = evaluate(model, va)
+    _, rows = evaluate(model, va, mo_va)
     ab = fit_abstain(rows, args.max_error, os.path.join(args.out, "abstain.json"))
+    th = calibrate(model, va, mo_va)
+    write_json(os.path.join(args.out, "thresholds.json"), th)
     torch.save({"in_dim": base.in_dim, "kw": {k: v for k, v in base.kw.items() if k != "frame_id"},
                 "state": {k: v.cpu() for k, v in model.state_dict().items()}, "features": ck.get("features", {}),
                 "base": os.path.abspath(args.model), "init": os.path.abspath(args.init) if args.init else "",
                 "sources": sorted(set(args.sources) | set(ck0.get("sources", []) if args.init else [])),
-                "eval": best_m, "before": m0},
+                "eval": best_m, "before": m0, "thresholds": th},
                os.path.join(args.out, "identity.pt"))
     write_json(os.path.join(args.out, "eval.json"), {"before": m0, "after": best_m,
                                                      "abstain": {k: ab[k] for k in ("threshold", "dev_top1", "dev")}})
@@ -874,7 +1087,11 @@ def cmd_train(args):
         e = r["error_when_answered"]
         print(f"  NaN model: budget {r['budget']:>4}  answers {r['answered']:.1%}  wrong when answering "
               f"{'-' if e is None else f'{e:.1%}'}")
-    print(f"-> {os.path.join(args.out, 'identity.pt')} (+ abstain.json): [model] identity in barn.toml")
+    for k in MCT_KEYS + GALLERY_KEYS:
+        if k in th:
+            print(f"  threshold {k:18s} {th[k]:.3f}  (two cows above it: {'2%' if k != 'handover_min_sim' else '5%'}"
+                  f"{' / 0.5%' if k == 'merge_similarity' else ''}; the same cow at or above: {th['recall'][k]:.1%})")
+    print(f"-> {os.path.join(args.out, 'identity.pt')} (+ abstain.json, thresholds.json): [model] identity in barn.toml")
 
 
 def load_identity(path, features_meta, dev):
@@ -931,6 +1148,9 @@ def main(argv=None):
     t.add_argument("--temperature", type=float, default=0.1)
     t.add_argument("--crop-s", type=float, default=2.0, help="the shortest view (s); up to 5.6 s")
     t.add_argument("--single-p", type=float, default=0.25, help="share of views cut to one frame")
+    t.add_argument("--frame-w", type=float, default=1.0, help="weight of the frame-against-frame loss on MmCows' "
+                   "seconds (a cow from two cameras at once; 0: off)")
+    t.add_argument("--moments", type=int, default=8, help="MmCows seconds a step for that loss")
     t.add_argument("--patience", type=int, default=6)
     t.add_argument("--max-error", type=float, default=0.01, help="the NaN model's error budget")
     args = p.parse_args(argv)
