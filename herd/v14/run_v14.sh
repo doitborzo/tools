@@ -8,12 +8,13 @@
 # Steps (each resumes):
 #   1 Python environment                     5 ID transformer: train + test day (MultiCamCows)
 #   2 version 10's detector + DINOv2          6 association transformer: train + test window (MmCows)
-#   3 MultiCamCows2024 crops -> DINOv2        7 onboarding test on MmCows: association vs camera-alone
-#   4 MmCows labels, frames, 1-s stream       8 RESULTS.md, RUN14A_RESULTS.tar, V14A_MODELS.tgz
+#   3 MmCows labels, frames, 1-s stream       7 onboarding test on MmCows: association vs camera-alone
+#   4 MultiCamCows2024 crops -> DINOv2        8 RESULTS.md, RUN14A_RESULTS.tar, V14A_MODELS.tgz
 #
 # Knobs: WORK=/workspace  MODELS_URL (version 10's archive)  DET_NAME (its detector folder)
 #        LIVE_STEP=2 (s between 1-second frames used)  TRAIN_EVERY=60  WINDOW_EVERY=15
 #        SETUP_MIN=60  START=12  END=15  ID_EPOCHS=60  ASSOC_EPOCHS=60
+#        MCC_WAIT_H=12 (hours to wait for data.bris.ac.uk)  MCC_ZIP (a local copy of the MultiCamCows zip)
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,6 +35,8 @@ START="${START:-12}"
 END="${END:-15}"
 ID_EPOCHS="${ID_EPOCHS:-60}"
 ASSOC_EPOCHS="${ASSOC_EPOCHS:-60}"
+MCC_WAIT_H="${MCC_WAIT_H:-12}"
+MCC_ZIP="${MCC_ZIP:-}"
 export HF_HOME="$WORK/hf-cache"
 
 case "${1:-}" in
@@ -48,7 +51,7 @@ if [ -z "${V14_IN_TMUX:-}" ]; then
     if tmux has-session -t "=$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     mkdir -p "$V"
     knobs=""
-    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS; do
+    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP; do
         knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env V14_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/run_v14.sh"); echo; echo '[run_v14.sh finished]'; exec bash"
@@ -90,16 +93,27 @@ fi
 [ -f "$DET/det_train_meta.json" ] || { echo "!! no $DET - set DET_NAME to a detector folder in the archive"; ls "$WORK/herd"; exit 1; }
 echo "detector: $DET"
 
-step "3/8  MultiCamCows2024: crops -> DINOv2 (the videos are not downloaded)"
-"$PY" data_mcc.py inspect | tee "$V/mcc_inspect.txt"
-"$PY" data_mcc.py fetch --out "$V/mcc"
-
-step "4/8  MmCows: labels, labelled frames (training side + test window), the 1-second stream"
+step "3/8  MmCows: labels, labelled frames (training side + test window), the 1-second stream"
 "$PY" data_mmcows.py labels --out "$V/mmcows"
 "$PY" data_mmcows.py frames --out "$V/mmcows" --train-every "$TRAIN_EVERY" --window-every "$WINDOW_EVERY" --start "$START" --end "$END"
 "$PY" data_mmcows.py inspect --out "$V/mmcows" | tee "$V/mmcows_live_inspect.txt"
 "$PY" data_mmcows.py live --out "$V/mmcows" --live-step "$LIVE_STEP" --start "$START" --end "$END"
 "$PY" data_mmcows.py feats --out "$V/mmcows"
+
+step "4/8  MultiCamCows2024: crops -> DINOv2 (the videos are not downloaded)"
+# data.bris.ac.uk's file server is sometimes down for hours: wait for it (MCC_WAIT_H), or MCC_ZIP=<the zip, downloaded by hand>
+SRC=(); [ -n "$MCC_ZIP" ] && SRC=(--zip "$MCC_ZIP")
+for i in $(seq 0 $((MCC_WAIT_H * 6))); do
+    if "$PY" data_mcc.py inspect "${SRC[@]}" > "$V/mcc_inspect.txt" 2>&1; then cat "$V/mcc_inspect.txt"; break; fi
+    tail -n 1 "$V/mcc_inspect.txt"
+    [ "$i" -ge $((MCC_WAIT_H * 6)) ] && { echo "!! data.bris.ac.uk did not answer for $MCC_WAIT_H h"; exit 1; }
+    echo "   data.bris.ac.uk not answering - try again in 10 min ($(date '+%T'))"; sleep 600
+done
+for j in 1 2 3 4 5 6; do
+    "$PY" data_mcc.py fetch --out "$V/mcc" "${SRC[@]}" && break
+    [ "$j" = 6 ] && { echo "!! the MultiCamCows fetch failed 6 times"; exit 1; }
+    echo "   fetch stopped - resume in 10 min"; sleep 600
+done
 
 step "5/8  ID transformer (from scratch): MultiCamCows days 1-5 -> day 6 picks -> day 7 tests"
 if [ -f "$V/idnet/idnet.pt" ] && [ -f "$V/idnet/eval_mcc.json" ]; then echo "trained already"; else
