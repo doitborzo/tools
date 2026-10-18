@@ -542,6 +542,12 @@ two-cow pairs: one cow's bursts grouped only a fifth of the time, most left in t
 late check (its same-cow pairs were any two pieces of the day, not a cow lost and back): now
 `new_cow_similarity` is the best split of same and two cows (at least above 90% of two cows) and the
 late check's positives are a cow's consecutive pieces.
+
+**The check alone, on a new pod** (`bash herd/eval_pod.sh`): with `herd_models_*.tgz` and
+`herd_reid_*.tgz` in `/workspace` it unpacks the identity model (`reid/id_model_all/`), recalibrates its
+thresholds on MmCows 7/25 alone (outside mct_eval's hours, ~4 GB read; the old file kept as
+`thresholds.old.json`; `CALIBRATE=0` skips it) and runs `mct_pod.sh` with it — nothing trained, none
+of the training sets fetched. Results: `export/herd_eval_<date>.tgz`.
 ---
 
 ## 5. Training on the pod (CBVD-5)
