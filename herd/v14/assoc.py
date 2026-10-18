@@ -155,6 +155,9 @@ class Data:
         for fi, f in enumerate(self.frames):
             self.at[(f["split"], round(f["ts"] / STEP_S))][f["cam"]] = fi
         self.keys = {s: sorted(k for (sp, k) in self.at if sp == s) for s in ("train", "window")}
+        # keys are 15-s steps; training frames may be sparser (one a minute = 4 keys): history and
+        # memory look back by the split's own spacing, or they would find nothing
+        self.stride = {s: max(1, int(np.median(np.diff(k)))) if len(k) > 1 else 1 for s, k in self.keys.items()}
         self.cams = sorted({f["cam"] for f in self.frames})
         self.full = {fi: scene.sub_grid(self.scene[fi]) for fi in range(len(self.frames))}
         self.covis = self._covisibility()
@@ -201,8 +204,9 @@ class Data:
                              "conf": rng.uniform(0.4, 1.0) if train else 1.0, "slot": slots[cam], "kind": CUR,
                              "label": cow, "elsewhere": float(len(now[cow] - {cam}) > 0)})
         link = {}
+        st = self.stride[split]
         for h in range(1, history + 1):
-            past = self.at.get((split, key - h), {})
+            past = self.at.get((split, key - h * st), {})
             for cam in names:
                 if cam not in past:
                     continue
@@ -211,9 +215,9 @@ class Data:
                         link[cow] = 1 + len(link) % 60
                     lk = link[cow] if not (train and rng.random() < 0.05) else 1 + rng.randrange(60)
                     dets.append({"feat": self.box_feats[j], "box": jitter(b, rng) if train else b, "conf": 1.0,
-                                 "dt": -h * STEP_S, "slot": slots[cam], "kind": HIST, "link": lk, "label": cow})
+                                 "dt": -h * st * STEP_S, "slot": slots[cam], "kind": HIST, "link": lk, "label": cow})
         pairs = 0
-        for h in range(4, 21, 2):                             # 1-5 minutes ago
+        for h in range(max(4, st), 21, max(2, st)):           # 1-5 minutes ago
             past = self.at.get((split, key - h), {})
             seen = collections.defaultdict(list)
             for cam in names:
@@ -283,15 +287,16 @@ class Data:
             dets.append({"feat": self.box_feats[j], "box": jitter(nb, rng), "conf": rng.uniform(0.4, 1.0),
                          "slot": slots[v], "kind": CUR, "label": cow, "elsewhere": float(len(where[cow] - {v}) > 0)})
         link = {}
+        st = self.stride[split]
         for h in range(1, history + 1):
-            past = self.at.get((split, key - h), {})
+            past = self.at.get((split, key - h * st), {})
             if cam in past:
                 for v, cow, nb, j in views(past[cam]):
                     link.setdefault(cow, 1 + len(link) % 60)
-                    dets.append({"feat": self.box_feats[j], "box": jitter(nb, rng), "conf": 1.0, "dt": -h * STEP_S,
-                                 "slot": slots[v], "kind": HIST, "link": link[cow], "label": cow})
+                    dets.append({"feat": self.box_feats[j], "box": jitter(nb, rng), "conf": 1.0,
+                                 "dt": -h * st * STEP_S, "slot": slots[v], "kind": HIST, "link": link[cow], "label": cow})
         pairs = 0
-        for h in range(4, 21, 2):
+        for h in range(max(4, st), 21, max(2, st)):
             past = self.at.get((split, key - h), {})
             if cam not in past:
                 continue
@@ -469,7 +474,8 @@ def cmd_train(args):
                "minutes": round((time.time() - t0) / 60, 1)}
         hist.append(rec)
         print(f"[assoc] epoch {ep + 1}: id {rec['loss_id']:.3f}  val cross-camera F1 "
-              f"{v['cross_camera']['f1'] or 0:.3f}  track top-1 {v['track_top1'] or 0:.1%}", flush=True)
+              f"{v['cross_camera']['f1'] or 0:.3f}  track top-1 "
+              f"{'-' if v['track_top1'] is None else format(v['track_top1'], '.1%')} ({v['track_cases']} cases)", flush=True)
         if score > best:
             best, since = score, 0
             torch.save({"kw": model.kw, "state": model.state_dict(), "epoch": ep + 1,

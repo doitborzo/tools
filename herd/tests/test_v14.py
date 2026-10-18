@@ -91,7 +91,7 @@ def test_idnet_trains_and_scores_a_new_day():
         assert "nan" in ck and "enrol_threshold" in ck
 
 
-def fake_mmcows(folder, cows=6, dim=48, sdim=16, keys=40, seed=0):
+def fake_mmcows(folder, cows=6, dim=48, sdim=16, keys=40, seed=0, train_every=1):
     """Two cameras over overlapping halves of one pen, a labelled frame every 15 s."""
     rng = np.random.default_rng(seed)
     proto = rng.normal(size=(cows, dim))
@@ -100,6 +100,8 @@ def fake_mmcows(folder, cows=6, dim=48, sdim=16, keys=40, seed=0):
     for k in range(keys):
         pos = np.clip(pos + rng.normal(scale=0.02, size=pos.shape), 0.05, 0.95)
         split = "window" if k >= keys - 10 else "train"
+        if split == "train" and k % train_every:
+            continue                                          # training frames sparser, like MmCows' one a minute
         for cam, (x0, x1) in (("cam_1", (0.0, 0.6)), ("cam_2", (0.4, 1.0))):
             boxes = []
             for c in range(cows):
@@ -138,6 +140,24 @@ def test_assoc_trains_on_real_and_virtual_cameras():
         ev = json.load(open(os.path.join(d, "assoc", "eval_assoc.json")))
         assert ev["test_window"]["cross_camera"]["pairs"] > 0
         assert ev["baseline_plain_dinov2"]["track_top1"] is not None
+
+
+def test_history_found_with_sparse_training_frames():
+    import assoc
+    import random
+    with tempfile.TemporaryDirectory() as d:
+        fake_mmcows(os.path.join(d, "mm"), keys=80, train_every=4)
+        data = assoc.Data(os.path.join(d, "mm"))
+        assert data.stride == {"train": 4, "window": 1}
+        for make in (data.real, data.virtual):
+            e = make("train", data.keys["train"][10], random.Random(0))
+            hist = e["dt"][e["kind"] == assoc.HIST]
+            assert len(hist) and set(np.round(hist).tolist()) <= {-60.0, -120.0}
+            assert (e["kind"] == assoc.MEM).any()
+        e = data.real("window", data.keys["window"][5], random.Random(0), train=False)
+        assert set(np.round(e["dt"][e["kind"] == assoc.HIST]).tolist()) == {-15.0, -30.0}
+        assert assoc.evaluate(assoc.build(48, 16, d=32, layers=1, heads=2).eval(), data, "train",
+                              data.keys["train"][5:12], "cpu")["track_cases"] > 0
 
 
 def test_onboarding_steps():
