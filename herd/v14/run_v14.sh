@@ -14,7 +14,7 @@
 # Knobs: WORK=/workspace  MODELS_URL (version 10's archive)  DET_NAME (its detector folder)
 #        LIVE_STEP=2 (s between 1-second frames used)  TRAIN_EVERY=60  WINDOW_EVERY=15
 #        SETUP_MIN=60  START=12  END=15  ID_EPOCHS=60  ASSOC_EPOCHS=60
-#        MCC_WAIT_H=12 (hours to wait for data.bris.ac.uk)  MCC_ZIP (a local copy of the MultiCamCows zip)
+#        MCC_WAIT_H=12 (hours to wait for data.bris.ac.uk)  MCC_ZIP (where the MultiCamCows zip is / goes)
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,6 +37,7 @@ ID_EPOCHS="${ID_EPOCHS:-60}"
 ASSOC_EPOCHS="${ASSOC_EPOCHS:-60}"
 MCC_WAIT_H="${MCC_WAIT_H:-12}"
 MCC_ZIP="${MCC_ZIP:-}"
+MCC_URL="${MCC_URL:-https://data.bris.ac.uk/datasets/tar/2inu67jru7a6821kkgehxg3cv2.zip}"
 export HF_HOME="$WORK/hf-cache"
 
 case "${1:-}" in
@@ -100,15 +101,19 @@ step "3/8  MmCows: labels, labelled frames (training side + test window), the 1-
 "$PY" data_mmcows.py live --out "$V/mmcows" --live-step "$LIVE_STEP" --start "$START" --end "$END"
 "$PY" data_mmcows.py feats --out "$V/mmcows"
 
-step "4/8  MultiCamCows2024: crops -> DINOv2 (the videos are not downloaded)"
-# data.bris.ac.uk's file server is sometimes down for hours: wait for it (MCC_WAIT_H), or MCC_ZIP=<the zip, downloaded by hand>
-SRC=(); [ -n "$MCC_ZIP" ] && SRC=(--zip "$MCC_ZIP")
-for i in $(seq 0 $((MCC_WAIT_H * 6))); do
-    if "$PY" data_mcc.py inspect "${SRC[@]}" > "$V/mcc_inspect.txt" 2>&1; then cat "$V/mcc_inspect.txt"; break; fi
-    tail -n 1 "$V/mcc_inspect.txt"
-    [ "$i" -ge $((MCC_WAIT_H * 6)) ] && { echo "!! data.bris.ac.uk did not answer for $MCC_WAIT_H h"; exit 1; }
-    echo "   data.bris.ac.uk not answering - try again in 10 min ($(date '+%T'))"; sleep 600
-done
+step "4/8  MultiCamCows2024: the whole zip, then crops -> DINOv2"
+# The whole zip as one file (36.5 GB, resumes where a cut transfer stopped), then read from disk.
+# data.bris.ac.uk's file server is sometimes down for hours: keep trying for MCC_WAIT_H hours.
+Z="${MCC_ZIP:-$V/MultiCamCows2024.zip}"
+if [ ! -f "$Z" ]; then
+    for i in $(seq 0 $((MCC_WAIT_H * 6))); do
+        if curl -L -# --fail --retry 3 -C - -o "$Z.part" "$MCC_URL"; then mv "$Z.part" "$Z"; break; fi
+        [ "$i" -ge $((MCC_WAIT_H * 6)) ] && { echo "!! data.bris.ac.uk did not send the zip for $MCC_WAIT_H h"; exit 1; }
+        echo "   data.bris.ac.uk not answering - try again in 10 min ($(date '+%T'), $(du -h "$Z.part" 2>/dev/null | cut -f1) so far)"; sleep 600
+    done
+fi
+SRC=(--zip "$Z")
+"$PY" data_mcc.py inspect "${SRC[@]}" | tee "$V/mcc_inspect.txt"
 for j in 1 2 3 4 5 6; do
     "$PY" data_mcc.py fetch --out "$V/mcc" "${SRC[@]}" && break
     [ "$j" = 6 ] && { echo "!! the MultiCamCows fetch failed 6 times"; exit 1; }
