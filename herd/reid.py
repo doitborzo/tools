@@ -896,7 +896,9 @@ def identity_thresholds(path):
     return torch.load(path, map_location="cpu", weights_only=False).get("thresholds", {}) if os.path.exists(path) else {}
 
 
-MCT_KEYS = ("reacquire_sim", "handover_min_sim", "late_sim")
+# applied to [mct]; late_sim is calibrated too but the late reacquire stays off unless barn.toml sets it
+# (MmCows, twice: the same IDF1 with it, purity a point lower)
+MCT_KEYS = ("reacquire_sim", "handover_min_sim")
 GALLERY_KEYS = ("new_cow_similarity", "merge_similarity")
 
 
@@ -1102,7 +1104,7 @@ def cmd_train(args):
         e = r["error_when_answered"]
         print(f"  NaN model: budget {r['budget']:>4}  answers {r['answered']:.1%}  wrong when answering "
               f"{'-' if e is None else f'{e:.1%}'}")
-    for k in MCT_KEYS + GALLERY_KEYS:
+    for k in MCT_KEYS + ("late_sim",) + GALLERY_KEYS:
         if k in th:
             two = {"handover_min_sim": "5%", "new_cow_similarity": f"{th['pairs'].get('two_cows_above', {}).get(k, 0):.1%}",
                    "merge_similarity": "0.5%"}.get(k, "2%")
@@ -1129,7 +1131,7 @@ def cmd_calibrate(args):
     write_json(os.path.join(out, "thresholds.json"), th)
     ck["thresholds"] = th
     torch.save(ck, args.identity)
-    for k in MCT_KEYS + GALLERY_KEYS:
+    for k in MCT_KEYS + ("late_sim",) + GALLERY_KEYS:
         if k in th:
             print(f"  threshold {k:18s} {th[k]:.3f}  (the same cow at or above: {th['recall'][k]:.1%})")
     print(f"-> {os.path.join(out, 'thresholds.json')}")

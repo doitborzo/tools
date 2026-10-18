@@ -603,7 +603,8 @@ def load_thresholds(data, cams):
 
 def variants(args, has_mats, cal=None):
     """(name, vector, kind, [mct] overrides) of every tracker scored; with an identity model's calibrated
-    thresholds (cal), every fid tracker starts from them (late reacquire on), the sweeps still set theirs."""
+    thresholds (cal), every fid tracker starts from them, the sweeps still set theirs; +late: the late
+    reacquire at its calibrated late_sim."""
     v = [("iou", "fid", "iou", {}),
          ("fid/cam", "fid", "cam", {"still_s": 0}),           # stage B as it was
          ("fid/still", "fid", "cam", {})]                      # + a cow lying still held by her place
@@ -622,10 +623,10 @@ def variants(args, has_mats, cal=None):
         v += [(f"fid/link-final@{d:g}", "fid", "link-final", dict(r9, link_dist=d)) for d in args.link_sweep]
         v += [("fid/link-final-nomargin", "fid", "link-final", dict(r9, link_margin=0.0)),
               ("fid/link-final+contra", "fid", "link-final", dict(r9, link_contra=0.3))]
-        if cal and cal.get("late_sim"):
-            v += [("fid/link-final-nolate", "fid", "link-final", {"late_sim": 0.0})]
+        if cal and cal.get("late_sim"):                          # the late reacquire (off by default) tried
+            v += [("fid/link-final+late", "fid", "link-final", {"late_sim": cal["late_sim"]})]
     if cal and cal.get("late_sim"):
-        v += [("fid/still-nolate", "fid", "cam", {"late_sim": 0.0})]
+        v += [("fid/still+late", "fid", "cam", {"late_sim": cal["late_sim"]})]
     if args.appearance:
         v += [("fid/mct", "fid", "mct", {})]
         v += [(f"fid/mct@{x:g}", "fid", "mct", {"handover_min_sim": x, "reacquire_sim": max(x, 0.7)})
@@ -753,7 +754,12 @@ def cmd_show(args):
     import cv2
     from show_ids import Writer, colour, draw_box, header
     meta, cams, gt, emb, _, mats = load_all(args)
-    known = {n: (vec, kind, over) for n, vec, kind, over in variants(args, bool(mats))}
+    # the same trackers as score: with the identity model's thresholds laid under every fid one
+    cal = load_thresholds(args.data, cams)
+    from reid import MCT_KEYS
+    cal_mct = {k: cal[k] for k in MCT_KEYS if k in cal}
+    known = {n: (vec, kind, dict(cal_mct, **over) if vec == "fid" else over)
+             for n, vec, kind, over in variants(args, bool(mats), cal)}
     if args.variant not in known:
         sys.exit(f"--variant: one of {', '.join(known)}")
     vec, kind, over = known[args.variant]

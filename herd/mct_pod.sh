@@ -111,7 +111,8 @@ app=(); [ "${APPEARANCE:-0}" = "1" ] && app=(--appearance)
 
 step "Show: who is who, drawn"
 V="${SHOW_VARIANT:-$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1]))['data']['best'])" "$M/mct_eval.json")}"
-"$PY" "$HERE/mct_eval.py" show --data "$M" --variant "$V" --minutes "${SHOW_MIN:-10}" "${app[@]}"
+"$PY" "$HERE/mct_eval.py" show --data "$M" --variant "$V" --minutes "${SHOW_MIN:-10}" "${app[@]}" \
+    || echo "!! show failed (above); the scores are in $M/mct_eval.json"
 
 mkdir -p "$WORK/export"
 T="$WORK/export/herd_mct_$(date +%Y%m%d_%H%M).tgz"

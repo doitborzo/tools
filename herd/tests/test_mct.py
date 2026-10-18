@@ -395,6 +395,13 @@ def test_geo_hands_cows_over_by_place_alone():
         mct_eval.main(["show", "--data", d, "--minutes", "0.5", "--still-every", "10"])
         out = os.path.join(d, "show", "fid_geo")
         assert os.path.getsize(os.path.join(out, "ids.mp4")) > 1000 and len(os.listdir(os.path.join(out, "stills"))) == 3
+        # embeddings of an identity model with its thresholds: show knows the variants score made with them
+        for cam in P:
+            z = dict(np.load(os.path.join(d, "emb", f"{cam}.npz")))
+            z["stamp"] = js.dumps({"thresholds": {"reacquire_sim": 0.9, "late_sim": 0.95}})
+            np.savez(os.path.join(d, "emb", f"{cam}.npz"), **z)
+        mct_eval.main(["show", "--data", d, "--minutes", "0.2", "--still-every", "10", "--variant", "fid/link-final+late"])
+        assert os.path.exists(os.path.join(d, "show", "fid_link-final+late", "ids.mp4"))
 
 
 def test_still_cow_kept_and_cannot_link_needs_evidence():
@@ -554,13 +561,13 @@ def test_mct_eval_uses_the_identity_models_thresholds():
     args = types.SimpleNamespace(reacquire_sweep=[0.9], apart=500.0, dist_sweep=[], floor_area=[], fuse_sweep=[],
                                  link_sweep=[], appearance=False, sweep=[], dino=False)
     plain = {n: o for n, _, _, o in mct_eval.variants(args, True)}
-    assert plain["fid/link-final"] == {"reacquire_sim": 0.9} and "fid/still-nolate" not in plain
+    assert plain["fid/link-final"] == {"reacquire_sim": 0.9} and "fid/still+late" not in plain
     cal = {"reacquire_sim": 0.97, "late_sim": 0.98}
     v = {n: o for n, _, _, o in mct_eval.variants(args, True, cal)}
-    # calibrated: no fixed 0.9 (cmd_score lays the thresholds under every fid tracker), and the late check
-    # can be compared with it off
-    assert v["fid/link-final"] == {} and v["fid/still-nolate"] == {"late_sim": 0.0}
-    assert v["fid/link-final-nolate"] == {"late_sim": 0.0} and v["fid/still~0.9"] == {"reacquire_sim": 0.9}
+    # calibrated: no fixed 0.9 (cmd_score lays the thresholds under every fid tracker); the late reacquire,
+    # off by default, tried at its calibrated threshold
+    assert v["fid/link-final"] == {} and v["fid/still+late"] == {"late_sim": 0.98}
+    assert v["fid/link-final+late"] == {"late_sim": 0.98} and v["fid/still~0.9"] == {"reacquire_sim": 0.9}
     with tempfile.TemporaryDirectory() as d:
         os.makedirs(os.path.join(d, "emb"))
         np.savez(os.path.join(d, "emb", "cam_1.npz"), ts=np.zeros(0), stamp=json.dumps({"thresholds": cal}))

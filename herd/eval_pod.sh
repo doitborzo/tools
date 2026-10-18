@@ -138,7 +138,8 @@ fi
 
 step "The MmCows check with the identity model (mct_pod.sh)"
 HERD_MCT_IN_TMUX=1 WORK="$WORK" RUN="$RUN" DET="$DET" MINUTES="${MINUTES:-60}" SHOW_MIN="${SHOW_MIN:-10}" \
-    SHOW_VARIANT="${SHOW_VARIANT:-}" IDENTITY="$IDENTITY" bash "$HERE/mct_pod.sh"
+    SHOW_VARIANT="${SHOW_VARIANT:-}" IDENTITY="$IDENTITY" bash "$HERE/mct_pod.sh" \
+    || echo "!! the MmCows check stopped (above); what it made is packed below"
 
 mkdir -p "$WORK/export"
 T="$WORK/export/herd_eval_$(date +%Y%m%d_%H%M).tgz"

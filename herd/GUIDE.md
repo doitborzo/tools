@@ -536,8 +536,10 @@ through: within-camera purity 88 → 77%, IDF1 over all cameras 0.499 → 0.413.
 | purity / wrong joins at 120 | 73% / 2330 | 61% / 3269 | 72% / 2095 |
 | ... at 160 | — | 62% / 2919 | **77% / 1682** |
 
-The late reacquire changed little (`-nolate`: the same IDF1, purity 1-2 points higher without it);
-link_dist 160 is now the default. The first calibration was too strict for the gallery (98% of
+The late reacquire changed little (twice: the same IDF1, purity a point or two higher without it - and
+a re-run of the same model moves IDF1 by ~0.02 anyway): it is **off by default** now, `thresholds.json`
+keeps its calibrated `late_sim` and `mct_eval` scores `+late` variants with it. link_dist 160 is the
+default (120: 0.502, 160 and 200: 0.535). The first calibration was too strict for the gallery (98% of
 two-cow pairs: one cow's bursts grouped only a fifth of the time, most left in the pool) and for the
 late check (its same-cow pairs were any two pieces of the day, not a cow lost and back): now
 `new_cow_similarity` is the best split of same and two cows (at least above 90% of two cows) and the

@@ -271,7 +271,7 @@ def test_moments_loss_and_the_models_own_thresholds():
         cfg = _copy.deepcopy(DEFAULTS)
         cfg["mct"]["handover_min_sim"] = 0.42                     # set in barn.toml: kept
         changed = reid.apply_thresholds(cfg, th, DEFAULTS, say=None)
-        assert cfg["mct"]["reacquire_sim"] == th["reacquire_sim"] and cfg["mct"]["late_sim"] == th["late_sim"]
+        assert cfg["mct"]["reacquire_sim"] == th["reacquire_sim"] and cfg["mct"]["late_sim"] == 0.0   # late: off
         assert cfg["mct"]["handover_min_sim"] == 0.42 and cfg["identity"]["new_cow_similarity"] == th["new_cow_similarity"]
         assert not any(c.startswith("mct.handover_min_sim") for c in changed)
         # thresholds again for the trained model (a change to calibrate, no training)
