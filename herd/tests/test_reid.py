@@ -274,3 +274,8 @@ def test_moments_loss_and_the_models_own_thresholds():
         assert cfg["mct"]["reacquire_sim"] == th["reacquire_sim"] and cfg["mct"]["late_sim"] == th["late_sim"]
         assert cfg["mct"]["handover_min_sim"] == 0.42 and cfg["identity"]["new_cow_similarity"] == th["new_cow_similarity"]
         assert not any(c.startswith("mct.handover_min_sim") for c in changed)
+        # thresholds again for the trained model (a change to calibrate, no training)
+        os.remove(os.path.join(d, "id_model", "thresholds.json"))
+        reid.main(["calibrate", "--data", d, "--identity", os.path.join(d, "id_model", "identity.pt")])
+        again = reid.identity_thresholds(os.path.join(d, "id_model", "identity.pt"))
+        assert abs(again["reacquire_sim"] - th["reacquire_sim"]) < 1e-3

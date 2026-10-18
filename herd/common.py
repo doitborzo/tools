@@ -93,7 +93,9 @@ DEFAULTS = {
             # mode "link": each camera tracks its own cows, tracks of two cameras are joined when for
             # link_min_s seconds they were each other's nearest on the floor within link_dist, in
             # link_share of the seconds both were seen (mct.TrackletLinker; reports follow track_links)
-            "link_dist": 120.0, "link_min_s": 5, "link_share": 0.6,
+            # MmCows with the identity model (frame-against-frame, calibrated): link_dist 160 against 120 -
+            # IDF1 over all cameras 0.496 -> 0.540, purity 72 -> 77%, wrong joins 2095 -> 1682
+            "link_dist": 160.0, "link_min_s": 5, "link_share": 0.6,
             # strict joining (off at 0): the next cow link_margin further; no join of two groups holding
             # tracks seen together link_contra_s seconds but near in less than link_contra of them
             # MmCows: link_margin 50 halved the wrong joins (2330 -> 1309) at the same IDF1 (0.498);

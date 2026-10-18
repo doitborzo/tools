@@ -503,7 +503,7 @@ def test_linker_refuses_a_chain_that_joins_cows_apart():
     pts = [[0, 0, 0, 0], [1, 0, 1000, 0], [1, 1, 1000, 1000], [0, 1, 0, 1000]]
     cfg = _cfg()
     cfg["cameras"] = [{"id": c, "mask": [], "floor_points": pts} for c in ("a", "b", "c")]
-    cfg["mct"].update(link_contra=0.3, link_min_s=3, link_share=0.3)
+    cfg["mct"].update(link_contra=0.3, link_min_s=3, link_share=0.3, link_dist=120.0)
     lk = mct.TrackletLinker(cfg)
     box = lambda x: [x - 0.03, 0.45, x + 0.03, 0.5]
     for k in range(20):

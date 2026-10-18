@@ -364,7 +364,7 @@ floor tracker, matching points a second at a time, swapped cows lying a metre or
 (33 switches a cow an hour, tracks 50% pure). Within a camera boxes are reliable (IoU tracks
 93% pure), so `mct.TrackletLinker` keeps both: each camera follows its own cows, and a track of
 one camera is joined to a track of another when for `link_min_s` (5) seconds they were each
-other's nearest on the floor within `link_dist` (120 cm, at the height where they agree), in
+other's nearest on the floor within `link_dist` (160 cm, at the height where they agree), in
 `link_share` (60%) of the seconds both were seen — never two tracks one camera saw at the same
 time. Joins are written to `track_links`; reports read every track under the one it was finally
 joined to. MmCows (60 min, 4 cameras): IDF1 over all cameras 0.499 (the system without `[mct]`
@@ -522,6 +522,26 @@ through: within-camera purity 88 → 77%, IDF1 over all cameras 0.499 → 0.413.
   60 s before it began, near where it began; the clearly nearest above `late_sim` is the same cow — the
   new gid continues the old one (`track_links`, the reports follow). Off without a calibration;
   `mct_eval` scores `fid/still-nolate` and `fid/link-final-nolate` to compare.
+
+**The result** (MmCows, 60 min, the model trained with the frame loss and its own thresholds):
+
+| | first identity model | from scratch, no frame loss | **with frame loss + thresholds** |
+|---|---|---|---|
+| by look, cows 11-16 (never seen) | — | 19.6% | **51.1%** |
+| by look, all cows (chance 9.8%) | 17.3% | 15.5% | **41.9%** |
+| IDF1 in a camera (`fid/still`; first model `~0.9`) | 0.579 | 0.505 | **0.593** |
+| track purity in a camera | 88% | 77% | **88%** |
+| IDF1 over all cameras, `link-final` at link_dist 120 | 0.499 | 0.388 | 0.496 |
+| ... at link_dist 160 | — | 0.411 | **0.540** |
+| purity / wrong joins at 120 | 73% / 2330 | 61% / 3269 | 72% / 2095 |
+| ... at 160 | — | 62% / 2919 | **77% / 1682** |
+
+The late reacquire changed little (`-nolate`: the same IDF1, purity 1-2 points higher without it);
+link_dist 160 is now the default. The first calibration was too strict for the gallery (98% of
+two-cow pairs: one cow's bursts grouped only a fifth of the time, most left in the pool) and for the
+late check (its same-cow pairs were any two pieces of the day, not a cow lost and back): now
+`new_cow_similarity` is the best split of same and two cows (at least above 90% of two cows) and the
+late check's positives are a cow's consecutive pieces.
 ---
 
 ## 5. Training on the pod (CBVD-5)

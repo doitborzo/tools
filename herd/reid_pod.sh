@@ -29,6 +29,7 @@
 # Knobs: WORK=/workspace  RUN=run9  DET=<best/> (default: the newest)  INIT=<identity.pt> (fine-tune it; default: from scratch)
 #        SOURCES="mmcows cobra sideview multicam cows2021 opencows"  EPOCHS=30  MCT=1  MINUTES=60
 #        UWB_DAYS="0722 0728 0801"  UWB_EVERY=30  WAIT_MIN=20 (how long the GPU waits for a background download)
+#        TRAIN=0 (no training: the existing model's thresholds again - reid.py calibrate - and the MmCows check)
 # Every step resumes. Licences: MmCows CC BY-NC-SA, CoBRA and SideViewCows CC BY 4.0, the Bristol sets NCGL.
 
 set -euo pipefail
@@ -58,7 +59,7 @@ if [ -z "${HERD_REID_IN_TMUX:-}" ]; then
     fi
     mkdir -p "$R"
     knobs=""
-    for v in WORK RUN DET SOURCES EPOCHS MCT MINUTES MODELS INIT UWB_DAYS UWB_EVERY WAIT_MIN; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
+    for v in WORK RUN DET SOURCES EPOCHS MCT MINUTES MODELS INIT UWB_DAYS UWB_EVERY WAIT_MIN TRAIN; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env HERD_REID_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/reid_pod.sh"); echo; echo '[reid finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log   ($LOG)"
@@ -203,9 +204,14 @@ fi
 bg_wait bristol multicam cows2021 opencows
 bg_wait zenodo cobra sideview
 
-step "Train the identity model ${initarg[*]:-(fresh)}"
-"$PY" "$HERE/reid.py" train --data "$R" --sources $SOURCES --model "$H/$RUN/model.pt" --epochs "${EPOCHS:-30}" \
-    --out "$OUT" "${initarg[@]}"
+if [ "${TRAIN:-1}" = "0" ] && [ -f "$OUT/identity.pt" ]; then
+    step "No training (TRAIN=0): the thresholds of $OUT/identity.pt again"
+    "$PY" "$HERE/reid.py" calibrate --data "$R" --identity "$OUT/identity.pt"
+else
+    step "Train the identity model ${initarg[*]:-(fresh)}"
+    "$PY" "$HERE/reid.py" train --data "$R" --sources $SOURCES --model "$H/$RUN/model.pt" --epochs "${EPOCHS:-30}" \
+        --out "$OUT" "${initarg[@]}"
+fi
 
 if [ "${MCT:-1}" = "1" ]; then
     step "MmCows with the identity model (mct_pod.sh)"

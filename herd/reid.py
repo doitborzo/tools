@@ -802,6 +802,14 @@ def _q(v, q):
     return float(np.quantile(v, q)) if len(v) else None
 
 
+def youden(pos, neg):
+    """The threshold splitting same-cow from two-cow similarities best (most same in, fewest two in)."""
+    pos, neg = np.sort(np.asarray(pos)), np.sort(np.asarray(neg))
+    cand = np.quantile(np.concatenate([pos, neg]), np.linspace(0.01, 0.99, 197))
+    j = [(1 - np.searchsorted(pos, t) / len(pos)) - (1 - np.searchsorted(neg, t) / len(neg)) for t in cand]
+    return float(cand[int(np.argmax(j))])
+
+
 def calibrate(model, split, mo):
     """The tracker's and the gallery's similarity thresholds for THIS model's space (another model's
     0.9 is not this one's): from cows never trained on, the similarities of different cows that a
@@ -809,8 +817,9 @@ def calibrate(model, split, mo):
       reacquire_sim     one frame vs another of the same camera: above 98% of two cows side by side
       handover_min_sim  one frame vs one of another camera at that second: above 95% of two cows
       late_sim          a few frames' mean vs another few of the same camera: above 98% of two cows
-      new_cow_similarity, merge_similarity   burst vs burst (the gallery): above 98% / 99.5% of two
-                        cows of one set
+      new_cow_similarity  burst vs burst (the gallery's grouping of new cows): the best split of same
+                        and two cows, at least above 90% of two cows of one set
+      merge_similarity  burst vs burst (the nightly merge of one cow's profiles): above 99.5%
     -> {key: value, "recall": {key: share of the same cow's pairs at or above it}, "pairs": {...}}"""
     out, recall, pairs = {}, {}, {}
     if mo is not None and len(mo):
@@ -839,13 +848,14 @@ def calibrate(model, split, mo):
                 pieces[(day, cam)].append((c, v[i][0], v[i + 2][0], m / (np.linalg.norm(m) + 1e-12)))
         late_n = []
         for ps in pieces.values():
+            last = {}                                           # a cow's previous piece: lost, then back
             for i, (c, a0, a1, ma) in enumerate(ps):
+                if c in last:
+                    late_p.append(float(last[c] @ ma))
+                last[c] = ma
                 for c2, b0, b1, mb in ps[i + 1:]:
-                    v = float(ma @ mb)
-                    if c2 == c:
-                        late_p.append(v)
-                    elif a0 <= b1 and b0 <= a1:                 # two cows the camera saw at the same time
-                        late_n.append(v)
+                    if c2 != c and a0 <= b1 and b0 <= a1:       # two cows the camera saw at the same time
+                        late_n.append(float(ma @ mb))
         for key, neg, posv, q in (("reacquire_sim", cam_n, cam_p, 0.98), ("handover_min_sim", cross_n, cross_p, 0.95),
                                   ("late_sim", late_n, late_p, 0.98)):
             if len(neg) >= 20 and posv:
@@ -862,9 +872,14 @@ def calibrate(model, split, mo):
     same_cow = ident[iu[0]] == ident[iu[1]]
     neg, posv = S[iu][same_src & ~same_cow], S[iu][same_cow]
     if len(neg) >= 20 and len(posv):
-        for key, q in (("new_cow_similarity", 0.98), ("merge_similarity", 0.995)):
-            out[key] = round(_q(neg, q), 4)
+        # grouping new cows (cannot_link guards it): the best split of same / two cows, at least above 90%
+        # of two-cow pairs; the nightly merge of profiles: strict, above 99.5% (MmCows: at 98% only a
+        # fifth of one cow's bursts grouped, most stayed in the pool)
+        out["new_cow_similarity"] = round(max(youden(posv, neg), _q(neg, 0.90)), 4)
+        out["merge_similarity"] = round(max(_q(neg, 0.995), out["new_cow_similarity"]), 4)
+        for key in GALLERY_KEYS:
             recall[key] = float(np.mean(posv >= out[key]))
+            pairs.setdefault("two_cows_above", {})[key] = float(np.mean(neg >= out[key]))
         pairs["bursts"] = {"same_cow": int(len(posv)), "two_cows": int(len(neg)), "same_cow_median": _q(posv, 0.5),
                            "two_cows_median": _q(neg, 0.5)}
     return dict(out, recall=recall, pairs=pairs) if out else {}
@@ -1089,9 +1104,35 @@ def cmd_train(args):
               f"{'-' if e is None else f'{e:.1%}'}")
     for k in MCT_KEYS + GALLERY_KEYS:
         if k in th:
-            print(f"  threshold {k:18s} {th[k]:.3f}  (two cows above it: {'2%' if k != 'handover_min_sim' else '5%'}"
-                  f"{' / 0.5%' if k == 'merge_similarity' else ''}; the same cow at or above: {th['recall'][k]:.1%})")
+            two = {"handover_min_sim": "5%", "new_cow_similarity": f"{th['pairs'].get('two_cows_above', {}).get(k, 0):.1%}",
+                   "merge_similarity": "0.5%"}.get(k, "2%")
+            print(f"  threshold {k:18s} {th[k]:.3f}  (two cows above it: {two}; the same cow at or above: "
+                  f"{th['recall'][k]:.1%})")
     print(f"-> {os.path.join(args.out, 'identity.pt')} (+ abstain.json, thresholds.json): [model] identity in barn.toml")
+
+
+def cmd_calibrate(args):
+    """The thresholds of an identity.pt already trained, again (after a change to reid.calibrate):
+    thresholds.json next to it and inside it; the model itself is not touched."""
+    import torch
+    from common import device
+    dev = device()
+    ck = torch.load(args.identity, map_location="cpu", weights_only=False)
+    model, _ = load_identity(args.identity, ck.get("features", {}), dev)
+    sources = args.sources or ck.get("sources") or list(SOURCES)
+    va = Bursts(args.data, sources, "val")
+    if not va.bursts:
+        sys.exit("no val features: reid.py extract first")
+    mo = Moments(args.data, "val") if "mmcows" in sources else None
+    th = calibrate(model, va, mo)
+    out = os.path.dirname(os.path.abspath(args.identity))
+    write_json(os.path.join(out, "thresholds.json"), th)
+    ck["thresholds"] = th
+    torch.save(ck, args.identity)
+    for k in MCT_KEYS + GALLERY_KEYS:
+        if k in th:
+            print(f"  threshold {k:18s} {th[k]:.3f}  (the same cow at or above: {th['recall'][k]:.1%})")
+    print(f"-> {os.path.join(out, 'thresholds.json')}")
 
 
 def load_identity(path, features_meta, dev):
@@ -1116,6 +1157,10 @@ def main(argv=None):
     lb = sub.add_parser("label", help="(GPU) MmCows' frames -> crops with cow numbers (human labels, neck tags)")
     e = sub.add_parser("extract")
     t = sub.add_parser("train")
+    cal = sub.add_parser("calibrate", help="the thresholds of a trained identity.pt again (thresholds.json)")
+    cal.add_argument("--data", required=True)
+    cal.add_argument("--identity", required=True)
+    cal.add_argument("--sources", nargs="+", default=None, choices=list(SOURCES))
     for q in (f, e, t):
         q.add_argument("--data", required=True)
         q.add_argument("--sources", nargs="+", default=list(SOURCES), choices=list(SOURCES))
@@ -1158,7 +1203,8 @@ def main(argv=None):
         args.out = os.path.join(args.data, "id_model")
     if args.cmd == "train" and args.lr is None:
         args.lr = 3e-5 if args.init else 1e-4
-    {"fetch": cmd_fetch, "label": cmd_label, "extract": cmd_extract, "train": cmd_train}[args.cmd](args)
+    {"fetch": cmd_fetch, "label": cmd_label, "extract": cmd_extract, "train": cmd_train,
+     "calibrate": cmd_calibrate}[args.cmd](args)
 
 
 if __name__ == "__main__":

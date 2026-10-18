@@ -865,7 +865,7 @@ def main(argv=None):
         q.add_argument("--reacquire-sweep", type=float, nargs="*", default=[0.8, 0.9],
                        help="reacquire_sim tried (the frame id's space differs with an identity model)")
         q.add_argument("--fuse-sweep", type=float, nargs="*", default=[120.0, 200.0], help="fused: fuse_dist tried (cm)")
-        q.add_argument("--link-sweep", type=float, nargs="*", default=[80.0, 160.0], help="link: link_dist tried (cm)")
+        q.add_argument("--link-sweep", type=float, nargs="*", default=[120.0, 200.0], help="link: link_dist tried (cm)")
     s.add_argument("--enroll", nargs="*", default=["fid/still~0.9", "fid/link-final"],
                    help="trackers whose tracks enroll is tried on")
     s.add_argument("--min-bursts", type=int, default=10, help="enroll: bursts a new cow needs")

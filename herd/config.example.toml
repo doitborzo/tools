@@ -103,7 +103,7 @@ handover_dist_margin = 50       # and the next cow at least this much further
 apart_dist = 0                  # > 0: two cameras' cows this far apart at the same second are two cows
 # mode = "link"                 # each camera tracks its cows; tracks of two cameras that stand together on
 #                               # the floor for link_min_s seconds are joined (reports follow the joins)
-# link_dist = 120               # link: the floor distance (cm) to count as together
+# link_dist = 160               # link: the floor distance (cm) to count as together
 # mode = "fused"                # all calibrated cameras on one floor plan, one tracker on the floor
 # fuse_dist = 160               # fused: points of different cameras this close (cm) are one cow
 # floor_area = [[0, 0], [2400, 0], [2400, 1200], [0, 1200]]   # fused: the pen's floor (cm); off it = phantom
