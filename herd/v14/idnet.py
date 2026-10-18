@@ -5,19 +5,23 @@ Input  : T frame vectors (DINOv2-S, 1920 numbers each: CLS + 2 x 2 pooled patche
          times in seconds and which are real (valid).
 Output : fingerprint (512, unit length) and a quality score per frame (how much it counts).
 
-Trained on MultiCamCows2024 only: days 1-5 (14-18 Aug) train, day 6 (19 Aug) picks the epoch
-and the "not sure" model, day 7 (20 Aug) is the test nobody looked at. A training batch is
-P cows x 2 sequences each, taken from different days or cameras where the cow has them, so
-the "twins" are the same cow on another day - what CBVD-5 could not teach. Loss: supervised
-contrastive (model.supcon). Small (~3 M parameters), dropout, weight decay, early stopping:
-90 cows is not much.
+Two ways to split (--split):
+  days  MultiCamCows2024: days 1-5 (14-18 Aug) train, day 6 picks the epoch and the "not sure"
+        model, day 7 is the test nobody looked at.
+  cows  MmCows, one barn (data_mmcows.py idcrops): 8 of the 16 cows train, 3 pick the epoch,
+        5 the model never saw are the test - album before 12:00, queries after 15:00. Its frames
+        are a minute apart: --time-aug 0.02 also shows them squeezed to the live stream's pace.
+A training batch is P cows x 2 sequences each, from different days (parts of the day) or
+cameras where the cow has them. Loss: supervised contrastive (model.supcon). Small (~3 M
+parameters), dropout, weight decay, early stopping.
 
     python herd/v14/idnet.py train --feats /workspace/v14/mcc --out /workspace/v14/idnet
-    python herd/v14/idnet.py eval  --feats /workspace/v14/mcc --out /workspace/v14/idnet
+    python herd/v14/idnet.py train --feats /workspace/v14/mmcows/idcrops --split cows --time-aug 0.02 --P 8 \
+        --out /workspace/v14/idnet
 
-Writes <out>/idnet.pt (model + its settings + the enrolment threshold + the "not sure"
-model) and <out>/eval_mcc.json: top-1 / top-5 / mAP and ID precision / recall / F1
-(abstentions count as misses), album from day 6, queries from day 7.
+Writes <out>/idnet.pt (model + its settings + the split + the enrolment threshold + the
+"not sure" model) and <out>/eval_id.json: top-1 / top-5 / mAP and ID precision / recall / F1
+(abstentions count as misses) on the test part.
 """
 
 from __future__ import annotations
@@ -215,8 +219,10 @@ def enrol_threshold(fps, cows):
 
 
 def score_days(model, store, device, album_days, query_days, nan=None):
-    a_keys = list(store.of_days(album_days))
-    q_keys = list(store.of_days(query_days))
+    return score_keys(model, store, device, list(store.of_days(album_days)), list(store.of_days(query_days)))
+
+
+def score_keys(model, store, device, a_keys, q_keys):
     a_fp, _, _ = embed(model, store.whole(a_keys), device)
     q_fp, qmax, qmean = embed(model, store.whole(q_keys), device)
     import metrics
@@ -230,6 +236,46 @@ def score_days(model, store, device, album_days, query_days, nan=None):
     return res, rows, [q_ids[i] for i in keep], q_fp, q_ids
 
 
+# ------------------------------------------------------------------ splits
+
+def split_plan(store, args):
+    """Which sequences train, pick the epoch (val) and test - as album / query key lists.
+
+    days: train = all days but the last two; val = album last train day, queries the day after;
+          test = album that day, queries the last day (MultiCamCows2024).
+    cows: the store has two parts of the day ("A" earlier, "B" later); cows are split at random
+          (split_seed) into train / val / test; val and test cows: album from A, queries from B -
+          cows the model never saw (MmCows, one barn)."""
+    keys = sorted(store.seqs)
+    days = store.days()
+    if args.split == "days":
+        if len(days) < 3:
+            sys.exit(f"need at least 3 days, found {days}")
+        tr_d, val_d, test_d = days[:-2], days[-2], days[-1]
+        pick = lambda ds: [k for k in keys if k[0] in set(ds)]
+        print(f"[idnet] days: train {tr_d}, val {val_d}, test {test_d}", flush=True)
+        return {"train": pick(tr_d), "val_album": pick(tr_d[-1:]), "val_query": pick([val_d]),
+                "test_album": pick([val_d]), "test_query": pick([test_d]),
+                "about": {"by": "days", "train": tr_d, "val": val_d, "test": test_d, "args": {"split": "days"}}}
+    if len(days) != 2:
+        sys.exit(f"--split cows needs two parts of the day (A, B), found {days}")
+    cows = sorted({k[1] for k in keys})
+    r = random.Random(args.split_seed)
+    shuffled = cows[:]
+    r.shuffle(shuffled)
+    n_te, n_va = args.test_cows, args.val_cows
+    if len(cows) < n_te + n_va + 2:
+        sys.exit(f"--split cows: {len(cows)} cows, too few for {n_va} val + {n_te} test")
+    test_c, val_c, train_c = sorted(shuffled[:n_te]), sorted(shuffled[n_te:n_te + n_va]), sorted(shuffled[n_te + n_va:])
+    print(f"[idnet] cows: train {train_c}, val {val_c}, test {test_c} (never trained on)", flush=True)
+    of = lambda cs, part=None: [k for k in keys if k[1] in set(cs) and (part is None or k[0] == part)]
+    a, b = days
+    return {"train": of(train_c), "val_album": of(val_c, a), "val_query": of(val_c, b),
+            "test_album": of(test_c, a), "test_query": of(test_c, b),
+            "about": {"by": "cows", "train": train_c, "val": val_c, "test": test_c, "album_part": a, "query_part": b,
+                      "args": {"split": "cows", "val_cows": n_va, "test_cows": n_te, "split_seed": args.split_seed}}}
+
+
 # ------------------------------------------------------------------ train
 
 def cmd_train(args):
@@ -240,12 +286,8 @@ def cmd_train(args):
     rng = random.Random(args.seed)
     torch.manual_seed(args.seed)
     store = Store(args.feats)
-    days = store.days()
-    if len(days) < 3:
-        sys.exit(f"need at least 3 days, found {days}")
-    train_days, val_day, test_day = days[:-2], days[-2], days[-1]
-    print(f"[idnet] days: train {train_days}, val {val_day}, test {test_day}", flush=True)
-    tr = store.of_days(train_days)
+    plan = split_plan(store, args)
+    tr = {k: store.seqs[k] for k in plan["train"]}
     by_cow = collections.defaultdict(list)
     for k in tr:
         if len(tr[k]) >= 2:
@@ -275,6 +317,8 @@ def cmd_train(args):
                 for k in (a, b):
                     L = rng.randint(args.min_len, args.max_len)
                     f, t = store.seq(tr[k], rng, L, rng.choice((1, 1, 2, 3, 5)))   # 5, 2.5, 1.7, 1 Hz
+                    if args.time_aug < 1:      # sparse frames (one a minute) taught at the live stream's pace too
+                        t = t * float(np.exp(rng.uniform(np.log(args.time_aug), 0)))
                     keep = np.array([rng.random() > args.drop for _ in range(len(f))]) if len(f) > 2 else np.ones(len(f), bool)
                     keep[rng.randrange(len(f))] = True
                     seqs.append((f[keep], t[keep] - t[keep][0])), labels.append(ci)
@@ -294,7 +338,7 @@ def cmd_train(args):
             sched.step()
             losses.append(loss.item())
         model.eval()
-        res, _, _, _, _ = score_days(model, store, dev, train_days[-1:], [val_day])
+        res, _, _, _, _ = score_keys(model, store, dev, plan["val_album"], plan["val_query"])
         score = (res["top1"] or 0) + (res["mAP"] or 0)
         rec = {"epoch": ep + 1, "loss": round(float(np.mean(losses)), 4), "val_top1": res["top1"], "val_mAP": res["mAP"],
                "minutes": round((time.time() - t0) / 60, 1)}
@@ -302,8 +346,7 @@ def cmd_train(args):
         print(f"[idnet] epoch {ep + 1}: loss {rec['loss']:.3f}  val top-1 {res['top1']:.1%}  mAP {res['mAP']:.3f}", flush=True)
         if score > best:
             best, since = score, 0
-            torch.save({"kw": model.kw, "state": model.state_dict(), "epoch": ep + 1, "days": days,
-                        "train_days": train_days, "val_day": val_day, "test_day": test_day,
+            torch.save({"kw": model.kw, "state": model.state_dict(), "epoch": ep + 1, "split": plan["about"],
                         "feats": read_meta(args.feats)}, os.path.join(args.out, "idnet.pt"))
         else:
             since += 1
@@ -327,13 +370,13 @@ def cmd_eval(args):
     model, ck = load(os.path.join(args.out, "idnet.pt"), dev)
     model.to(dev)
     store = Store(args.feats)
-    tr, val, test = ck["train_days"], ck["val_day"], ck["test_day"]
-    # the "not sure" model and the enrolment threshold: album from the last train day, queries the val day
-    vres, vrows, vtruth, vfp, vids = score_days(model, store, dev, tr[-1:], [val])
+    plan = split_plan(store, argparse.Namespace(**{**vars(args), **ck["split"]["args"]}))
+    # the "not sure" model and the enrolment threshold, on the val part
+    vres, vrows, vtruth, vfp, vids = score_keys(model, store, dev, plan["val_album"], plan["val_query"])
     nan = fit_nan(vrows, vtruth, args.max_error)
     thr = enrol_threshold(vfp, np.array(vids))
-    # the test: album from the val day, queries the test day (a day the model never saw)
-    tres, trows, ttruth, _, _ = score_days(model, store, dev, [val], [test], nan)
+    # the test: a later day (days) or cows the model never saw (cows)
+    tres, trows, ttruth, _, _ = score_keys(model, store, dev, plan["test_album"], plan["test_query"])
     p = nan_p(nan, trows)
     import metrics
     pred = [r["cow"] if pi >= nan["threshold"] else None for r, pi in zip(trows, p)]
@@ -342,20 +385,19 @@ def cmd_eval(args):
     ck.update({"nan": nan, "enrol_threshold": thr})
     torch.save(ck, os.path.join(args.out, "idnet.pt"))
     out = {"model": {"epoch": ck["epoch"], "parameters": int(sum(v.numel() for v in ck["state"].values())), **ck["kw"]},
-           "days": {"train": tr, "val": val, "test": test},
-           "val_day": vres, "test_day": tres,
+           "split": ck["split"], "val": vres, "test": tres,
            "test_id_with_not_sure": prf, "test_id_always_answer": always,
            "nan": {k: nan[k] for k in ("threshold", "max_error", "fit_queries", "fit_top1")},
            "enrol_threshold": thr,
-           "what": "album = sequences of the earlier day (k-means looks per cow), queries = every sequence "
-                   "of the later day; precision / recall / F1 count 'not sure' as a miss"}
-    write_json(os.path.join(args.out, "eval_mcc.json"), out)
+           "what": "album = sequences of the earlier part (k-means looks per cow), queries = every sequence "
+                   "of the later part; precision / recall / F1 count 'not sure' as a miss"}
+    write_json(os.path.join(args.out, "eval_id.json"), out)
     pct = lambda v: "-" if v is None else f"{v:.1%}"
-    print(f"[idnet] test day {test} (album {val}): top-1 {pct(tres['top1'])}, top-5 {pct(tres['top5'])}, "
+    print(f"[idnet] test ({ck['split']['test']}): top-1 {pct(tres['top1'])}, top-5 {pct(tres['top5'])}, "
           f"mAP {tres['mAP'] if tres['mAP'] is None else round(tres['mAP'], 3)}", flush=True)
     print(f"[idnet] with 'not sure' (<= {args.max_error:.0%} wrong on val): precision {pct(prf['precision'])}, "
           f"recall {pct(prf['recall'])}, F1 {pct(prf['f1'])}, answered {pct(prf['answered_share'])}", flush=True)
-    print(f"[idnet] enrolment threshold {thr}; -> {os.path.join(args.out, 'eval_mcc.json')}", flush=True)
+    print(f"[idnet] enrolment threshold {thr}; -> {os.path.join(args.out, 'eval_id.json')}", flush=True)
 
 
 def main(argv=None):
@@ -363,9 +405,15 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
     for name in ("train", "eval"):
         s = sub.add_parser(name)
-        s.add_argument("--feats", required=True, help="data_mcc.py's feature folder")
+        s.add_argument("--feats", required=True, help="data_mcc.py's or data_mmcows.py idcrops' feature folder")
         s.add_argument("--out", required=True)
         s.add_argument("--max-error", type=float, default=0.01)
+        s.add_argument("--split", choices=("days", "cows"), default="days",
+                       help="days: train on early days, test on the last (MultiCamCows); cows: one barn, "
+                            "train on some cows, test on others never seen (MmCows)")
+        s.add_argument("--val-cows", type=int, default=3)
+        s.add_argument("--test-cows", type=int, default=5)
+        s.add_argument("--split-seed", type=int, default=0)
         if name == "train":
             s.add_argument("--epochs", type=int, default=60)
             s.add_argument("--patience", type=int, default=10)
@@ -382,6 +430,8 @@ def main(argv=None):
             s.add_argument("--wd", type=float, default=0.05)
             s.add_argument("--temperature", type=float, default=0.1)
             s.add_argument("--seed", type=int, default=0)
+            s.add_argument("--time-aug", type=float, default=1.0,
+                           help="< 1: sequence times squeezed by up to this factor at random")
     args = p.parse_args(argv)
     return {"train": cmd_train, "eval": cmd_eval}[args.cmd](args)
 

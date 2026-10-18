@@ -16,6 +16,9 @@ through HTTP Range requests (cowbench/extra_det.py's RemoteZip), nothing downloa
              "barn" the onboarding test runs on (not masked: the mask is applied there)
     feats    DINOv2 of every labelled box (the barn's 224 px crop, margin 0.1) and the scene
              grid of every saved labelled frame -> <out>/assoc.npz + <out>/assoc_rows.jsonl
+    idcrops  the box vectors of `feats` outside the test window as ID sequences (per cow and
+             camera, consecutive frames) for idnet.py --split cows: part "A" before the window,
+             "B" after it -> <out>/idcrops/{feats.npy, crops.jsonl, meta.json}
     inspect  how the member names of a zip read as camera and time
 
 The test window (12:00-15:00 by default) is never used for training. The detector of
@@ -243,6 +246,51 @@ def cmd_feats(args):
     print(f"[mmcows] {len(box_rows)} boxes, {len(frames)} scene grids -> {out_npz}", flush=True)
 
 
+def cmd_idcrops(args):
+    """One barn, different cows (idnet.py --split cows): every labelled box outside the test
+    window, chained per (cow, camera) into sequences of up to --seq-len frames with no gap
+    over 2.5 x --train-every; times in seconds."""
+    frames = read_jsonl(os.path.join(args.out, "frames.jsonl"))
+    rows = read_jsonl(os.path.join(args.out, "assoc_rows.jsonl"))
+    if not rows:
+        sys.exit("run `feats` first")
+    feats = np.load(os.path.join(args.out, "assoc.npz"))["box_feats"]
+    by = collections.defaultdict(list)
+    for i, r in enumerate(rows):
+        f = frames[r["frame"]]
+        if f["split"] != "train":
+            continue
+        part = "A" if local_hour(f["ts"]) < args.start else "B"
+        by[(part, r["cow"], f["cam"])].append((f["ts"], i))
+    out_rows, idx = [], []
+    for (part, cow, cam), seen in sorted(by.items()):
+        seen.sort()
+        t0 = last = None
+        count = 0
+        for ts, i in seen:
+            if last is None or ts - last > 2.5 * args.train_every or count >= args.seq_len:
+                t0, count = ts, 0                       # a new sequence
+            count += 1
+            last = ts
+            out_rows.append({"name": f"{cam}/{ts:.1f}/{cow}", "day": part, "cow": cow, "seq": f"{cam}_{int(t0)}",
+                             "t": round(ts - t0, 2), "cam": cam})
+            idx.append(i)
+    d = os.path.join(args.out, "idcrops")
+    os.makedirs(d, exist_ok=True)
+    np.save(os.path.join(d, "feats.npy"), feats[np.array(idx, int)].astype(np.float16))
+    with open(os.path.join(d, "crops.jsonl"), "w", encoding="utf-8") as fh:
+        for r in out_rows:
+            fh.write(json.dumps(r) + "\n")
+    meta = json.load(open(os.path.join(args.out, "assoc_meta.json"), encoding="utf-8"))
+    write_json(os.path.join(d, "meta.json"), {**meta, "source": "MmCows labelled boxes outside the test window",
+                                              "parts": {"A": f"before {args.start:g}:00", "B": f"after {args.end:g}:00"}})
+    seqs = collections.Counter((r["day"], r["cow"], r["seq"]) for r in out_rows)
+    cows = collections.Counter(r["cow"] for r in out_rows)
+    print(f"[mmcows] idcrops: {len(out_rows)} crops, {len(seqs)} sequences "
+          f"(A {sum(1 for k in seqs if k[0] == 'A')}, B {sum(1 for k in seqs if k[0] == 'B')}), "
+          f"{len(cows)} cows ({min(cows.values())}-{max(cows.values())} crops each) -> {d}", flush=True)
+
+
 def cmd_inspect(args):
     z = remote(args.zip_url)
     names = z.names()
@@ -255,7 +303,7 @@ def cmd_inspect(args):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("labels", "frames", "live", "feats", "inspect"):
+    for name in ("labels", "frames", "live", "feats", "idcrops", "inspect"):
         s = sub.add_parser(name)
         s.add_argument("--out", default="/workspace/v14/mmcows")
         s.add_argument("--visual", default=VISUAL)
@@ -273,9 +321,10 @@ def main(argv=None):
         s.add_argument("--crop", type=int, default=224)
         s.add_argument("--margin", type=float, default=0.1)
         s.add_argument("--zip-url", default=LIVE.format(k=1))
+        s.add_argument("--seq-len", type=int, default=12, help="idcrops: frames per sequence at most")
     args = p.parse_args(argv)
     return {"labels": cmd_labels, "frames": cmd_frames, "live": cmd_live, "feats": cmd_feats,
-            "inspect": cmd_inspect}[args.cmd](args)
+            "idcrops": cmd_idcrops, "inspect": cmd_inspect}[args.cmd](args)
 
 
 if __name__ == "__main__":

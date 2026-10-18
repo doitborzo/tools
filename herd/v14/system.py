@@ -182,7 +182,10 @@ def run(args):
     names = identify([r for r in minute_recs if r[0] >= setup_m], alb_P, alb_ids, nan, args.ema)
 
     # --- scoring against the labels
-    res = score(args, det_log, track_album, names, t_start, t_setup, cams, metrics)
+    sp = idck.get("split") or {}
+    groups = ({"unseen_by_id_model (its test cows)": sp["test"], "id_model_val_cows": sp["val"],
+               "id_model_train_cows": sp["train"]} if sp.get("by") == "cows" else None)
+    res = score(args, det_log, track_album, names, t_start, t_setup, cams, metrics, groups)
     res["settings"] = {k: getattr(args, k) for k in ("step", "setup_min", "start", "end", "assoc", "det_threshold",
                                                      "calib", "max_gap", "min_frames", "min_minutes", "ema",
                                                      "scene_every")}
@@ -372,7 +375,7 @@ def identify(recs, P, ids, nan, ema):
 
 # ------------------------------------------------------------------ scores
 
-def score(args, det_log, track_album, names, t_start, t_setup, cams, metrics):
+def score(args, det_log, track_album, names, t_start, t_setup, cams, metrics, groups=None):
     labels = [r for r in read_jsonl(os.path.join(args.data, "labels.jsonl"))
               if args.start <= local_hour(r["ts"]) < args.end and r["cam"] in cams]
     by = collections.defaultdict(list)
@@ -420,6 +423,12 @@ def score(args, det_log, track_album, names, t_start, t_setup, cams, metrics):
     mapped = [to_cow.get(p) if p is not None else None for p in id_pred]
     mapped_always = [to_cow.get(p) if p is not None else None for p in id_pred_always]
     rate = lambda a, b: a / b if b else None
+    by_group = {}
+    for g, cows in (groups or {}).items():                     # e.g. cows the ID transformer never saw
+        keep = [i for i, c in enumerate(id_truth) if c in set(cows)]
+        by_group[g] = {"cows": sorted(cows),
+                       "with_not_sure": metrics.id_prf([mapped[i] for i in keep], [id_truth[i] for i in keep]),
+                       "always_answer": metrics.id_prf([mapped_always[i] for i in keep], [id_truth[i] for i in keep])}
     return {"labelled_sightings": len(gt_ids), "true_cows": len(true_cows),
             "detector": {"recall": rate(det_tp, det_tp + det_fn), "precision": rate(det_tp, det_tp + det_fp),
                          "recall_setup_hour": rate(det_split[("setup", "tp")], det_split[("setup", "gt")]),
@@ -432,7 +441,8 @@ def score(args, det_log, track_album, names, t_start, t_setup, cams, metrics):
                                "always_answer": metrics.id_prf(mapped_always, id_truth),
                                "what": "after the setup hour, every labelled sighting: right if the ID desk named "
                                        "its track with the album cow that is this true cow; not found / not sure "
-                                       "/ wrong all count against recall"}}
+                                       "/ wrong all count against recall",
+                               "by_cow_group": by_group}}
 
 
 def report(res, tag):

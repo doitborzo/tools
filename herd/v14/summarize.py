@@ -26,18 +26,29 @@ def main(argv=None):
     p.add_argument("--work", required=True, help="the v14 folder (idnet/, assoc/, system/ inside)")
     p.add_argument("--out", required=True)
     a = p.parse_args(argv)
-    idn = load(os.path.join(a.work, "idnet", "eval_mcc.json"))
+    idn = load(os.path.join(a.work, "idnet", "eval_id.json"))
     asc = load(os.path.join(a.work, "assoc", "eval_assoc.json"))
     sys_a = load(os.path.join(a.work, "system", "system_assoc.json"))
     sys_b = load(os.path.join(a.work, "system", "system_iou_per_camera.json"))
-    L = ["# Version 14 (A): cow identification, trained on MultiCamCows2024 + MmCows only", "",
+    sp = (idn or {}).get("split") or {}
+    by_cows = sp.get("by") == "cows"
+    L = ["# Version 14 (A): cow identification" + (", one barn (MmCows): different cows for training and testing"
+                                                   if by_cows else ", trained on MultiCamCows2024 + MmCows"), "",
          "Nothing from CBVD-5. Detector: version 10's, not retrained. DINOv2-S frozen. The ID transformer "
          "and the association transformer trained from scratch.", ""]
     if idn:
-        t, prf, alw = idn["test_day"], idn["test_id_with_not_sure"], idn["test_id_always_answer"]
-        L += ["## 1. ID transformer on MultiCamCows2024 (a day it never saw)", "",
-              f"Trained on {', '.join(idn['days']['train'])}; epoch and 'not sure' model picked on {idn['days']['val']}; "
-              f"album = {idn['days']['val']}, queries = every sequence of {idn['days']['test']}.", "",
+        t, prf, alw = idn["test"], idn["test_id_with_not_sure"], idn["test_id_always_answer"]
+        if by_cows:
+            L += ["## 1. ID transformer on MmCows cows it never saw", "",
+                  f"Trained on cows {sp['train']} ({len(sp['train'])}); epoch, 'not sure' model and enrolment "
+                  f"threshold picked on cows {sp['val']}; tested on cows {sp['test']} ({len(sp['test'])}, never "
+                  f"seen): album from before 12:00, queries every sequence after 15:00 (labelled frames a minute "
+                  f"apart). With {len(sp['test'])} cows, guessing gets {1 / max(1, len(sp['test'])):.0%} top-1.", ""]
+        else:
+            L += ["## 1. ID transformer on MultiCamCows2024 (a day it never saw)", "",
+                  f"Trained on {', '.join(sp['train'])}; epoch and 'not sure' model picked on {sp['val']}; "
+                  f"album = {sp['val']}, queries = every sequence of {sp['test']}.", ""]
+        L += [
               "| measure | value |", "|---|---|",
               f"| top-1 (right cow first) | {pct(t['top1'])} |", f"| top-5 | {pct(t['top5'])} |",
               f"| mAP | {num(t['mAP'])} |", f"| queries | {t['queries']} |",
@@ -75,12 +86,19 @@ def main(argv=None):
               f"| ID precision / recall, with 'not sure' | {pct(i1['precision'])} / {pct(i1['recall'])} |",
               f"| **ID F1** | **{pct(i1['f1'])}** |",
               f"| ID F1, always answering | {pct(i2['f1'])} |", ""]
+        for g, v in (s["identification"].get("by_cow_group") or {}).items():
+            L.insert(len(L) - 1, f"| ID F1, {g.replace('_', ' ')}: cows {v['cows']} | {pct(v['with_not_sure']['f1'])} "
+                                 f"(always answering {pct(v['always_answer']['f1'])}) |")
     L += ["## Notes", "",
           "- MultiCamCows2024 (UK Non-Commercial Government Licence) and MmCows (CC BY-NC-SA 4.0): non-commercial.",
           "- The detector was fine-tuned on MmCows' labelled frames except the hours 0, 6, 12 and 18: its numbers "
           "for 13:00-15:00 may be flattering; the setup hour is clean.",
-          "- MultiCamCows crops are torsos from a walkway; MmCows crops are whole cows in a pen: the ID transformer "
-          "meets a new kind of crop in the onboarding test, as it would on a new farm.", ""]
+          ("- One barn: the test cows are new to the ID transformer, but the pen, light and cameras are not; with "
+           "few cows, picking the right one is easier than in a real herd. The association transformer trained on "
+           "all 16 cows outside 12:00-15:00 (it learns which boxes are one cow, not who the cow is)."
+           if by_cows else
+           "- MultiCamCows crops are torsos from a walkway; MmCows crops are whole cows in a pen: the ID transformer "
+           "meets a new kind of crop in the onboarding test, as it would on a new farm."), ""]
     os.makedirs(a.out, exist_ok=True)
     with open(os.path.join(a.out, "RESULTS.md"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(L))

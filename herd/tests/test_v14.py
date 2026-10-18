@@ -80,11 +80,12 @@ def test_idnet_trains_and_scores_a_new_day():
         fake_mcc(os.path.join(d, "mcc"))
         a = argparse.Namespace(feats=os.path.join(d, "mcc"), out=os.path.join(d, "idnet"), max_error=0.05, epochs=6,
                                patience=6, P=8, min_len=3, max_len=8, drop=0.1, noise=0.01, d=32, layers=1, heads=2,
-                               dropout=0.0, lr=2e-3, wd=0.0, temperature=0.1, seed=0)
+                               dropout=0.0, lr=2e-3, wd=0.0, temperature=0.1, seed=0,
+                               split="days", val_cows=3, test_cows=5, split_seed=0, time_aug=1.0)
         idnet.cmd_train(a)
-        ev = json.load(open(os.path.join(d, "idnet", "eval_mcc.json")))
-        assert ev["days"]["test"] == "2023Aug17" and ev["test_day"]["queries"] == 8 * 3
-        assert ev["test_day"]["top1"] >= 0.8                          # easy made-up cows
+        ev = json.load(open(os.path.join(d, "idnet", "eval_id.json")))
+        assert ev["split"]["test"] == "2023Aug17" and ev["test"]["queries"] == 8 * 3
+        assert ev["test"]["top1"] >= 0.8                              # easy made-up cows
         assert ev["test_id_with_not_sure"]["f1"] is not None
         ck = torch.load(os.path.join(d, "idnet", "idnet.pt"), weights_only=False)
         assert "nan" in ck and "enrol_threshold" in ck
@@ -195,7 +196,10 @@ def test_scoring_and_results_page():
         names = {(11, m): "A01" for m in range(10)}
         names.update({(12, m): "A01" for m in range(5, 10)})   # cow 2 named wrong after minute 5
         a = argparse.Namespace(data=d, start=12.0, end=12.17, step=2, match_iou=0.3)
-        res = system.score(a, det_log, {11: "A01", 12: "A02"}, names, t0, t0 + 300, {"cam_1"}, metrics)
+        res = system.score(a, det_log, {11: "A01", 12: "A02"}, names, t0, t0 + 300, {"cam_1"}, metrics,
+                           {"unseen": [2], "seen": [1]})
+        g = res["identification"]["by_cow_group"]
+        assert g["seen"]["with_not_sure"]["recall"] == 1.0 and g["unseen"]["with_not_sure"]["recall"] == 0.0
         assert res["detector"]["recall"] == 1.0 and res["tracking"]["idf1"] == 1.0
         assert res["album"]["album_cows"] == 2 and res["album"]["purity"] == 1.0
         idr = res["identification"]["with_not_sure"]
@@ -207,7 +211,54 @@ def test_scoring_and_results_page():
         fake_mcc(os.path.join(d, "mcc"))
         idnet.cmd_train(argparse.Namespace(feats=os.path.join(d, "mcc"), out=os.path.join(w, "idnet"), max_error=0.05,
                                            epochs=1, patience=1, P=8, min_len=3, max_len=8, drop=0.1, noise=0.01, d=32,
-                                           layers=1, heads=2, dropout=0.0, lr=2e-3, wd=0.0, temperature=0.1, seed=0))
+                                           layers=1, heads=2, dropout=0.0, lr=2e-3, wd=0.0, temperature=0.1, seed=0,
+                               split="days", val_cows=3, test_cows=5, split_seed=0, time_aug=1.0))
         summarize.main(["--work", w, "--out", os.path.join(d, "res")])
         page = open(os.path.join(d, "res", "RESULTS.md")).read()
         assert "ID F1" in page and "IDF1" in page
+
+
+def test_one_barn_split_by_cow():
+    """MmCows-like boxes over a day -> idcrops -> ID transformer trained on some cows, tested on others."""
+    import data_mmcows
+    import idnet
+    rng = np.random.default_rng(3)
+    cows, dim = 16, 48
+    proto = rng.normal(size=(cows, dim))
+    frames, rows, feats = [], [], []
+    t0 = 1690261200.0                                            # 00:00 local on 25 July
+    for k in range(0, 24 * 60, 20):                              # a frame every 20 min, 2 cameras
+        ts = t0 + 60 * k
+        win = 12 <= C.local_hour(ts) < 15
+        for cam in ("cam_1", "cam_2"):
+            for c in range(cows):
+                rows.append({"frame": len(frames), "cow": c, "box": [0.1, 0.1, 0.2, 0.2]})
+                feats.append(proto[c] + rng.normal(scale=0.5, size=dim))
+            frames.append({"cam": cam, "ts": ts, "split": "window" if win else "train", "boxes": [], "path": ""})
+    with tempfile.TemporaryDirectory() as d:
+        np.savez(os.path.join(d, "assoc.npz"), box_feats=np.array(feats, np.float16), scene=np.zeros((1, 144, 4)))
+        for name, data in (("frames.jsonl", frames), ("assoc_rows.jsonl", rows)):
+            with open(os.path.join(d, name), "w") as fh:
+                for r in data:
+                    fh.write(json.dumps(r) + "\n")
+        json.dump({"encoder": "stub", "dim": dim}, open(os.path.join(d, "assoc_meta.json"), "w"))
+        data_mmcows.main(["idcrops", "--out", d, "--train-every", "1200", "--seq-len", "6"])
+        ic = os.path.join(d, "idcrops")
+        crops = [json.loads(l) for l in open(os.path.join(ic, "crops.jsonl"))]
+        assert {r["day"] for r in crops} == {"A", "B"}
+        n_window = sum(1 for f in frames if f["split"] == "window") * cows
+        assert len(crops) == len(rows) - n_window                # nothing from 12:00-15:00
+        assert max(len([r for r in crops if (r["day"], r["cow"], r["seq"]) == k])
+                   for k in {(r["day"], r["cow"], r["seq"]) for r in crops}) <= 6
+        a = argparse.Namespace(feats=ic, out=os.path.join(d, "idnet"), max_error=0.05, epochs=4, patience=4, P=8,
+                               min_len=2, max_len=6, drop=0.1, noise=0.01, d=32, layers=1, heads=2, dropout=0.0,
+                               lr=2e-3, wd=0.0, temperature=0.1, seed=0, split="cows", val_cows=3, test_cows=5,
+                               split_seed=0, time_aug=0.02)
+        idnet.cmd_train(a)
+        ev = json.load(open(os.path.join(d, "idnet", "eval_id.json")))
+        sp = ev["split"]
+        assert sp["by"] == "cows" and len(sp["train"]) == 8 and len(sp["val"]) == 3 and len(sp["test"]) == 5
+        assert not set(sp["test"]) & set(sp["train"]) and not set(sp["val"]) & set(sp["train"])
+        assert ev["test"]["queries"] > 0 and ev["test"]["top1"] >= 0.6     # new cows, easy made-up ones
+        ck = torch.load(os.path.join(d, "idnet", "idnet.pt"), weights_only=False)
+        assert ck["split"]["test"] == sp["test"]

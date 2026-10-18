@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Version 14 (A): cow identification only, trained from scratch on MultiCamCows2024 + MmCows.
+# Version 14 (A): cow identification only, trained from scratch.
+#   ID_DATA=mmcows (default): one barn - the ID transformer trains on 8 of MmCows' 16 cows and is
+#                            tested on 5 others it never saw (3 more pick the epoch)
+#   ID_DATA=mcc:             it trains on MultiCamCows2024 (90 cows, data.bris.ac.uk) instead
 #
 #   bash herd/v14/run_v14.sh          start in tmux session "v14" (hours: downloads + training)
 #   bash herd/v14/run_v14.sh log      follow the log
@@ -9,7 +12,7 @@
 #   1 Python environment                     5 ID transformer: train + test day (MultiCamCows)
 #   2 version 10's detector + DINOv2          6 association transformer: train + test window (MmCows)
 #   3 MmCows labels, frames, 1-s stream       7 onboarding test on MmCows: association vs camera-alone
-#   4 MultiCamCows2024 crops -> DINOv2        8 RESULTS.md, RUN14A_RESULTS.tar, V14A_MODELS.tgz
+#   4 MultiCamCows2024 (ID_DATA=mcc only)     8 RESULTS.md, RUN14A_RESULTS.tar, V14A_MODELS.tgz
 #
 # Knobs: WORK=/workspace  MODELS_URL (version 10's archive)  DET_NAME (its detector folder)
 #        LIVE_STEP=2 (s between 1-second frames used)  TRAIN_EVERY=60  WINDOW_EVERY=15
@@ -36,6 +39,7 @@ END="${END:-15}"
 ID_EPOCHS="${ID_EPOCHS:-60}"
 ASSOC_EPOCHS="${ASSOC_EPOCHS:-60}"
 MCC_WAIT_H="${MCC_WAIT_H:-12}"
+ID_DATA="${ID_DATA:-mmcows}"
 MCC_ZIP="${MCC_ZIP:-}"
 MCC_URL="${MCC_URL:-https://data.bris.ac.uk/datasets/tar/2inu67jru7a6821kkgehxg3cv2.zip}"
 export HF_HOME="$WORK/hf-cache"
@@ -57,7 +61,7 @@ if [ -z "${V14_IN_TMUX:-}" ]; then
     if tmux has-session -t "=$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     mkdir -p "$V"
     knobs=""
-    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP; do
+    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP ID_DATA; do
         knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env V14_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/run_v14.sh"); echo; echo '[run_v14.sh finished]'; exec bash"
@@ -105,8 +109,10 @@ step "3/8  MmCows: labels, labelled frames (training side + test window), the 1-
 "$PY" data_mmcows.py inspect --out "$V/mmcows" | tee "$V/mmcows_live_inspect.txt"
 "$PY" data_mmcows.py live --out "$V/mmcows" --live-step "$LIVE_STEP" --start "$START" --end "$END"
 "$PY" data_mmcows.py feats --out "$V/mmcows"
+"$PY" data_mmcows.py idcrops --out "$V/mmcows" --train-every "$TRAIN_EVERY" --start "$START" --end "$END"
 
-step "4/8  MultiCamCows2024: the whole zip, then crops -> DINOv2"
+step "4/8  MultiCamCows2024: the whole zip, then crops -> DINOv2 (ID_DATA=$ID_DATA)"
+if [ "$ID_DATA" = mcc ]; then
 # The whole zip as one file (36.5 GB, resumes where a cut transfer stopped), then read from disk.
 # data.bris.ac.uk's file server is sometimes down for hours: keep trying for MCC_WAIT_H hours.
 Z="${MCC_ZIP:-$V/MultiCamCows2024.zip}"
@@ -124,10 +130,17 @@ for j in 1 2 3 4 5 6; do
     [ "$j" = 6 ] && { echo "!! the MultiCamCows fetch failed 6 times"; exit 1; }
     echo "   fetch stopped - resume in 10 min"; sleep 600
 done
+else echo "skipped: the ID transformer trains on MmCows cows (ID_DATA=mmcows)"; fi
 
-step "5/8  ID transformer (from scratch): MultiCamCows days 1-5 -> day 6 picks -> day 7 tests"
-if [ -f "$V/idnet/idnet.pt" ] && [ -f "$V/idnet/eval_mcc.json" ]; then echo "trained already"; else
-    "$PY" idnet.py train --feats "$V/mcc" --out "$V/idnet" --epochs "$ID_EPOCHS"; fi
+if [ "$ID_DATA" = mcc ]; then
+    step "5/8  ID transformer (from scratch): MultiCamCows days 1-5 -> day 6 picks -> day 7 tests"
+    ID_ARGS=(--feats "$V/mcc" --split days)
+else
+    step "5/8  ID transformer (from scratch): MmCows, 8 cows train, 3 pick the epoch, 5 never seen test it"
+    ID_ARGS=(--feats "$V/mmcows/idcrops" --split cows --val-cows 3 --test-cows 5 --time-aug 0.02 --P 8)
+fi
+if [ -f "$V/idnet/idnet.pt" ] && [ -f "$V/idnet/eval_id.json" ]; then echo "trained already"; else
+    "$PY" idnet.py train "${ID_ARGS[@]}" --out "$V/idnet" --epochs "$ID_EPOCHS"; fi
 
 step "6/8  Association transformer (from scratch): MmCows outside the test window -> the window"
 if [ -f "$V/assoc/assoc.pt" ] && [ -f "$V/assoc/eval_assoc.json" ]; then echo "trained already"; else
@@ -143,9 +156,9 @@ step "8/8  Results and models"
 R="$WORK/RUN14A_RESULTS"
 rm -rf "$R"; mkdir -p "$R"
 "$PY" summarize.py --work "$V" --out "$R"
-for f in idnet/eval_mcc.json idnet/history.json assoc/eval_assoc.json assoc/history.json \
+for f in idnet/eval_id.json idnet/history.json assoc/eval_assoc.json assoc/history.json \
          system/system_assoc.json system/system_iou_per_camera.json mcc_inspect.txt mmcows_live_inspect.txt \
-         mcc/meta.json mcc/samples.png mmcows/assoc_meta.json log.txt; do
+         mcc/meta.json mcc/samples.png mmcows/assoc_meta.json mmcows/idcrops/meta.json log.txt; do
     [ -f "$V/$f" ] && { mkdir -p "$R/$(dirname "$f")"; cp "$V/$f" "$R/$f"; }
 done
 cp "$DET/det_train_meta.json" "$R/detector_det_train_meta.json"
