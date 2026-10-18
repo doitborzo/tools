@@ -42,7 +42,12 @@ export HF_HOME="$WORK/hf-cache"
 
 case "${1:-}" in
     log)  [ -f "$LOG" ] || { echo "no log yet: $LOG"; exit 1; }; exec tail -n 100 -F "$LOG" ;;
-    stop) tmux kill-session -t "=$SESSION" 2>/dev/null && echo "stopped $SESSION" || echo "$SESSION not running"; exit 0 ;;
+    stop) tmux kill-session -t "=$SESSION" 2>/dev/null && echo "stopped $SESSION" || echo "$SESSION not running"
+          # the run ignores hang-ups (to survive a closed terminal): end it and what it started for real
+          for p in $(pgrep -f '^bash .*run_v14\.sh' || true); do [ "$p" != "$$" ] && kill "$p" 2>/dev/null; done
+          pkill -f 'python.* (data_mcc|data_mmcows|idnet|assoc|system|summarize)\.py' 2>/dev/null || true
+          pkill -f 'curl .*MultiCamCows2024\.zip' 2>/dev/null || true
+          exit 0 ;;
     "") ;;
     *) echo "usage: $0 [log|stop]"; exit 2 ;;
 esac
@@ -109,7 +114,7 @@ if [ ! -f "$Z" ]; then
     for i in $(seq 0 $((MCC_WAIT_H * 6))); do
         if curl -L -# --fail --retry 3 -C - -o "$Z.part" "$MCC_URL"; then mv "$Z.part" "$Z"; break; fi
         [ "$i" -ge $((MCC_WAIT_H * 6)) ] && { echo "!! data.bris.ac.uk did not send the zip for $MCC_WAIT_H h"; exit 1; }
-        echo "   data.bris.ac.uk not answering - try again in 10 min ($(date '+%T'), $(du -h "$Z.part" 2>/dev/null | cut -f1) so far)"; sleep 600
+        echo "   data.bris.ac.uk not answering - try again in 10 min ($(date '+%T'), $( { du -h "$Z.part" 2>/dev/null || echo "0"; } | cut -f1) so far)"; sleep 600
     done
 fi
 SRC=(--zip "$Z")
