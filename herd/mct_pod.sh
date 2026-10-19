@@ -61,6 +61,7 @@ fi
 
 mkdir -p "$M"
 exec > >(tee -a "$LOG") 2>&1
+trap 'echo "!! $(basename "$0") stopped at line $LINENO: $BASH_COMMAND (exit $?)"' ERR   # never silently
 step() { echo; echo "=== $*   [$(date '+%F %T')]"; }
 PY="$H/.venv/bin/python"
 export HF_HOME="$WORK/hf-cache"

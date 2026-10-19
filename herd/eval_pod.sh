@@ -57,6 +57,7 @@ fi
 
 mkdir -p "$E"
 exec > >(tee -a "$LOG") 2>&1
+trap 'echo "!! $(basename "$0") stopped at line $LINENO: $BASH_COMMAND (exit $?)"' ERR   # never silently
 step() { echo; echo "=== $*   [$(date '+%F %T')]"; }
 PY="$H/.venv/bin/python"
 export HF_HOME="$WORK/hf-cache"
@@ -86,7 +87,7 @@ if [ -z "${IDENTITY:-}" ]; then
     done
 fi
 if [ -z "${IDENTITY:-}" ]; then
-    a="$(ls -t "$WORK"/herd_reid_*.tgz 2>/dev/null | head -1)"
+    a="$(ls -t "$WORK"/herd_reid_*.tgz 2>/dev/null | head -1 || true)"   # none: ls fails, pipefail would end the script
     [ -n "$a" ] || { echo "!! no identity model: upload herd_reid_*.tgz to $WORK (or IDENTITY=<identity.pt>)"; exit 1; }
     echo "unpacking $a"
     U="$WORK/_unpack_reid"

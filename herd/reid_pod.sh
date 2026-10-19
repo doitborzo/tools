@@ -79,6 +79,7 @@ fi
 
 mkdir -p "$R"
 exec > >(tee -a "$LOG") 2>&1
+trap 'echo "!! $(basename "$0") stopped at line $LINENO: $BASH_COMMAND (exit $?)"' ERR   # never silently
 step() { echo; echo "=== $*   [$(date '+%F %T')]"; }
 PY="$H/.venv/bin/python"
 export HF_HOME="$WORK/hf-cache"
@@ -125,7 +126,7 @@ fi
 # an earlier run's frame vectors (herd_reid_feat_*.tgz, this script's second export): the sets in it are
 # neither fetched nor labelled nor extracted again - a pod trains at once, and a set whose server is
 # down (data.bris, 404 in 2026-10) still comes in
-a="$(ls -t "$WORK"/herd_reid_feat_*.tgz 2>/dev/null | head -1)"
+a="$(ls -t "$WORK"/herd_reid_feat_*.tgz 2>/dev/null | head -1 || true)"   # none: ls fails, pipefail would end the script
 if [ -n "$a" ] && [ ! -f "$R/feat/.from_archive" ]; then
     step "Frame vectors from $a"
     mkdir -p "$R"
