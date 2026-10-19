@@ -73,6 +73,8 @@ docker/data on your computer is /data here: the config, the recordings, everythi
   show-zone --config /data/barn.toml --camera cam1 --image /data/cam1.jpg   a camera's zone drawn
   record --config /data/barn.toml --out /data/rec --minutes 60
                                  every camera at once -> /data/rec/<camera>_<time>.mp4
+  fix-videos --videos /data/rec --out /data/rec_fixed
+                                 damaged recordings (broken metadata, decoder errors) -> clean .mp4
   barn video --config /data/barn.toml --videos /data/rec --out /data/barn_video
                                  recordings -> tracks for naming the cows
   barn sheet --cache /data/barn_video/training_cache --out /data/barn_video/tracks.html

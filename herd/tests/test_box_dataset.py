@@ -237,3 +237,12 @@ def test_file_frames_on_the_recordings_own_clock():
         ts = [t for t, _ in pipeline.frames_from(path, 1000.0)]
         assert len(ts) == 15 and ts[0] == 1000.0 and abs(ts[-1] - 1002.8) < 0.05
         assert all(b > a for a, b in zip(ts, ts[1:]))
+
+
+def test_fix_videos_command():
+    import fix_videos
+    enc = fix_videos.command("in.mkv", "out.mp4", 25.0)
+    assert enc[:2] == ["ffmpeg", "-nostdin"] and "discardcorrupt" in " ".join(enc) and "setpts=PTS-STARTPTS,fps=25.0" in enc
+    assert enc[-1] == "out.mp4" and "libx264" in enc
+    cp = fix_videos.command("in.mkv", "out.mp4", 25.0, copy=True)
+    assert "copy" in cp and "libx264" not in cp

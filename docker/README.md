@@ -125,6 +125,18 @@ docker compose run --rm herd record --config /data/barn.toml --out /data/rec --m
 The files are named as the tools read them (`rec/cam1_2026-10-20_06-00-00.mp4`). Recordings made
 elsewhere work too: copy them into `docker/data/rec/`, named by camera id and local start time.
 
+**Damaged recordings.** A recorder's file can play in a player and still be read wrong by the tools:
+`h264 ... error while decoding` in the log, one camera making no bursts, the clock of a camera standing
+still. Encode them again into clean .mp4 (same names, steady frame rate, broken frames dropped) and use
+that folder:
+
+```bash
+docker compose run --rm herd fix-videos --videos /data/rec --out /data/rec_fixed
+```
+
+`--copy` only re-wraps the stream (fast; enough when just the container is broken). Then pass
+`--videos /data/rec_fixed` to the commands below (and to `zones page`).
+
 **Naming the cows** (`herd/SETUP.md` section 11):
 
 ```bash

@@ -165,6 +165,7 @@ time on tracks no cow could be given.
 | `degrade.py` | bursts spoilt on purpose (occlusion, mud, blur, dark): what the quality heads learn on |
 | `barn_dataset.py` | the barn's own bursts (training cache, live or from recordings: `barn video`): the labelling page, `merges.csv`, the export to the identity model (`barn` in `reid.py`) and to `train.py --extra-train` |
 | `zone_page.py` | the cameras' masks and excluded zones drawn on their pictures -> `[[cameras]]` |
+| `fix_videos.py` | damaged recordings encoded again into clean .mp4 the tools read |
 | `record.py` | every camera recorded at once, files named as the dataset tools read them |
 | `box_dataset.py` | cow boxes on frames of the barn's recordings: the detector's guess, a page to correct them, COCO export for `run_pod.sh detector` |
 | `cbvd_bursts.py` | CBVD-5 -> bursts + keyframes -> Stage A vectors |
