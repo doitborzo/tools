@@ -36,8 +36,9 @@ from v14common import iou, local_hour, read_jsonl
 
 
 def hour_of(text):
-    h, m = text.split(":")
-    return int(h) + int(m) / 60.0
+    """HH:MM or HH:MM:SS -> hours."""
+    p = [int(x) for x in text.split(":")] + [0]
+    return p[0] + p[1] / 60.0 + p[2] / 3600.0
 
 
 def colour(name):
@@ -125,6 +126,7 @@ def render(args):
     size = (W * cols, H * rows_n + head)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     out = Writer(args.out, args.fps, size)
+    repeat = max(1, int(round(args.fps * step))) if args.realtime else 1     # real time: each step shown `step` s
     dark = {}
     for c in cams:
         if masks.get(c) is not None:
@@ -188,18 +190,20 @@ def render(args):
             canvas[head + r * H: head + (r + 1) * H, c * W:(c + 1) * W] = tile
         clock = C.dt.datetime.fromtimestamp(t, C.MMCOWS_TZ).strftime("%H:%M:%S")
         phase = "SETUP (building the album)" if setup else "IDENTIFYING"
-        cv2.putText(canvas, f"MmCows 25 Jul {clock}   {phase}   tracking: {args.tag}", (10, 26),
+        cv2.putText(canvas, f"{args.title}MmCows 25 Jul {clock}   {phase}   tracking: {args.tag}", (10, 26),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(canvas, (f"labelled boxes so far: right {tally['right']}  wrong {tally['wrong']}  "
                              f"not named {tally['no name']} (its guess right {tally['guess right']})  "
                              f"not boxed {tally['no box']}") if not setup else
                     "white = MmCows label (every 15 s); colours = album cows; T<n> = track not in the album",
                     (10, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
-        out.add(canvas)
+        for _ in range(repeat):
+            out.add(canvas)
         if n % 50 == 0:
             print(f"\r  {n + 1}/{len(frames)} frames", end="", flush=True)
     out.close()
-    print(f"\n[video] {len(frames)} frames ({len(frames) / args.fps:.0f} s at {args.fps} fps) -> {args.out}"
+    print(f"\n[video] {len(frames)} moments ({len(frames) * repeat / args.fps:.0f} s of video"
+          f"{', real time' if args.realtime else f' at {args.fps} fps'}) -> {args.out}"
           + (f"; labelled boxes: {dict(tally)}" if tally else ""), flush=True)
     return dict(tally)
 
@@ -209,9 +213,11 @@ def main(argv=None):
     p.add_argument("--data", required=True, help="data_mmcows.py's folder (live.jsonl, labels.jsonl, masks.npz)")
     p.add_argument("--system", required=True, help="system.py's --out (tracks_<tag>.jsonl, names_<tag>.json)")
     p.add_argument("--tag", default="assoc", choices=("assoc", "iou_per_camera"))
-    p.add_argument("--from", dest="time_from", default="13:00", help="local time, HH:MM")
+    p.add_argument("--from", dest="time_from", default="13:00", help="local time, HH:MM or HH:MM:SS")
     p.add_argument("--to", dest="time_to", default="13:10")
     p.add_argument("--fps", type=float, default=5.0, help="video frames per second (one per 2-s step: 5 = 10x speed)")
+    p.add_argument("--realtime", action="store_true", help="play at the barn's speed: each moment repeated to last its step")
+    p.add_argument("--title", default="", help="text before the header, e.g. 'v14 (B)  '")
     p.add_argument("--width", type=int, default=1920)
     p.add_argument("--match-iou", type=float, default=0.3)
     p.add_argument("--out", required=True)

@@ -32,10 +32,17 @@ def main(argv=None):
     sys_b = load(os.path.join(a.work, "system", "system_iou_per_camera.json"))
     sp = (idn or {}).get("split") or {}
     by_cows = sp.get("by") == "cows"
-    L = ["# Version 14 (A): cow identification" + (", one barn (MmCows): different cows for training and testing"
+    ver = "B" if ((sys_a or {}).get("settings") or {}).get("way") == "B" else "A"
+    L = [f"# Version 14 ({ver}): cow identification" + (", version 14 (A)'s weights (one barn, MmCows)" if ver == "B" and not idn else ", one barn (MmCows): different cows for training and testing"
                                                    if by_cows else ", trained on MultiCamCows2024 + MmCows"), "",
          "Nothing from CBVD-5. Detector: version 10's, not retrained. DINOv2-S frozen. The ID transformer "
          "and the association transformer trained from scratch.", ""]
+    if ver == "B":
+        L += ["Version 14 (B) uses version 14 (A)'s weights, nothing retrained. At onboarding it measures the "
+              "barn's average cow in the setup hour and takes it out of every fingerprint before the album is built; "
+              "the album threshold is set from the setup hour too, without labels (the same track a minute later = "
+              "the same cow, two tracks seen together = two cows). The 'not sure' model was fitted on A's "
+              "similarities, so B always answers. Way A is scored on the same run.", ""]
     if idn:
         t, prf, alw = idn["test"], idn["test_id_with_not_sure"], idn["test_id_always_answer"]
         if by_cows:
@@ -86,6 +93,21 @@ def main(argv=None):
               f"| ID precision / recall, with 'not sure' | {pct(i1['precision'])} / {pct(i1['recall'])} |",
               f"| **ID F1** | **{pct(i1['f1'])}** |",
               f"| ID F1, always answering | {pct(i2['f1'])} |", ""]
+        st = s.get("settings") or {}
+        if st.get("way"):
+            way_txt = {"A": "A (fingerprints as they come)", "B": "B (the barn's average cow taken out first)"}
+            L.insert(len(L) - 1, f"| album built by way | {way_txt.get(st['way'], st['way'])}, threshold {st.get('enrol_threshold')} |")
+            cal = st.get("self_calibration")
+            if cal:
+                L.insert(len(L) - 1, f"| threshold from the setup hour (no labels) | same-track pairs {cal.get('same_pairs')} "
+                                     f"(10th pct {cal.get('same_p10')}), seen-together pairs {cal.get('different_pairs')} "
+                                     f"(99th pct {cal.get('different_p99')}) |")
+        o = s.get("other_way")
+        if o:
+            oa, oi, oi2 = o["album"], o["identification"]["with_not_sure"], o["identification"]["always_answer"]
+            L.insert(len(L) - 1, f"| **way {o['way']}, same run**: album cows / purity / coverage | {oa['album_cows']} / "
+                                 f"{pct(oa['purity'])} / {pct(oa['coverage'])} |")
+            L.insert(len(L) - 1, f"| **way {o['way']}, same run**: ID F1 (always answering) | {pct(oi['f1'])} ({pct(oi2['f1'])}) |")
         for g, v in (s["identification"].get("by_cow_group") or {}).items():
             L.insert(len(L) - 1, f"| ID F1, {g.replace('_', ' ')}: cows {v['cows']} | {pct(v['with_not_sure']['f1'])} "
                                  f"(always answering {pct(v['always_answer']['f1'])}) |")

@@ -46,6 +46,7 @@ MCC_ZIP="${MCC_ZIP:-}"
 MCC_URL="${MCC_URL:-https://data.bris.ac.uk/datasets/tar/2inu67jru7a6821kkgehxg3cv2.zip}"
 PRETRAINED="${PRETRAINED:-}"
 VIDEO_END="${VIDEO_END:-13.5}"
+CENTER="${CENTER:-}"; NAME="${NAME:-}"; REALTIME="${REALTIME:-}"; CLIPS="${CLIPS:-}"; FPS="${FPS:-}"; TITLE="${TITLE:-}"
 export HF_HOME="$WORK/hf-cache"
 
 case "${1:-}" in
@@ -65,7 +66,7 @@ if [ -z "${V14_IN_TMUX:-}" ]; then
     if tmux has-session -t "=$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     mkdir -p "$V"
     knobs=""
-    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP ID_DATA PRETRAINED VIDEO_END; do
+    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP ID_DATA PRETRAINED VIDEO_END CENTER NAME REALTIME CLIPS FPS TITLE; do
         knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env V14_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/run_v14.sh"); echo; echo '[run_v14.sh finished]'; exec bash"

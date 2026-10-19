@@ -173,24 +173,43 @@ def run(args):
                                 last_minute, dev, args.min_frames)
     print(flush=True)
 
-    # --- album from the setup minutes
+    # --- album from the setup minutes, then identification (scoreboards + ID desk), both ways:
+    #     A = the fingerprints as they come; B = the barn's "average cow" removed first (v14 B)
     setup_m = args.setup_min
-    alb_P, alb_ids, track_album = enrol([r for r in minute_recs if r[0] < setup_m], enrol_thr, args.min_minutes)
-    print(f"[system] album: {len(set(alb_ids.tolist())) if len(alb_ids) else 0} cows from "
-          f"{len({r[1] for r in minute_recs if r[0] < setup_m})} setup tracks (threshold {enrol_thr})", flush=True)
-    # --- identification after setup: scoreboards + ID desk
-    names = identify([r for r in minute_recs if r[0] >= setup_m], alb_P, alb_ids, nan, args.ema)
-
-    # --- scoring against the labels
     sp = idck.get("split") or {}
     groups = ({"unseen_by_id_model (its test cows)": sp["test"], "id_model_val_cows": sp["val"],
                "id_model_train_cows": sp["train"]} if sp.get("by") == "cows" else None)
-    res = score(args, det_log, track_album, names, t_start, t_setup, cams, metrics, groups)
-    res["settings"] = {k: getattr(args, k) for k in ("step", "setup_min", "start", "end", "assoc", "det_threshold",
-                                                     "calib", "max_gap", "min_frames", "min_minutes", "ema",
-                                                     "scene_every")}
-    res["settings"].update({"pair_threshold": pair_thr, "enrol_threshold": enrol_thr,
-                            "nan_threshold": (nan or {}).get("threshold")})
+    setup_recs = [r for r in minute_recs if r[0] < setup_m]
+    out = {}
+    for way in ("A", "B"):
+        recs, thr, nan_w, calib = minute_recs, enrol_thr, nan, None
+        if way == "B":
+            if len(setup_recs) < 3:
+                continue
+            c = centering(setup_recs)
+            recs = [(m, tid, apply_centering(c, fp), *rest) for m, tid, fp, *rest in minute_recs]
+            thr, calib = self_threshold([r for r in recs if r[0] < setup_m], det_log, t_start)
+            calib = {**calib, "setup_fingerprints": c["fingerprints"], "biggest_direction_share": round(c["top_share"], 4)}
+            thr = thr if thr is not None else 0.5
+            nan_w = None          # the "not sure" model was fitted on A's similarities: B always answers
+        alb_P, alb_ids, track_album = enrol([r for r in recs if r[0] < setup_m], thr, args.min_minutes)
+        print(f"[system:{way}] album: {len(set(alb_ids.tolist())) if len(alb_ids) else 0} cows from "
+              f"{len({r[1] for r in recs if r[0] < setup_m})} setup tracks (threshold {thr})", flush=True)
+        names = identify([r for r in recs if r[0] >= setup_m], alb_P, alb_ids, nan_w, args.ema)
+        res = score(args, det_log, track_album, names, t_start, t_setup, cams, metrics, groups)
+        res["settings"] = {k: getattr(args, k) for k in ("step", "setup_min", "start", "end", "assoc", "det_threshold",
+                                                         "calib", "max_gap", "min_frames", "min_minutes", "ema",
+                                                         "scene_every", "center")}
+        res["settings"].update({"way": way, "pair_threshold": pair_thr, "enrol_threshold": thr,
+                                "nan_threshold": (nan_w or {}).get("threshold"), "self_calibration": calib})
+        out[way] = (res, names, track_album)
+    primary = "B" if args.center == "on" and "B" in out else "A"
+    res, names, track_album = out[primary]
+    other = "A" if primary == "B" else "B"
+    if other in out:
+        o = out[other][0]
+        res["other_way"] = {"way": other, "album": {k: v for k, v in o["album"].items() if k != "mapping"},
+                            "identification": o["identification"], "settings": o["settings"]}
     os.makedirs(args.out, exist_ok=True)
     tag = "assoc" if am is not None else "iou_per_camera"
     write_json(os.path.join(args.out, f"system_{tag}.json"), res)
@@ -301,6 +320,48 @@ def fingerprints(idm, tracks, t0, t1, minute, dev, min_frames):
         return []
     fp, qmax, qmean = I.embed(idm, seqs, dev, max_len=64)
     return [(minute, tid, fp[i], float(qmax[i]), float(qmean[i]), area) for i, (tid, area) in enumerate(meta)]
+
+
+def centering(recs, shrink=1.0):
+    """v14 (B): this barn's "average cow" and spread, from the setup fingerprints alone (no labels):
+    the mean is taken out and every direction scaled to an even spread (whitening, shrunk towards
+    the mean spread so a few setup minutes cannot blow up noise)."""
+    X = np.stack([r[2] for r in recs]).astype(np.float64)
+    mu = X.mean(0)
+    _, S, Vt = np.linalg.svd(X - mu, full_matrices=False)
+    lam = S ** 2 / max(1, len(X) - 1)
+    scale = 1.0 / np.sqrt(lam + shrink * lam.mean() + 1e-12)
+    return {"mu": mu, "V": Vt, "scale": scale, "fingerprints": len(X), "top_share": float(lam[0] / lam.sum())}
+
+
+def apply_centering(c, fp):
+    z = ((np.asarray(fp, np.float64) - c["mu"]) @ c["V"].T) * c["scale"]
+    return (z / (np.linalg.norm(z) + 1e-12)).astype(np.float32)
+
+
+def self_threshold(recs, det_log, t_start):
+    """The enrolment threshold from the setup hour itself, no labels: the same track a minute
+    later is the same cow; two tracks in one camera at one moment are two cows. Halfway between
+    the different-cow pairs' 99th percentile and the same-cow pairs' 10th (as on the val cows)."""
+    fp = {(r[1], r[0]): r[2] for r in recs}
+    at = collections.defaultdict(set)
+    for tm, cam, _, tid, _ in det_log:
+        at[(tm, cam)].add(tid)
+    neg = set()
+    for (tm, _), tids in at.items():
+        m = int((tm - t_start) // 60)
+        ts = sorted(tids)
+        for i in range(len(ts)):
+            for j in range(i + 1, len(ts)):
+                if (ts[i], m) in fp and (ts[j], m) in fp:
+                    neg.add((ts[i], ts[j], m))
+    s_neg = [float(fp[(a, m)] @ fp[(b, m)]) for a, b, m in neg]
+    s_pos = [float(fp[(t, m)] @ fp[(t, m + 1)]) for t, m in fp if (t, m + 1) in fp]
+    if len(s_neg) < 20 or len(s_pos) < 20:
+        return None, {"same_pairs": len(s_pos), "different_pairs": len(s_neg)}
+    lo, hi = float(np.percentile(s_neg, 99)), float(np.percentile(s_pos, 10))
+    return round((lo + hi) / 2, 4), {"same_pairs": len(s_pos), "different_pairs": len(s_neg),
+                                     "different_p99": round(lo, 4), "same_p10": round(hi, 4)}
 
 
 def enrol(recs, thr, min_minutes, k_max=6):
@@ -459,6 +520,11 @@ def report(res, tag):
     print(f"[system:{tag}] album {al['album_cows']} cows for {al['true_cows']} true (purity {p(al['purity'])}, "
           f"coverage {p(al['coverage'])}, duplicates {al['duplicates']}); identification precision "
           f"{p(idn['precision'])} recall {p(idn['recall'])} F1 {p(idn['f1'])}", flush=True)
+    o = res.get("other_way")
+    if o:
+        oi, oa = o["identification"]["with_not_sure"], o["album"]
+        print(f"[system:{tag}] way {res['settings']['way']} above; way {o['way']}: album {oa['album_cows']} cows (purity "
+              f"{p(oa['purity'])}, coverage {p(oa['coverage'])}), identification F1 {p(oi['f1'])}", flush=True)
 
 
 def main(argv=None):
@@ -483,6 +549,9 @@ def main(argv=None):
     p.add_argument("--min-minutes", type=int, default=5, help="setup fingerprints for an album cow")
     p.add_argument("--ema", type=float, default=0.5, help="weight of the newest minute on the scoreboard")
     p.add_argument("--match-iou", type=float, default=0.3, help="detection to labelled box, for scoring")
+    p.add_argument("--center", choices=("on", "off"), default="on",
+                   help="v14 (B): take the barn's average cow out of the fingerprints before the album "
+                        "(on), or not (off = v14 A); the other way is scored too, as other_way")
     args = p.parse_args(argv)
     run(args)
 

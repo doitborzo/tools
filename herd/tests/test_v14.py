@@ -317,10 +317,40 @@ def test_video_from_a_made_up_system_run():
                    "album_to_cow": {"A01": 5, "A02": 9}}, open(os.path.join(sysd, "names_assoc.json"), "w"))
         out = os.path.join(d, "v.mp4")
         tally = video.render(argparse.Namespace(data=data, system=sysd, tag="assoc", time_from="12:59",
-                                                time_to="13:01", fps=5.0, width=640, match_iou=0.3, out=out))
+                                                time_to="13:01", fps=5.0, width=640, match_iou=0.3, out=out,
+                                                realtime=False, title=""))
         cap = cv2.VideoCapture(out)
         n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         ok, frame = cap.read()
         assert ok and n >= 45 and frame.shape[1] == 640
         # after 13:00: cam_1's cow 5 named A01 = cow 5 (right), cam_2's cow 9 named A01 too (wrong)
         assert tally["right"] >= 1 and tally["wrong"] >= 1
+
+
+def test_v14b_taking_out_the_average_cow_splits_the_album():
+    import system
+    rng = np.random.default_rng(5)
+    dim, cows = 32, 6
+    common = rng.normal(size=dim)
+    common /= np.linalg.norm(common)
+    own = rng.normal(size=(cows, dim)) * 0.12                     # small differences between cows
+    t0 = 1690304400.0
+    recs, det_log = [], []
+    for m in range(10):
+        for c in range(cows):
+            tid = 6 if (c == 0 and m >= 5) else c                  # cow 0's track breaks at minute 5
+            fp = common * 3 + own[c] + rng.normal(scale=0.03, size=dim)
+            recs.append((m, tid, (fp / np.linalg.norm(fp)).astype(np.float32), 1.0, 0.5, 0.1))
+            for k in range(0, 60, 2):
+                det_log.append((t0 + 60 * m + k, "cam_1", [0.1, 0.1, 0.2, 0.2], tid, 0.9))
+    sims = [float(a[2] @ b[2]) for a in recs[:6] for b in recs[:6] if a is not b]
+    assert min(sims) > 0.87                                       # way A: everyone looks alike
+    _, ids_a, _ = system.enrol(recs, 0.8735, 5)
+    assert len(set(ids_a.tolist())) == 1                          # ... one album cow: the A01 collapse
+    c = system.centering(recs)
+    rb = [(m, tid, system.apply_centering(c, fp), *rest) for m, tid, fp, *rest in recs]
+    thr, cal = system.self_threshold(rb, det_log, t0)
+    assert thr is not None and cal["different_pairs"] > 0 and cal["same_p10"] > cal["different_p99"]
+    _, ids_b, ta = system.enrol(rb, thr, 5)
+    assert len(set(ids_b.tolist())) == cows                       # way B: one album cow per cow
+    assert ta[0] == ta[6]                                         # cow 0's two tracks: one album cow
