@@ -553,6 +553,15 @@ them back, knowingly). `reid.py extract` stops if a cow of any set is both train
 `train` checks it again on the bursts. Still true: cows 1-10 are trained on (7/25 outside 11:30-15:30)
 and are in mct_eval's hour - its `look` for cows 11-16 and the calibration are the clean numbers.
 
+**2026-10-19: data.bris down.** The Bristol sets (MultiCamCows, Cows2021, OpenCows) answered 404 - their
+storage, not our URLs (the dataset pages open, even readme.txt is 404). Trained without them (142 cows
+instead of 312) on 7/25 every 15 s, the model learnt MmCows' ten cows and little else: cows 11-16 by
+look 51% -> 32%, the NaN model answering 3% of bursts at 1% error (MmCows' thousands of other-camera
+queries set it). Since then: `reid_pod.sh` stops before training when `REQUIRE` (multicam, cows2021) is
+not in; the NaN model takes at most 1000 queries of each set; and every run also exports
+`herd_reid_feat_<date>.tgz` - every set's frame vectors and MmCows' crop index (~1-2 GB) - which a
+next pod unpacks and trains from without fetching any training set.
+
 **The check alone, on a new pod** (`bash herd/eval_pod.sh`): with `herd_models_*.tgz` and
 `herd_reid_*.tgz` in `/workspace` it unpacks the identity model (`reid/id_model_all/`), recalibrates its
 thresholds on MmCows 7/25 alone (outside mct_eval's hours, ~4 GB read; the old file kept as

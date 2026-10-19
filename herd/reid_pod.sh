@@ -33,6 +33,9 @@
 #        UWB_DAYS="" (neck-tag days, e.g. "0722 0728 0801": off - ~4% of their labels are another cow, mostly a
 #        held-out one)  UWB_EVERY=30  WAIT_MIN=20 (how long the GPU waits for a background download)
 #        TRAIN=0 (no training: the existing model's thresholds again - reid.py calibrate - and the MmCows check)
+#        REQUIRE="multicam cows2021" (no training if these are not in; REQUIRE= trains without them)
+# A herd_reid_feat_*.tgz in WORK (the second export of a run) brings every set's frame vectors: nothing
+# of those sets is fetched again.
 # Every step resumes. Licences: MmCows CC BY-NC-SA, CoBRA and SideViewCows CC BY 4.0, the Bristol sets NCGL.
 
 set -euo pipefail
@@ -62,7 +65,9 @@ if [ -z "${HERD_REID_IN_TMUX:-}" ]; then
     fi
     mkdir -p "$R"
     knobs=""
-    for v in WORK RUN DET SOURCES EPOCHS MCT MINUTES MODELS INIT UWB_DAYS UWB_EVERY LABEL_EVERY WAIT_MIN TRAIN; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
+    for v in WORK RUN DET SOURCES EPOCHS MCT MINUTES MODELS INIT UWB_DAYS UWB_EVERY LABEL_EVERY WAIT_MIN TRAIN REQUIRE; do
+        [ -n "${!v+x}" ] && knobs+="$v=$(printf '%q' "${!v}") "            # only those set: unset stays unset
+    done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env HERD_REID_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/reid_pod.sh"); echo; echo '[reid finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log   ($LOG)"
@@ -114,6 +119,19 @@ if [ -z "${DET:-}" ]; then
            | sort -rn | head -1 | cut -d' ' -f2-)"
 fi
 
+# an earlier run's frame vectors (herd_reid_feat_*.tgz, this script's second export): the sets in it are
+# neither fetched nor labelled nor extracted again - a pod trains at once, and a set whose server is
+# down (data.bris, 404 in 2026-10) still comes in
+a="$(ls -t "$WORK"/herd_reid_feat_*.tgz 2>/dev/null | head -1)"
+if [ -n "$a" ] && [ ! -f "$R/feat/.from_archive" ]; then
+    step "Frame vectors from $a"
+    mkdir -p "$R"
+    tar -xzf "$a" -C "$WORK"
+    touch "$R/feat/.from_archive"
+    ls "$R/feat"
+fi
+have() { [ -f "$R/feat/$1/bursts.jsonl" ] && [ -f "$R/feat/$1/crops.npz" ] && [ -f "$R/feat/.from_archive" ]; }
+
 step "Environment (run_pod.sh step 1)"
 HERD_IN_TMUX=1 SETUP_ONLY=env WORK="$WORK" RUN=setup bash "$HERE/run_pod.sh"
 if [ -n "${DET:-}" ] && grep -qs '"kind": *"rfdetr"' "$DET/det_train_meta.json"; then
@@ -127,7 +145,10 @@ want() { [[ " $SOURCES " == *" $1 "* ]]; }
 bg_fetch() {   # name, sources... -> a background fetch with its own log; its pid in BG_<name>
     local name="$1"; shift
     local srcs=()
-    for s_ in "$@"; do want "$s_" && srcs+=("$s_"); done
+    for s_ in "$@"; do
+        if have "$s_"; then echo "$s_: frame vectors from the archive, not fetched"; continue; fi
+        want "$s_" && srcs+=("$s_")
+    done
     [ ${#srcs[@]} -gt 0 ] || return 0
     echo "fetching ${srcs[*]} in the background (log: $R/fetch_$name.log)"
     "$PY" "$HERE/reid.py" fetch --data "$R" --sources "${srcs[@]}" > "$R/fetch_$name.log" 2>&1 &
@@ -180,7 +201,9 @@ if [ "${MCT:-1}" = "1" ]; then                      # the last step's frames (mc
     MCT_PID=$!
 fi
 
-if want mmcows; then
+if have mmcows; then
+    echo "mmcows: frame vectors from the archive, not fetched / labelled / extracted"
+elif want mmcows; then
     [ -n "${DET:-}" ] && [ -f "$DET/det_train_meta.json" ] || { echo "!! no detector best/ under $H (DET=<it>)"; exit 1; }
     echo "detector $DET"
     # no neck-tag days unless UWB_DAYS names them: their labels are ~4% wrong, mostly an untagged cow
@@ -209,6 +232,19 @@ fi
 bg_wait bristol multicam cows2021 opencows
 bg_wait zenodo cobra sideview
 
+# without the sets most cows come from the model learns too few cows and over-fits MmCows' ten
+# (2026-10-19, data.bris down: 142 cows instead of 312, cows 11-16 by look 51% -> 32%): stop instead
+missing=()
+for s_ in ${REQUIRE-multicam cows2021}; do
+    want "$s_" && [ ! -f "$R/feat/$s_/bursts.jsonl" ] && missing+=("$s_")
+done
+if [ ${#missing[@]} -gt 0 ] && [ "${TRAIN:-1}" != "0" ]; then
+    echo "!! ${missing[*]} not in (their fetch failed - see $R/fetch_bristol.log): no training without them."
+    echo "   Run again later (what is in is kept), upload a herd_reid_feat_*.tgz that has them, or"
+    echo "   REQUIRE= to train without them anyway."
+    exit 1
+fi
+
 if [ "${TRAIN:-1}" = "0" ] && [ -f "$OUT/identity.pt" ]; then
     step "No training (TRAIN=0): the thresholds of $OUT/identity.pt again"
     "$PY" "$HERE/reid.py" calibrate --data "$R" --identity "$OUT/identity.pt"
@@ -233,4 +269,14 @@ for p in "$OUT" "$R/mmcows/label.json" "$LOG" "$WORK/mct/mct_eval.json" "$WORK/m
 done
 (cd "$WORK" && tar -czf "$T" "${parts[@]}")
 echo "identity model + results: $T   (scp -P <port> root@<ip>:$T .)"
+# the frame vectors of every set (and MmCows' crop index the frame-vs-frame loss reads): a next pod
+# trains from them without fetching anything (~1-2 GB)
+F="$WORK/export/herd_reid_feat_$(date +%Y%m%d_%H%M).tgz"
+fparts=()
+for p in "$R"/feat/*/crops.npz "$R"/feat/*/crops.npz.json "$R"/feat/*/bursts.jsonl "$R"/feat/*/meta.json \
+         "$R/raw/mmcows/index.jsonl"; do
+    [ -e "$p" ] && fparts+=("${p#"$WORK"/}")
+done
+[ ${#fparts[@]} -gt 0 ] && (cd "$WORK" && tar -czf "$F" "${fparts[@]}") && \
+    echo "frame vectors for the next pod: $F   (keep it: with it a pod fetches no training set)"
 echo "in the barn: [model] identity = \".../reid/$(basename "$OUT")/identity.pt\" (abstain.json next to it is used)"

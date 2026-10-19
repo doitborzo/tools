@@ -292,3 +292,10 @@ def test_a_held_out_cow_never_in_training():
     else:
         raise AssertionError("a held-out cow in training was let through")
     reid.check_split("cows2021", [{"cow": "a"}, {"cow": "b"}], {"b"})    # split by the held-out set
+
+
+def test_nan_model_rows_balanced_across_sets():
+    import reid
+    rows = [{"src": "mmcows", "sim": 0.9}] * 5000 + [{"src": "cobra", "sim": 0.8}] * 200
+    out = reid.balance_rows(rows, cap=1000)
+    assert sum(r["src"] == "mmcows" for r in out) == 1000 and sum(r["src"] == "cobra" for r in out) == 200

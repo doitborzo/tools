@@ -978,7 +978,8 @@ def reid_scores(split, fp, qfp=None, qmax=None, qmean=None):
                 second = float(other.max()) if other.size and other.max() > -2 else -1.0
                 rows.append({"sim": float(s[q, b]), "margin": float(s[q, b]) - second, "correct": int(hit[q]),
                              "quality_max": float(qmax[q]) if qmax is not None else 0.0,
-                             "quality_mean": float(qmean[q]) if qmean is not None else 0.0, "area": 0.05})
+                             "quality_mean": float(qmean[q]) if qmean is not None else 0.0, "area": 0.05,
+                             "src": str(src[q])})
     return res, rows
 
 
@@ -1010,9 +1011,21 @@ def mm_line(m, before=None):
             f"{was('frame_other_camera_top1_mmcows')}{mom}")
 
 
+def balance_rows(rows, cap=1000, seed=0):
+    """At most cap rows of each set: MmCows' one day gives thousands of other-camera queries, and alone they
+    would set the NaN model (2026-10-19: answers 3% of bursts at 1% error)."""
+    by = collections.defaultdict(list)
+    for r in rows:
+        by[r.get("src", "")].append(r)
+    rng = random.Random(seed)
+    return [r for v in by.values() for r in (rng.sample(v, cap) if len(v) > cap else v)]
+
+
 def fit_abstain(rows, max_error, out_path):
-    """The NaN model on these fingerprints: abstain.py's logistic over (sim, margin, quality, size)."""
+    """The NaN model on these fingerprints: abstain.py's logistic over (sim, margin, quality, size), each
+    set weighing at most balance_rows' cap."""
     import abstain
+    rows = balance_rows(rows)
     X = abstain.feature_matrix(rows)
     y = np.array([r["correct"] for r in rows], float)
     m = abstain.fit_logistic(X, y)
