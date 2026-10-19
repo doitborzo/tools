@@ -727,7 +727,8 @@ def run(cfg, start=None, models=None, max_wall_s=None):
     stop = threading.Event()
     threads = []
     for cam, c in zip(cams, cfg["cameras"]):
-        target = (lambda cam=cam, c=c: run_file(cam, c["url"], start_ts)) if start is not None else \
+        # files: each from its own start (start_ts, when its recording began later than the others')
+        target = (lambda cam=cam, c=c: run_file(cam, c["url"], c.get("start_ts", start_ts))) if start is not None else \
                  (lambda cam=cam, c=c: run_live(cam, lambda: frames_from(c["url"]), stop))
         th = threading.Thread(target=target, daemon=True)
         th.start()

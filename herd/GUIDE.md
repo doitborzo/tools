@@ -664,7 +664,8 @@ bash herd/export_pod.sh          # three archives in WORK/export: models (detect
 | `run --config barn.toml` | run in the barn |
 | `report --config barn.toml csv\|alerts\|verdict\|alert-stats\|daily` | reports |
 | `gallery --config barn.toml` | the cows the system knows |
-| `barn sheet\|export\|build ...` | the barn's own cows named by hand, for training (section 4.9, 8.1; SETUP.md 11) |
+| `barn sheet\|export\|video\|build ...` | the barn's own cows named by hand, for training (section 4.9, 8.1; SETUP.md 11) |
+| `boxes frames\|page\|export ...` | cow boxes on the barn's own frames, for the detector (section 8.2; SETUP.md 12) |
 
 One table of every run: `python cowbench/summary.py /workspace/herd /workspace/lora-runs`.
 
@@ -815,15 +816,18 @@ the only fair test of the barn's own cameras.
 
 **How to finish:**
 
-1. Cut frames from the barn's videos and draw boxes around the cows in CVAT. The tools
-   are in `cowbench/label/`: `prelabel.py` (pre-labels with the current detector),
-   `cvat2ava.py` (exports to the CBVD-5 format), and the labelling manual
-   `manual_labeling_uk.docx`. A few hundred frames from different cameras and times of
-   day are enough.
-2. Train: `python cowbench/detector.py train --root <dataset> --out /workspace/herd/detector_top
-   --size 1088 --zoom 0.5 --tiles 1 --select f2`.
-3. `herd.py eval-det` on the barn's labelled frames → the threshold into the config.
-   Then `stress`.
+1. `herd.py boxes frames` cuts frames from the barn's recordings (a frame every 30 s, at most 300 a
+   camera, greyed and sized as the detector sees them) with the current detector's boxes as a first
+   guess, and writes a labelling page; a person corrects the boxes in the browser and saves
+   `labels.json`; `herd.py boxes export` makes `herd_det_barn_<date>.tgz` (COCO train / valid, the
+   valid frames whole hours of a camera). Step by step: `SETUP.md` section 12. A few hundred frames
+   from different cameras and times of day are enough. (`cowbench/label/` - prelabel, CVAT,
+   `cvat2ava.py` - is the way for posture and activity labels too.)
+2. Train on the pod: `DET_ARCH=rfdetr DET_INIT=<the current best/> EXTRA=zenodo,mmcows bash
+   herd/run_pod.sh detector` - with the archive in `/workspace`, its training frames join CBVD-5 and
+   the public sets three times each (`BARN_REPEAT`), and every detector is scored on its held-out
+   frames (`extra_det/eval_extra.json`, row `barn`).
+3. The barn's best-F1 threshold into `[detector] threshold`. Then `stress`.
 
 ### 8.3 Lameness — needs labels
 
@@ -921,7 +925,8 @@ model sees fine detail: coat pattern, the jaw.
 | `report.py` | days per cow, CSV, alerts, verdicts |
 | `eval_det.py` | the whole path on the detector's boxes, threshold sweep |
 | `stress.py` | load test |
-| `barn_dataset.py` | the barn cache, the track sheet, building the identity training set |
+| `barn_dataset.py` | the barn cache (live, or from recordings), the track labelling page, the identity training sets |
+| `box_dataset.py` | frames of the barn's recordings, the box correcting page, the detector's COCO set |
 | `show_crops.py` | a picture of what the model sees (boxes, crops, a burst) |
 | `show_zone.py` | a picture of the working zone: which cows are kept, which are not tried |
 | `run_pod.sh` | everything on a GPU pod with one command |

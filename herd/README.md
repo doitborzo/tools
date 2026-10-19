@@ -143,6 +143,9 @@ python herd/herd.py report --config barn.toml alert-stats
 python herd/herd.py gallery --config barn.toml
 python herd/herd.py barn sheet --cache barn/training_cache --out tracks.html   # name the cows -> merges.csv
 python herd/herd.py barn export --cache barn/training_cache --merges merges.csv # -> herd_barn_feat_*.tgz (reid_pod.sh)
+python herd/herd.py barn video --config barn.toml --videos rec --out barn_video  # recordings -> barn_video/training_cache
+python herd/herd.py boxes frames --config barn.toml --videos rec --out boxes     # frames + boxes.html to correct
+python herd/herd.py boxes export --data boxes --labels labels.json             # -> herd_det_barn_*.tgz (run_pod.sh detector)
 ```
 
 CSV columns: `period_start, period_end, cow_id, label, observed_min, lying_min,
@@ -158,7 +161,8 @@ time on tracks no cow could be given.
 | `model.py` | DINOv2 frame encoder, frame heads, temporal transformer, losses |
 | `motion.py` | the rhythm of a burst's crops: what rumination (chewing) looks like |
 | `degrade.py` | bursts spoilt on purpose (occlusion, mud, blur, dark): what the quality heads learn on |
-| `barn_dataset.py` | the barn's own bursts (training cache): the labelling page, `merges.csv`, the export to the identity model (`barn` in `reid.py`) and to `train.py --extra-train` |
+| `barn_dataset.py` | the barn's own bursts (training cache, live or from recordings: `barn video`): the labelling page, `merges.csv`, the export to the identity model (`barn` in `reid.py`) and to `train.py --extra-train` |
+| `box_dataset.py` | cow boxes on frames of the barn's recordings: the detector's guess, a page to correct them, COCO export for `run_pod.sh detector` |
 | `cbvd_bursts.py` | CBVD-5 -> bursts + keyframes -> Stage A vectors |
 | `train.py` | Stage A training, re-ID / posture / rumination scoring, cowbench export |
 | `eval_det.py` | the 1 fps heads on the detector's boxes: detector error included, cut-off sweep |

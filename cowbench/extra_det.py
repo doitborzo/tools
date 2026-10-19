@@ -444,9 +444,10 @@ def cmd_cbvd_videos(args):
     print(f"[cbvd-videos] {len(vids)} val clips -> {out} (annotation files in {dest}/annotations)")
 
 
-def _sources(s):
+def _sources(s, data=None):
+    """Set names; with data (eval), also a set already there that is not fetched (the barn's: box_dataset.py)."""
     names = [x.strip() for x in s.split(",") if x.strip()]
-    bad = [x for x in names if x not in SOURCES]
+    bad = [x for x in names if x not in SOURCES and not (data and os.path.isdir(os.path.join(data, x)))]
     if bad:
         sys.exit(f"unknown source(s) {bad}; known: {', '.join(SOURCES)}")
     return names
@@ -481,7 +482,7 @@ def cmd_eval(args):
             own = json.load(fh)["threshold"]
         tag = os.path.basename(os.path.dirname(os.path.abspath(best)))
         report[tag] = {"detector": os.path.abspath(best), "threshold": own}
-        for name in _sources(args.sources):
+        for name in _sources(args.sources, args.data):
             folder = os.path.join(args.data, name, "valid")
             if not os.path.exists(os.path.join(folder, "_annotations.coco.json")):
                 print(f"[extra-eval] {name}: not fetched, skipped")

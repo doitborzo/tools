@@ -107,7 +107,7 @@ class TrainingCache:
 
 def read_cache(folder):
     rows = []
-    for day in sorted(os.listdir(folder)):
+    for day in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
         p = os.path.join(folder, day, "index.jsonl")
         if os.path.exists(p):
             with open(p, encoding="utf-8") as fh:
@@ -479,6 +479,73 @@ def cmd_export(args):
               f"from the others - name the same cows on more days")
 
 
+def cmd_video(args):
+    """Recordings of the barn's cameras -> the training cache, as the live barn would fill it - but every
+    burst kept, a burst every --burst-every s, into a store of its own (the barn's database untouched).
+    The files are played in sessions (the cameras that started together); a file done is not played again."""
+    import copy
+    import shutil
+    from common import load_config, recordings, sessions
+    cfg = load_config(args.config)
+    tz = cfg["farm"]["timezone_offset_hours"]
+    ids = [c["id"] for c in cfg["cameras"]]
+    if args.video:
+        if not args.start:
+            sys.exit("--video needs --start (when the recordings began, local time)")
+        t0 = dt.datetime.fromisoformat(args.start)
+        t0 = (t0 if t0.tzinfo else t0.replace(tzinfo=dt.timezone(dt.timedelta(hours=tz)))).timestamp()
+        recs = []
+        for v in args.video:
+            cam, _, path = v.partition("=")
+            if cam not in ids or not os.path.exists(path):
+                sys.exit(f"--video {v}: want <camera id>=<file>, a camera of {args.config} ({', '.join(ids)})")
+            recs.append((cam, path, t0))
+        groups = [recs]
+    else:
+        recs, bad = recordings(args.videos, ids, tz)
+        if bad:
+            print(f"[video] {len(bad)} files without a camera id ({', '.join(ids)}) or a time in their name - "
+                  f"skipped, e.g. {bad[0]}", flush=True)
+        if not recs:
+            sys.exit(f"no recordings under {args.videos} named <camera>..<YYYY-MM-DD_HH-MM-SS> (or --video cam=file "
+                     f"--start ISO)")
+        groups = sessions(recs, args.gap)
+    out = os.path.abspath(args.out)
+    os.makedirs(out, exist_ok=True)
+    done_path = os.path.join(out, "videos_done.txt")
+    done = set(open(done_path, encoding="utf-8").read().split("\n")) if os.path.exists(done_path) else set()
+    if args.gallery and not os.path.exists(os.path.join(out, "gallery")):
+        shutil.copytree(args.gallery, os.path.join(out, "gallery"))      # its guesses help naming the cows
+        print(f"[video] the gallery copied from {args.gallery}", flush=True)
+    cfg["store"]["path"] = os.path.join(out, "herd.sqlite")
+    cfg["training_cache"].update(enabled=True, every_n=1, folder=os.path.join(out, "training_cache"))
+    cfg["sampling"]["burst_every_s"] = args.burst_every
+    todo = [g for g in groups if not all(p in done for _, p, _ in g)]
+    print(f"[video] {sum(len(g) for g in groups)} recordings in {len(groups)} sessions, {len(todo)} to play "
+          f"(a burst every {args.burst_every:g} s a camera, every one kept) -> {out}", flush=True)
+    import pipeline
+    models = None
+    for k, g in enumerate(todo, 1):
+        c = copy.deepcopy(cfg)
+        cams = {cam["id"]: cam for cam in c["cameras"]}
+        c["cameras"] = [dict(cams[cam], url=path, start_ts=ts) for cam, path, ts in g]
+        start = min(ts for _, _, ts in g)
+        when = dt.datetime.fromtimestamp(start, dt.timezone(dt.timedelta(hours=tz))).strftime("%Y-%m-%d %H:%M")
+        print(f"[video] session {k}/{len(todo)}: {when}, {', '.join(cam for cam, _, _ in g)}", flush=True)
+        models = models or pipeline.Models(c)
+        t = dt.datetime.now()
+        stats = pipeline.run(c, start, models=models)
+        print(f"[video]   done in {(dt.datetime.now() - t).total_seconds() / 60:.0f} min, "
+              f"{sum(v.get('bursts_missed', 0) for v in stats.values())} bursts missed; "
+              f"{json.dumps({cam: {k: v for k, v in s.items() if k.startswith('id_')} for cam, s in stats.items()})}",
+              flush=True)
+        with open(done_path, "a", encoding="utf-8") as fh:
+            fh.writelines(p + "\n" for _, p, _ in g)
+    rows = read_cache(cfg["training_cache"]["folder"])
+    print(f"[video] the cache: {len(rows)} bursts of {len({r['track'] for r in rows})} tracks on "
+          f"{len({r['day'] for r in rows})} days -> next: herd.py barn sheet --cache {cfg['training_cache']['folder']}")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -496,6 +563,15 @@ def main(argv=None):
     s.add_argument("--merges", default=None, help="a merges.csv saved earlier: its names filled in")
     s.add_argument("--names", default=None, help="the barn's names.json: the gallery's guess shown as the ear tag")
     s.add_argument("--thumbs", type=int, default=12, help="thumbnails a track")
+    v = sub.add_parser("video", help="recorded camera files -> the training cache (every burst), a store of its own")
+    v.add_argument("--config", required=True, help="the barn's config: its cameras (ids, masks), models")
+    v.add_argument("--videos", default=None, help="a folder of recordings named <camera>..<date and time>")
+    v.add_argument("--video", action="append", default=[], help="cam1=file.mp4 (with --start), instead of --videos")
+    v.add_argument("--start", default=None, help="--video: when the recordings began, local time (ISO)")
+    v.add_argument("--out", required=True, help="its store, gallery and training_cache/")
+    v.add_argument("--burst-every", type=float, default=20.0, help="a burst every this many s a camera")
+    v.add_argument("--gap", type=float, default=300.0, help="recordings starting within this many s play together")
+    v.add_argument("--gallery", default=None, help="the barn's gallery/ copied in first: its guesses on the page")
     x = sub.add_parser("export", help="named tracks -> herd_barn_feat_*.tgz for the identity model (reid_pod.sh)")
     x.add_argument("--cache", required=True)
     x.add_argument("--merges", required=True, help="identity,track per line (the page's Save merges.csv)")
@@ -505,7 +581,9 @@ def main(argv=None):
     x.add_argument("--val-share", type=float, default=1 / 6, help="cows held out (never trained on)")
     x.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
-    {"build": cmd_build, "sheet": cmd_sheet, "export": cmd_export}[args.cmd](args)
+    if args.cmd == "video" and not (args.videos or args.video):
+        p.error("video: --videos DIR or --video cam=file")
+    {"build": cmd_build, "sheet": cmd_sheet, "export": cmd_export, "video": cmd_video}[args.cmd](args)
 
 
 if __name__ == "__main__":

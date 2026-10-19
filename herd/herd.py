@@ -23,8 +23,12 @@ Running:
 Barn data for identity (once the barn runs with [training_cache] enabled):
     herd.py barn sheet --cache C --out tracks.html     the labelling page: name each track's cow -> merges.csv
     herd.py barn export --cache C --merges merges.csv   -> herd_barn_feat_*.tgz for the identity model (reid_pod.sh)
+    herd.py barn video --config barn.toml --videos DIR --out D   recorded camera files -> D/training_cache
     herd.py barn build --cache C --out F [--merges merges.csv] [--val-from DAY]
     then train --extra-train F/train, eval --extra-val F/val
+Cow boxes on the barn's cameras (detector training):
+    herd.py boxes frames --config barn.toml --videos DIR --out D   frames + the detector's guess + D/boxes.html
+    herd.py boxes export --data D --labels labels.json            -> herd_det_barn_*.tgz (run_pod.sh detector)
 
 Reports:
     herd.py report --config barn.toml csv [--end DAY]       the 3-day CSV
@@ -105,6 +109,9 @@ def main():
     if cmd == "barn":
         import barn_dataset
         return barn_dataset.main(argv)
+    if cmd == "boxes":
+        import box_dataset
+        return box_dataset.main(argv)
     if cmd == "report":
         import report
         return report.main(argv)

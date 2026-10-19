@@ -245,6 +245,31 @@ Let it run 1–2 weeks. Check: `ls /srv/herd/barn/training_cache` — a folder p
 `index.jsonl` and a folder per camera. With `[mct]` on, one track follows a cow across cameras;
 without it, a track is one camera's.
 
+**1, from recordings instead.** Files recorded from the barn's cameras give the same cache without
+touching the running barn. Put them in one folder, each named by its camera's id (as in `barn.toml`)
+and the local time it started:
+
+```
+/srv/herd/rec/cam1_2026-10-20_06-00-00.mp4      or   /srv/herd/rec/cam1/20261020T060000.mp4
+/srv/herd/rec/cam2_2026-10-20_06-00-00.mp4
+/srv/herd/rec/cam1_2026-10-21_14-00-00.mp4
+```
+
+(any of `2026-10-20_06-00-00`, `20261020_060000`, `20261020T060000`; .mp4 .mkv .avi .mov .ts). Then:
+
+```bash
+$PY herd.py barn video --config /srv/herd/barn.toml --videos /srv/herd/rec --out /srv/herd/barn_video \
+    --gallery /srv/herd/barn/gallery         # optional: the barn's gallery copied in, its guesses on the page
+```
+
+It plays the files through the whole pipeline (detector, tracker, cameras joined as `[mct]` says),
+every camera's recordings that started together as one session, and keeps **every** burst, one a
+camera every 20 s (`--burst-every`). Everything goes to `--out` — its own database, gallery and
+`training_cache/`; the barn's are not touched. A file played is not played again, so add recordings
+and run it again. It needs the GPU for about as long as the recordings last: run it at a quiet time
+(the live barn shares the card) or on a pod. Then use `--cache /srv/herd/barn_video/training_cache`
+below. Days count more than hours: a few hours on each of 3–5 days beat a whole single day.
+
 **2. Make the labelling page:**
 
 ```bash
@@ -323,7 +348,81 @@ old names), export, train. Each round adds days, and days are what identificatio
 The herd model itself (posture, activity) can also learn from these names: `barn build` and
 `train.py --extra-train` (`GUIDE.md` 8.1).
 
-## 12. Maintenance
+## 12. Your cameras' boxes: a dataset for the detector
+
+The detector was trained on side views (CBVD-5) and public top-down sets. A few hundred frames of the
+barn's own cameras with their cow boxes checked by hand teach it this barn: its angle, light, pens
+and dirt. It needs the same recordings as above (named by camera and time).
+
+**1. Cut frames, with the detector's guess:**
+
+```bash
+$PY herd.py boxes frames --config /srv/herd/barn.toml --videos /srv/herd/rec --out /srv/herd/boxes
+```
+
+A frame every 30 s (`--every`), at most 300 a camera (`--max`) spread over all its recordings;
+frames where nothing moved are skipped. Each frame is cut as the detector sees it in the barn: Full
+HD, the camera's `exclude` zone grey. The current detector draws its boxes on every frame as a
+first guess. It writes `frames/`, `frames.json` and the page `boxes.html` into `--out`. Run it again
+with more recordings: frames already cut are kept.
+
+**2. Correct the boxes** — open `/srv/herd/boxes/boxes.html` in a browser (on another computer: copy
+the whole `boxes/` folder). Green boxes are the detector's; dashed orange ones are cows it was unsure
+of.
+
+- **every cow gets a box**, or the part of her that is visible (a cow behind a rail: the visible part;
+  half out of the frame: the half inside);
+- drag on empty space — a new box; drag a box — move it; drag its corners — resize;
+  **Del** — remove the selected box;
+- a click on a dashed box keeps it, **A** keeps all of them;
+- no boxes in the grey zone (the barn never shows it to the detector);
+- **Enter** — the frame is right: marked done, the next one opens. Only frames marked done are
+  exported; a frame with no cow at all, marked done, teaches "nothing here" — keep some;
+- **S** — skip a frame (spoilt, or you are not sure); **←/→** — move without marking;
+  **Ctrl+Z** — undo; "Detector's boxes" — start the frame again;
+- filters: one camera, only frames not done.
+
+The work is kept in this browser, but **Save labels.json** is the result — press it often. To go on
+later or elsewhere: **Load labels.json** (or `herd.py boxes page --data /srv/herd/boxes --labels
+labels.json`).
+
+How much: 200–400 frames over all cameras, from different times of day (morning, night light,
+feeding) and days. Boxes drawn tightly, the same way on every frame.
+
+**3. Export:**
+
+```bash
+$PY herd.py boxes export --data /srv/herd/boxes --labels labels.json
+```
+
+It writes `herd_det_barn_<date>.tgz`: COCO `train/` and `valid/`. A fifth of the frames are held out
+to check the detector, by whole hours of a camera (`--block-min 60`), so the check never sees a frame
+taken a minute after a training one. With frames from a single hour it stops and asks for more.
+
+**4. Train on the pod.** The detector is fine-tuned together with CBVD-5 (so it keeps what it
+knew), so the pod needs CBVD-5 and the current detector:
+
+```bash
+bash herd/run_pod.sh setup                        # the environment and CBVD-5, once per pod
+tar -xzf /workspace/herd_models_*.tgz -C /workspace   # the current detector -> /workspace/herd/detector_*/
+# and herd_det_barn_*.tgz uploaded to /workspace (left packed: the next command takes it in)
+DET_ARCH=rfdetr DET_INIT=/workspace/herd/detector_rfdetr_large_zenodo_mmcows_opencows_ft/best \
+    EXTRA=zenodo,mmcows bash herd/run_pod.sh detector
+bash herd/run_pod.sh log detector                 # follow it
+```
+
+The barn's frames join training three times each (`BARN_REPEAT=3`: a few hundred frames against
+CBVD-5's thousands). After training, the new and the old detectors are scored on the barn's held-out
+frames: `/workspace/extra_det/eval_extra.json`, row `barn`, and a table in the log: recall,
+precision and the **best F1 threshold**. The new detector is
+`/workspace/herd/detector_rfdetr_large_zenodo_mmcows_barn_ft/best`. (`opencows` is left out of
+`EXTRA` above: its server, data.bris, answers 404 since 2026-10.)
+
+**5. Into the barn.** Copy that `best/` folder to the server, set `[detector] weights` to it and
+`[detector] threshold` to the barn's best-F1 threshold, check with `show_zone.py` (section 3) and
+restart. Only when its recall and precision on `barn` are better than the old detector's.
+
+## 13. Maintenance
 
 - **Backups**, daily, of `/srv/herd/barn/`: `herd.sqlite`, `gallery/`, `names.json`. The
   gallery is the memory of the cows — without it the herd has to be enrolled again.
@@ -331,7 +430,7 @@ The herd model itself (posture, activity) can also learn from these names: `barn
   limit).
 - **Updating the code**: `git pull` in `/opt/herd/tools`, then `sudo systemctl restart herd`.
 
-## 13. Common problems
+## 14. Common problems
 
 - **`cannot open rtsp://…`** — wrong address, login or password, or the camera cannot be
   reached from the server. Check with the same `ffmpeg` command.

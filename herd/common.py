@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sys
 import tomllib
 
@@ -304,6 +305,55 @@ def crop(image_rgb, box, size, margin=0.1):
 
 
 # --------------------------------------------------------------------- io
+
+VIDEO_EXT = (".mp4", ".mkv", ".avi", ".mov", ".ts", ".h264", ".h265", ".dav")
+_STAMP = re.compile(r"(20\d{2})[-_.]?(\d{2})[-_.]?(\d{2})[T _-]?(\d{2})[-_.:h]?(\d{2})[-_.:m]?(\d{2})")
+
+
+def recording_start(path, tz_hours):
+    """The local time in a recording's name (2026-10-20_06-00-00, 20261020T060000, ...) -> unix time, or None."""
+    import datetime as dt
+    m = _STAMP.search(os.path.basename(path)) or _STAMP.search(path)
+    if not m:
+        return None
+    try:
+        t = dt.datetime(*map(int, m.groups()), tzinfo=dt.timezone(dt.timedelta(hours=tz_hours)))
+    except ValueError:
+        return None
+    return t.timestamp()
+
+
+def recordings(folder, cam_ids, tz_hours):
+    """Video files under folder -> ([(camera id, path, start unix time)], [files not understood]): the
+    camera is the config id standing alone in the file's path (cam1 in cam1_2026-10-20_06-00-00.mp4 or
+    cam1/06-00.mp4, not in cam10), the start the local time in its name."""
+    found, bad = [], []
+    ids = sorted(cam_ids, key=len, reverse=True)
+    for d, _, fs in os.walk(folder):
+        for f in sorted(fs):
+            if not f.lower().endswith(VIDEO_EXT):
+                continue
+            path = os.path.join(d, f)
+            rel = os.path.relpath(path, folder)
+            cam = next((c for c in ids if re.search(rf"(?<![A-Za-z0-9]){re.escape(c)}(?![A-Za-z0-9])", rel)), None)
+            ts = recording_start(rel, tz_hours)
+            if cam is None or ts is None:
+                bad.append(path)
+            else:
+                found.append((cam, path, ts))
+    return sorted(found, key=lambda x: (x[2], x[0])), bad
+
+
+def sessions(recs, gap_s=300):
+    """Recordings -> groups played together: each camera once, starts within gap_s of the group's first."""
+    groups = []
+    for cam, path, ts in recs:
+        g = groups[-1] if groups else None
+        if g is None or ts - g[0][2] > gap_s or any(c == cam for c, _, _ in g):
+            groups.append([])
+        groups[-1].append((cam, path, ts))
+    return groups
+
 
 def read_jsonl(path):
     if not os.path.exists(path):

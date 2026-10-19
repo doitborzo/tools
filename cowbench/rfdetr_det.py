@@ -46,10 +46,11 @@ def frames_of(rows):
     return [{"video_id": v, "timestamp": t, "boxes": b} for (v, t), b in out.items()]
 
 
-def write_coco(root, frames, folder, extra=()):
+def write_coco(root, frames, folder, extra=(), repeat=None):
     """Keyframes -> folder/_annotations.coco.json + the images linked in (one class: cow);
     extra: [(source name, its COCO folder of this split, at most this many images or 0)]
-    appended (extra_det.py's sets)."""
+    appended (extra_det.py's sets); repeat {source name: k}: its images k times (a small set - the
+    barn's own few hundred frames - weighs more against CBVD-5's thousands)."""
     from PIL import Image
     import random
     os.makedirs(folder, exist_ok=True)
@@ -79,18 +80,19 @@ def write_coco(root, frames, folder, extra=()):
         by = {}
         for a in d["annotations"]:
             by.setdefault(a["image_id"], []).append(a)
-        for im in ims:
-            i = len(images) + 1
-            fname = f"x_{name}_{im['file_name']}"
-            dst = os.path.join(folder, fname)
-            if not os.path.lexists(dst):
-                try:
-                    os.symlink(os.path.abspath(os.path.join(src, im["file_name"])), dst)
-                except OSError:
-                    shutil.copy(os.path.join(src, im["file_name"]), dst)
-            images.append({"id": i, "file_name": fname, "width": im["width"], "height": im["height"]})
-            for a in by.get(im["id"], []):
-                anns.append({**a, "id": len(anns) + 1, "image_id": i, "category_id": 1})
+        for r in range((repeat or {}).get(name, 1)):
+            for im in ims:
+                i = len(images) + 1
+                fname = f"x_{name}{f'_r{r}' if r else ''}_{im['file_name']}"
+                dst = os.path.join(folder, fname)
+                if not os.path.lexists(dst):
+                    try:
+                        os.symlink(os.path.abspath(os.path.join(src, im["file_name"])), dst)
+                    except OSError:
+                        shutil.copy(os.path.join(src, im["file_name"]), dst)
+                images.append({"id": i, "file_name": fname, "width": im["width"], "height": im["height"]})
+                for a in by.get(im["id"], []):
+                    anns.append({**a, "id": len(anns) + 1, "image_id": i, "category_id": 1})
     with open(os.path.join(folder, "_annotations.coco.json"), "w", encoding="utf-8") as fh:
         json.dump({"images": images, "annotations": anns,
                    "categories": [{"id": 1, "name": "cow", "supercategory": "none"}]}, fh)
@@ -107,6 +109,17 @@ def extra_sources(args):
     return out
 
 
+def repeat(args):
+    """--repeat barn=3 -> {"barn": 3}."""
+    out = {}
+    for r in args.repeat:
+        name, _, k = r.partition("=")
+        if not k.isdigit() or int(k) < 1:
+            sys.exit(f"--repeat {r}: want <set>=<times>, e.g. barn=3")
+        out[name] = int(k)
+    return out
+
+
 def cmd_export(args):
     """The same split as detector.py: CBVD-5 train minus the val clips, 10% of clips held out.
     --extra sets join train (each at most --extra-max images) and valid (the checkpoint is chosen on
@@ -119,7 +132,7 @@ def cmd_export(args):
     for name, fr in (("train", tr), ("valid", dv), ("test", dv)):
         extra = [(x, os.path.join(d, "train" if name == "train" else "valid"), args.extra_max if name == "train" else 0)
                  for x, d in xs]
-        n, a = write_coco(args.root, fr, os.path.join(ds, name), extra)
+        n, a = write_coco(args.root, fr, os.path.join(ds, name), extra, repeat(args) if name == "train" else None)
         print(f"[rfdetr] {name}: {n} images ({len(fr)} CBVD-5 keyframes), {a} cows")
     return ds, dv
 
@@ -275,6 +288,7 @@ def main(argv=None):
     p.add_argument("--extra", nargs="*", default=[],
                    help="more boxes: extra_det.py's source folders (e.g. /workspace/extra_det/zenodo)")
     p.add_argument("--extra-max", type=int, default=0, help="at most this many train images per --extra source")
+    p.add_argument("--repeat", nargs="*", default=[], help="an --extra set's train images k times: barn=3")
     p.add_argument("--fresh", action="store_true")
     args = p.parse_args(argv)
     {"export": cmd_export, "train": cmd_train}[args.stage](args)
