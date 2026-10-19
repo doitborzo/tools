@@ -203,6 +203,14 @@ def test_zones_page_and_apply():
         assert set(cams) == {"cam1", "cam2"} and cams["cam1"]["w"] == 320 and cams["cam1"]["boxes"]
         assert cams["cam1"]["exclude"] == [[0.0, 0.0], [1.0, 0.0], [1.0, 0.2], [0.0, 0.2]]      # from the config
         assert os.path.exists(os.path.join(d, "zones", cams["cam2"]["still"]))
+        # a camera not in the config yet (cam3's recording), named on the command line
+        import shutil as sh
+        sh.copy(os.path.join(rec, "cam1_2026-10-20_06-00-00.mp4"), os.path.join(rec, "cam3_2026-10-20_06-00-00.mp4"))
+        zone_page.main(["page", "--config", cfg, "--videos", rec, "--cameras", "cam1", "cam2", "cam3",
+                        "--detector", "none", "--out", os.path.join(d, "zones3")])
+        html = open(os.path.join(d, "zones3", "zones.html"), encoding="utf-8").read()
+        data = json.loads(html.split("const DATA = ", 1)[1].split(";\n", 1)[0])
+        assert [c["id"] for c in data["cams"]] == ["cam1", "cam2", "cam3"] and data["cams"][2]["still"]
         # the page's Save -> barn.toml
         ct = os.path.join(d, "cameras.toml")
         open(ct, "w").write('[[cameras]]\nid = "cam1"\nurl = "rtsp://a"\nmask = [[0, 0], [1, 0], [1, 1]]\n'

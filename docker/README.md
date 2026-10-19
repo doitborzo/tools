@@ -86,8 +86,11 @@ Docker Desktop's network reaches cameras on the farm's network as the computer d
 section 5):
 
 ```bash
-docker compose run --rm herd zones page --config /data/barn.toml --videos /data/rec --out /data/zones
+docker compose run --rm herd zones page --config /data/barn.toml --videos /data/rec --cameras cam1 cam2 cam3 cam4 \
+    --out /data/zones
 ```
+
+(`--cameras`: the camera ids, also those not in `barn.toml` yet; the recordings are found by them.)
 
 1. Open `docker/data/zones/zones.html`. It shows each camera's picture with the cows the detector
    found, coloured by the zone rule.

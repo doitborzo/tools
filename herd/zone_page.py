@@ -55,6 +55,10 @@ def cmd_page(args):
     from PIL import Image
     cfg = load_config(args.config)
     by_id = {c["id"]: c for c in cfg["cameras"]}
+    for cid in args.cameras or []:               # cameras not in the config yet: they get a block too
+        by_id.setdefault(cid, {"id": cid})
+    if args.cameras:                             # only these, in this order
+        by_id = {cid: by_id[cid] for cid in args.cameras}
     pictures = {}
     for v in args.image:
         cam, _, path = v.partition("=")
@@ -303,6 +307,8 @@ def main(argv=None):
     g.add_argument("--config", required=True)
     g.add_argument("--videos", default=None, help="recordings named <camera>..<date and time>: a still of each camera")
     g.add_argument("--image", action="append", default=[], help="cam1=picture.jpg (instead of, or besides, --videos)")
+    g.add_argument("--cameras", nargs="*", default=None, help="the camera ids (default: the config's), e.g. "
+                   "cam1 cam2 cam3 cam4 - recordings are found by them")
     g.add_argument("--at", type=float, default=30.0, help="the still is this many seconds into the recording")
     g.add_argument("--detector", default=None, help="a best/ folder (default: the config's); none: no cows drawn")
     g.add_argument("--out", required=True)
