@@ -29,6 +29,9 @@ The herd model's fingerprint was taught on CBVD-5, which has no cow ids: it lear
                in mct_eval's hours). Other days have no labels, but cows 1-10 wear a UWB neck tag:
                its position every 15 s, against the detector's boxes on the floor, labels whole tracks
                (tag_tracks; 95% right when checked on 7/25 against the human labels).
+    barn       the barn's own cows, its tracks named by hand (herd.py barn sheet -> barn export ->
+               herd_barn_feat_*.tgz): its bursts as they are, no fetch, no extract; a sixth of the
+               named cows held out (the export decides).
 
     fetch    the crops, read in place from the zips (HTTP Range) -> DATA/raw/<source>/<cow>/...;
              mmcows: frames, labels, tags and projection matrices -> DATA/mmcows/
@@ -102,6 +105,9 @@ SOURCES = {
     "sideview": {"url": {s: f"{ZENODO}/21605650/files/{s}.zip?download=1" for s in ("snapshots", "barn", "parlor")},
                  "licence": "CC BY 4.0", "cite": "Moeller, SideViewCows2026, Zenodo 21605650", "whole": True},
     "mmcows": {"url": MMCOWS, "licence": "CC BY-NC-SA 4.0", "cite": "Vu et al., MmCows, NeurIPS 2024"},
+    # the barn's own cows, labelled by hand (barn_dataset.py sheet -> export): feat/barn comes ready from
+    # herd_barn_feat_*.tgz - nothing to fetch or extract
+    "barn": {"local": True, "licence": "the barn's own footage"},
 }
 SIDEVIEW_STRIDE = {"snapshots": 1, "barn": 5, "parlor": 10}   # video frames: every k-th (neighbours are alike)
 SLOTS, FPS = 175, 25.0                   # the barn's burst: 7 s at 25 fps
@@ -198,6 +204,8 @@ def cmd_fetch(args):
     for src in args.sources:
         if src == "mmcows":
             fetch_mmcows(args)
+            continue
+        if SOURCES[src].get("local"):
             continue
         url = SOURCES[src]["url"] or DET_SOURCES["opencows"]["url"]
         folder = os.path.join(args.data, "raw", src)
@@ -642,6 +650,9 @@ def cmd_extract(args):
             "crop": f.get("crop", 224), "margin": f.get("margin", 0.1)}
     rng = random.Random(args.seed)
     for src in args.sources:
+        if SOURCES[src].get("local"):
+            print(f"[extract] {src}: its frame vectors come ready (barn_dataset.py export)", flush=True)
+            continue
         raw = os.path.join(args.data, "raw", src)
         rows = read_jsonl(os.path.join(raw, "index.jsonl"))
         if not rows:
@@ -685,12 +696,14 @@ def cmd_extract(args):
 class Bursts:
     """One part (train / val) of the sets: every crop's vector once (crops.npz), bursts as lists of crops."""
 
-    def __init__(self, data, sources, part):
+    def __init__(self, data, sources, part, features=None):
         self.feats, self.bursts = {}, []
         for src in sources:
             folder = os.path.join(data, "feat", src)
             rows = read_jsonl(os.path.join(folder, "bursts.jsonl"))
             if not rows:
+                continue
+            if features and not same_features(folder, features):
                 continue
             self.feats[src] = np.load(os.path.join(folder, "crops.npz"))["feats"]
             self.bursts += [dict(r, src=src) for r in rows if r["split"] == part]
@@ -706,6 +719,20 @@ class Bursts:
         """The burst stretched to the barn's 175 frames."""
         f = self.frames(i)
         return f[stretch(len(f))]
+
+
+def same_features(folder, features):
+    """A set's frame vectors read as the model reads them (the barn's come from its own server's encoder)?"""
+    path = os.path.join(folder, "meta.json")
+    if not os.path.exists(path):
+        return True
+    have = json.load(open(path, encoding="utf-8"))
+    keys = ("encoder", "grid", "crop", "margin")
+    if all(have.get(k) is None or have.get(k) == features.get(k) for k in keys):
+        return True
+    print(f"[data] {folder} left out: its frame vectors {({k: have.get(k) for k in keys})}, the model's "
+          f"{({k: features.get(k) for k in keys})}", flush=True)
+    return False
 
 
 def sampler(data, P, K, rng):
@@ -1084,8 +1111,8 @@ def cmd_train(args):
     from common import device
     from model import HerdModel, supcon
     base, ck = HerdModel.load(args.model, map_location=device())
-    tr = Bursts(args.data, args.sources, "train")
-    va = Bursts(args.data, args.sources, "val")
+    tr = Bursts(args.data, args.sources, "train", ck.get("features"))
+    va = Bursts(args.data, args.sources, "val", ck.get("features"))
     if not tr.bursts or not va.bursts:
         sys.exit("no features: reid.py extract first")
     if tr.dim != base.in_dim:
@@ -1196,7 +1223,7 @@ def cmd_calibrate(args):
     ck = torch.load(args.identity, map_location="cpu", weights_only=False)
     model, _ = load_identity(args.identity, ck.get("features", {}), dev)
     sources = args.sources or ck.get("sources") or list(SOURCES)
-    va = Bursts(args.data, sources, "val")
+    va = Bursts(args.data, sources, "val", ck.get("features"))
     if not va.bursts:
         sys.exit("no val features: reid.py extract first")
     mo = Moments(args.data, "val") if "mmcows" in sources else None

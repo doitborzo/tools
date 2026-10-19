@@ -220,15 +220,110 @@ The vet's answers (`verdict`) are what tell whether the alerts are worth anythin
   (identity.pt, abstain.json) to the server and set
   `[model] identity = "/srv/herd/reid/id_model_all/identity.pt"`. Do it before the herd is enrolled
   (or move `gallery/` aside and let it enrol again): the fingerprints change.
-- **Training on your own cows**: `[training_cache] enabled = true` keeps every 10th
-  burst. After a few weeks:
-  1. `herd.py barn sheet` — a page of track thumbnails; mark which tracks are one cow;
-  2. `herd.py barn build`;
-  3. train with `--extra-train`.
+- **Training on your own cows** — the main way to make identification better: section 11.
 
-  This is the main way to make identification better.
+## 11. Your own cows: a labelled dataset
 
-## 11. Maintenance
+The public sets teach what a cow looks like. Only the barn's own cows teach this barn's cameras, light
+and herd — and the check on them is the only honest one. The dataset is made in the barn: the server
+keeps bursts, a person names the cows on a page, the names go to the pod with the bursts.
+
+What is kept: with `[training_cache]` on, every 10th burst of every track — its frame vectors (the
+encoder's output, not video), the track, the gallery's guess and a 112 px thumbnail. About 250 MB an
+hour at 60 cows. Only the vectors leave the barn; the thumbnails stay on the server.
+
+**1. Collect.** In `barn.toml`, then `sudo systemctl restart herd`:
+
+```toml
+[training_cache]
+enabled = true
+every_n = 10          # every 10th burst
+max_gb = 200          # it stops keeping at this size
+```
+
+Let it run 1–2 weeks. Check: `ls /srv/herd/barn/training_cache` — a folder per day, each with
+`index.jsonl` and a folder per camera. With `[mct]` on, one track follows a cow across cameras;
+without it, a track is one camera's.
+
+**2. Make the labelling page:**
+
+```bash
+cd /opt/herd/tools/herd
+$PY herd.py barn sheet --cache /srv/herd/barn/training_cache --out /srv/herd/barn/tracks.html \
+    --names /srv/herd/barn/names.json            # --names: the gallery's guess shown as her ear tag
+```
+
+Open `tracks.html` in a browser. It reads the thumbnails from `training_cache/` next to it. To label
+on another computer, copy the page with the thumbnails only, keeping the layout:
+
+```bash
+rsync -a --include='*/' --include='*.jpg' --include='tracks.html' --exclude='*' \
+    server:/srv/herd/barn/ ./barn/              # then open barn/tracks.html
+```
+
+**3. Name the cows.** One row is one track: the camera, the time, how many bursts, thumbnails spread
+over the track, the gallery's guess.
+
+- Type the cow's ear tag (or any name that stays hers) and press **Enter**: the next track.
+- One name on many tracks makes them one cow — across cameras and days.
+- **= last** repeats the last name. **= UA…/gallery** takes the gallery's guess: check it on the
+  thumbnails first.
+- **x** leaves the track out: two cows in one track (the tracker swapped them), or no cow.
+- **Not sure — leave it empty.** Unnamed tracks are not exported; a wrong name does more harm than
+  none.
+- Filters: a day, a camera, **only unnamed**, and **find a name** (every track of that cow: check
+  they all look alike).
+- The line under the buttons: every cow named so far, with her tracks and days.
+
+How to tell the cows apart: the thumbnails are too small for the ear tag, but a Holstein's
+black-and-white pattern is her own. Name first the cows you know for sure (a striking pattern), and
+the same cows on as many days as you can. When the pattern does not settle it (an all-black cow),
+leave the track empty.
+
+The names are kept in this browser while you work, but **Save merges.csv** is the result — press it
+often (it downloads `merges.csv`: `identity,track` per line, `x` for a track left out). To go on
+later, or on another computer: **Load merges.csv**, or make the page again with
+`--merges merges.csv`.
+
+How much: at least 20 cows, each on 3 or more days. A sixth of the cows are held out to check the
+model, so with fewer cows the check says little. A cow named on one day only teaches little: the
+model must learn the same cow on another day.
+
+**4. Export:**
+
+```bash
+$PY herd.py barn export --cache /srv/herd/barn/training_cache --merges merges.csv
+```
+
+It writes `herd_barn_feat_<date>.tgz` (frame vectors, no pictures) and says how many cows and bursts
+went in and which cows are held out. Held-out cows (a sixth, picked by `--seed`) are never trained on:
+they score the model and set its thresholds. Options: `--min-bursts 4` (a cow with fewer is left
+out), `--val-share`, `--frames 35` (frames kept per burst).
+
+**5. Train on the pod.** Put `herd_barn_feat_*.tgz` in `/workspace` next to `herd_models_*.tgz`
+(and `herd_reid_feat_*.tgz` from an earlier run, if you have it: then no public set is downloaded),
+then:
+
+```bash
+bash herd/reid_pod.sh          # bash herd/reid_pod.sh log - follow it
+```
+
+The log shows `barn: N bursts of the barn's own cows (M of them held out)`. The model trains on the
+public sets and the barn's cows together; `eval.json` scores the held-out cows of every set, the
+barn's among them. `BARN=0` trains without it. The barn's vectors must come from the same herd model
+as the pod's `RUN`; otherwise the set is left out, with a message in the log.
+
+**6. Into the barn.** As in section 10: copy `reid/id_model_all/` (identity.pt, abstain.json,
+thresholds.json) to the server, set `[model] identity`, move `gallery/` aside and restart. The gallery
+enrols the herd again, so `names.json` has to be written again too.
+
+**7. Again.** Keep the cache on. Every few weeks name the new days (`--merges merges.csv` keeps the
+old names), export, train. Each round adds days, and days are what identification needs.
+
+The herd model itself (posture, activity) can also learn from these names: `barn build` and
+`train.py --extra-train` (`GUIDE.md` 8.1).
+
+## 12. Maintenance
 
 - **Backups**, daily, of `/srv/herd/barn/`: `herd.sqlite`, `gallery/`, `names.json`. The
   gallery is the memory of the cows — without it the herd has to be enrolled again.
@@ -236,7 +331,7 @@ The vet's answers (`verdict`) are what tell whether the alerts are worth anythin
   limit).
 - **Updating the code**: `git pull` in `/opt/herd/tools`, then `sudo systemctl restart herd`.
 
-## 12. Common problems
+## 13. Common problems
 
 - **`cannot open rtsp://…`** — wrong address, login or password, or the camera cannot be
   reached from the server. Check with the same `ffmpeg` command.

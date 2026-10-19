@@ -21,7 +21,8 @@ Running:
     herd.py show-ids --config barn.toml --cam cam1 --video F --start ISO   who is who, drawn on a recorded file
 
 Barn data for identity (once the barn runs with [training_cache] enabled):
-    herd.py barn sheet --cache C --out tracks.html     one thumbnail per track, to write merges.csv
+    herd.py barn sheet --cache C --out tracks.html     the labelling page: name each track's cow -> merges.csv
+    herd.py barn export --cache C --merges merges.csv   -> herd_barn_feat_*.tgz for the identity model (reid_pod.sh)
     herd.py barn build --cache C --out F [--merges merges.csv] [--val-from DAY]
     then train --extra-train F/train, eval --extra-val F/val
 

@@ -577,6 +577,15 @@ with no box, so the number cannot be put on one of them. MultiCamCows' thinned c
 thresholds on MmCows 7/25 alone (outside mct_eval's hours, ~4 GB read; the old file kept as
 `thresholds.old.json`; `CALIBRATE=0` skips it) and runs `mct_pod.sh` with it — nothing trained, none
 of the training sets fetched. Results: `export/herd_eval_<date>.tgz`.
+
+**The barn's own cows** (`SETUP.md` section 11). With `[training_cache]` on, the server keeps every
+10th burst; `herd.py barn sheet` makes a labelling page where a person names each track's cow, and
+`herd.py barn export --merges merges.csv` turns the named tracks into the set `barn`
+(`herd_barn_feat_<date>.tgz`: each burst's valid frames, up to 35, as frame vectors). A sixth of the
+named cows are held out whole; unnamed tracks are not exported, since one of them could be a held-out
+cow. `reid_pod.sh` unpacks the newest such archive and adds `barn` to `SOURCES` (`BARN=0`: not); its
+held-out cows are scored and calibrated with the other sets'. A set whose vectors were made with other
+encoder settings than the pod's herd model is left out (`reid.same_features`).
 ---
 
 ## 5. Training on the pod (CBVD-5)
@@ -655,7 +664,7 @@ bash herd/export_pod.sh          # three archives in WORK/export: models (detect
 | `run --config barn.toml` | run in the barn |
 | `report --config barn.toml csv\|alerts\|verdict\|alert-stats\|daily` | reports |
 | `gallery --config barn.toml` | the cows the system knows |
-| `barn sheet\|build ...` | barn data for training (section 8.1) |
+| `barn sheet\|export\|build ...` | the barn's own cows named by hand, for training (section 4.9, 8.1; SETUP.md 11) |
 
 One table of every run: `python cowbench/summary.py /workspace/herd /workspace/lora-runs`.
 
@@ -766,11 +775,12 @@ training, evaluation across tracks and days.
 1. In `barn.toml`: `[training_cache] enabled = true` (by default every 10th burst,
    ~250 MB an hour, capped at 200 GB). Run for 1–2 weeks.
 2. `python herd/herd.py barn sheet --cache <store_dir>/training_cache --out tracks.html` —
-   a page per day, one row per track: thumbnails of the cow and the gallery's guess.
-3. From the page, write `merges.csv`: lines `identity,track` — tracks that are one cow
-   (identity: her ear tag or any name). A few dozen cows over a few days are enough.
-   Without `merges.csv` a track counts as a cow by itself (already minutes to hours, in
-   different postures).
+   the labelling page: a row per track (thumbnails over the track, camera, time, the gallery's
+   guess) and a field for the cow's name. Step by step: `SETUP.md` section 11.
+3. On the page, name the cows (her ear tag): one name on many tracks makes them one cow, `x`
+   leaves a track out. **Save merges.csv** writes `identity,track` per line. A few dozen cows over
+   a few days are enough. Without `merges.csv` a track counts as a cow by itself (already minutes
+   to hours, in different postures).
 4. Build the dataset, the last days held out for evaluation:
    ```bash
    python herd/herd.py barn build --cache <...>/training_cache --out /workspace/herd/features_barn \

@@ -38,6 +38,8 @@
 #        REQUIRE="multicam cows2021" (no training if these are not in; REQUIRE= trains without them)
 # A herd_reid_feat_*.tgz in WORK (the second export of a run) brings every set's frame vectors: nothing
 # of those sets is fetched again.
+# A herd_barn_feat_*.tgz in WORK (herd.py barn export: the barn's own cows, named by hand) adds the set
+# "barn" to SOURCES (BARN=0: not); its held-out cows are scored with the others and set the thresholds.
 # Every step resumes. Licences: MmCows CC BY-NC-SA, CoBRA and SideViewCows CC BY 4.0, the Bristol sets NCGL
 # (non-commercial), CowDataset as on Figshare 16879780.
 
@@ -68,7 +70,7 @@ if [ -z "${HERD_REID_IN_TMUX:-}" ]; then
     fi
     mkdir -p "$R"
     knobs=""
-    for v in WORK RUN DET SOURCES EPOCHS MCT MINUTES MODELS INIT UWB_DAYS UWB_EVERY LABEL_EVERY WAIT_MIN TRAIN REQUIRE; do
+    for v in WORK RUN DET SOURCES EPOCHS MCT MINUTES MODELS INIT UWB_DAYS UWB_EVERY LABEL_EVERY WAIT_MIN TRAIN REQUIRE BARN; do
         [ -n "${!v+x}" ] && knobs+="$v=$(printf '%q' "${!v}") "            # only those set: unset stays unset
     done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
@@ -135,6 +137,19 @@ if [ -n "$a" ] && [ ! -f "$R/feat/.from_archive" ]; then
     ls "$R/feat"
 fi
 have() { [ -f "$R/feat/$1/bursts.jsonl" ] && [ -f "$R/feat/$1/crops.npz" ] && [ -f "$R/feat/.from_archive" ]; }
+# the barn's own cows (herd.py barn export): the newest archive replaces an older one's set
+b="$(ls -t "$WORK"/herd_barn_feat_*.tgz 2>/dev/null | head -1 || true)"
+if [ -n "$b" ] && [ "$(cat "$R/feat/barn/.from" 2>/dev/null || true)" != "$(basename "$b")" ]; then
+    step "The barn's own cows from $b"
+    rm -rf "$R/feat/barn"
+    mkdir -p "$R"
+    tar -xzf "$b" -C "$WORK"
+    basename "$b" > "$R/feat/barn/.from"
+fi
+if [ "${BARN:-1}" = "1" ] && [ -f "$R/feat/barn/bursts.jsonl" ] && [[ " $SOURCES " != *" barn "* ]]; then
+    SOURCES="$SOURCES barn"
+    echo "barn: $(grep -c . "$R/feat/barn/bursts.jsonl") bursts of the barn's own cows ($(grep -c '"split": "val"' "$R/feat/barn/bursts.jsonl" || true) of them held out)"
+fi
 
 step "Environment (run_pod.sh step 1)"
 HERD_IN_TMUX=1 SETUP_ONLY=env WORK="$WORK" RUN=setup bash "$HERE/run_pod.sh"
