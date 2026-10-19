@@ -185,3 +185,30 @@ def test_record_names_files_as_the_tools_read_them():
         assert record.main(["--config", cfg, "--out", out, "--minutes", "0.05", "--cameras", "cam2"]) == 0
         recs, bad = common.recordings(out, ["cam1", "cam2"], 2)
         assert [c for c, _, _ in recs] == ["cam2"] and not bad
+
+
+def test_zones_page_and_apply():
+    import common
+    import zone_page
+    with tempfile.TemporaryDirectory() as d:
+        cfg, rec = _setup(d)
+        sys.modules["detector"] = types.SimpleNamespace(Live=lambda *a, **k: (lambda img: [{"bbox": [0.1, 0.4, 0.3, 0.8], "det_score": 0.9}]))
+        try:
+            zone_page.main(["page", "--config", cfg, "--videos", rec, "--out", os.path.join(d, "zones")])
+        finally:
+            del sys.modules["detector"]
+        html = open(os.path.join(d, "zones", "zones.html"), encoding="utf-8").read()
+        data = json.loads(html.split("const DATA = ", 1)[1].split(";\n", 1)[0])
+        cams = {c["id"]: c for c in data["cams"]}
+        assert set(cams) == {"cam1", "cam2"} and cams["cam1"]["w"] == 320 and cams["cam1"]["boxes"]
+        assert cams["cam1"]["exclude"] == [[0.0, 0.0], [1.0, 0.0], [1.0, 0.2], [0.0, 0.2]]      # from the config
+        assert os.path.exists(os.path.join(d, "zones", cams["cam2"]["still"]))
+        # the page's Save -> barn.toml
+        ct = os.path.join(d, "cameras.toml")
+        open(ct, "w").write('[[cameras]]\nid = "cam1"\nurl = "rtsp://a"\nmask = [[0, 0], [1, 0], [1, 1]]\n'
+                            'exclude = [[[0, 0], [1, 0], [1, 0.1]], [[0, 0.9], [1, 0.9], [1, 1]]]\n\n'
+                            '[[cameras]]\nid = "cam3"\nurl = "rtsp://c"\nfloor_points = [[0.1, 0.9, 0, 0]]\n')
+        zone_page.main(["apply", "--config", cfg, "--cameras", ct])
+        got = common.load_config(cfg)
+        assert [c["id"] for c in got["cameras"]] == ["cam1", "cam3"] and len(got["cameras"][0]["exclude"]) == 2
+        assert got["detector"]["weights"].endswith("det") and os.path.exists(cfg + ".bak")

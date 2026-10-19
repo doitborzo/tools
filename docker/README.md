@@ -82,6 +82,26 @@ Then edit `docker/data/barn.toml`:
 See `herd/SETUP.md` sections 3–4. Paths in it are container paths (`/models/...`, `/data/...`).
 Docker Desktop's network reaches cameras on the farm's network as the computer does.
 
+**The zones, drawn on the cameras' pictures.** With recordings in `docker/data/rec/` (named as in
+section 5):
+
+```bash
+docker compose run --rm herd zones page --config /data/barn.toml --videos /data/rec --out /data/zones
+```
+
+1. Open `docker/data/zones/zones.html`. It shows each camera's picture with the cows the detector
+   found, coloured by the zone rule.
+2. Draw:
+   - `exclude`: neighbouring pens, the yard, cows that are not this pen's;
+   - `mask`: the floor this camera counts;
+   - the `url`.
+3. **Save cameras.toml** and move the file to `docker/data/`.
+4. Apply it:
+
+   ```bash
+   docker compose run --rm herd zones apply --config /data/barn.toml --cameras /data/cameras.toml
+   ```
+
 A still from a camera, and its zone drawn:
 
 ```bash

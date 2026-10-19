@@ -62,6 +62,11 @@ ls /srv/herd/herd/detector_*/best                             # the detector
    pixels). **Every patch of floor must be in exactly one mask** — otherwise a cow is
    counted twice or not at all. A neighbouring pen behind a rail goes into `exclude`: it
    is greyed out before the detector.
+   Easier: draw them on the pictures. `herd.py zones page --config barn.toml --videos <recordings>
+   --out zones` (or `--image cam1=cam1.jpg ...`) writes `zones/zones.html`: each camera's still with
+   the detector's cows coloured by the rule as you draw. **Save cameras.toml**, then
+   `herd.py zones apply --config barn.toml --cameras cameras.toml` puts the `[[cameras]]` blocks into
+   `barn.toml` (the old file kept as `barn.toml.bak`).
 3. **Check the zone** — which cows are kept and which are not:
    ```bash
    $PY herd/show_zone.py --config /srv/herd/barn.toml --camera cam1 --image /srv/herd/cam1.jpg \

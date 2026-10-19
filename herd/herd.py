@@ -26,6 +26,9 @@ Barn data for identity (once the barn runs with [training_cache] enabled):
     herd.py barn video --config barn.toml --videos DIR --out D   recorded camera files -> D/training_cache
     herd.py barn build --cache C --out F [--merges merges.csv] [--val-from DAY]
     then train --extra-train F/train, eval --extra-val F/val
+Cameras' zones, drawn on their pictures:
+    herd.py zones page --config barn.toml --videos DIR --out D    D/zones.html -> cameras.toml
+    herd.py zones apply --config barn.toml --cameras cameras.toml
 Recordings for them:
     herd.py record --config barn.toml --out DIR --minutes 60   every camera at once -> DIR/<cam>_<time>.mp4
 Cow boxes on the barn's cameras (detector training):
@@ -114,6 +117,9 @@ def main():
     if cmd == "boxes":
         import box_dataset
         return box_dataset.main(argv)
+    if cmd == "zones":
+        import zone_page
+        return zone_page.main(argv)
     if cmd == "record":
         import record
         return record.main(argv)

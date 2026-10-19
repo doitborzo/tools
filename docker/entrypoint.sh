@@ -54,6 +54,9 @@ docker/data on your computer is /data here: the config, the recordings, everythi
 
   models                         the models in this image, and the GPU
   init                           /data/barn.toml from the example, with the models filled in
+  zones page --config /data/barn.toml --videos /data/rec --out /data/zones
+                                 a still of every camera -> zones.html: draw masks / excluded zones
+  zones apply --config /data/barn.toml --cameras /data/cameras.toml   the drawn zones into barn.toml
   show-zone --config /data/barn.toml --camera cam1 --image /data/cam1.jpg   a camera's zone drawn
   record --config /data/barn.toml --out /data/rec --minutes 60
                                  every camera at once -> /data/rec/<camera>_<time>.mp4
