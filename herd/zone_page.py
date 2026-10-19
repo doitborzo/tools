@@ -79,10 +79,16 @@ def cmd_page(args):
     if args.detector != "none" and pictures:
         import detector as det_mod
         weights = args.detector or cfg["detector"]["weights"]
-        if weights and os.path.exists(os.path.join(weights, "det_train_meta.json")):
+        if not (weights and os.path.exists(os.path.join(weights, "det_train_meta.json"))):
+            import glob
+            found = sorted(glob.glob(os.path.join(os.environ.get("HERD_MODELS", "/models"), "**", "best",
+                                                  "det_train_meta.json"), recursive=True), key=os.path.getmtime)
+            print(f"[zones] [detector] weights = \"{weights}\" in {args.config}: no detector there (a best/ folder "
+                  f"with det_train_meta.json)" + (f" - this one is used: {os.path.dirname(found[-1])}; put it in "
+                                                  f"the config too" if found else " - the page shows no cows"))
+            weights = os.path.dirname(found[-1]) if found else None
+        if weights:
             live = det_mod.Live(weights, threshold=cfg["detector"]["threshold"], tiles=cfg["detector"].get("tiles"))
-        else:
-            print("[zones] no detector in the config: the page shows no cows")
     cams = []
     ids = list(by_id) + sorted(c for c in pictures if c not in by_id)
     for cid in ids:
