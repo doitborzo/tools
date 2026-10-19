@@ -4,14 +4,16 @@
 #
 #   1. the environment (run_pod.sh step 1), the models from herd_models_*.tgz (export_pod.sh) in WORK
 #   2. fetch: the crops of the sets in SOURCES (Zenodo's zips are downloaded whole, the others read in
-#      place); Zenodo, Bristol and the last step's MmCows frames download in the background while
+#      place); Zenodo, WildlifeReID-10k and the last step's MmCows frames download in the background while
 #      MmCows' training days are fetched one at a time, each labelled (GPU) as the next downloads
 #        mmcows    MmCows (the evaluation's own pen and cameras): 7/25 with its human labels outside
 #                  mct_eval's 12:00-15:00, every 15 s (cows 1-10 train, 11-16 held out: never trained on);
 #                  the neck-tag days only with UWB_DAYS
 #        cobra     CoBRA youngstock: 48 heifers from a roof camera, standing and lying (733 MB)
 #        sideview  SideViewCows2026: 110 cows from the side, parlor / barn / snapshots (25 GB of zips)
-#        multicam cows2021 opencows   the top-down sets the first model was trained on
+#        multicam cows2021 opencows aerialcattle   the Bristol top-down sets, from WildlifeReID-10k (Kaggle):
+#                  data.bris itself answers 404 since 2026-10
+#        cowdataset  13 cows photographed from the side on 6 days (WildlifeReID-10k)
 #   3. label (GPU, mmcows): the detector on its frames; 7/25's boxes by the human labels, the other
 #      days' by the cows' UWB neck tags (tracks voted by the tag's position, ~95% right on 7/25)
 #   4. extract (GPU): DINOv2 on every crop as the barn does; pseudo-bursts with cow ids
@@ -28,7 +30,7 @@
 #   bash herd/reid_pod.sh stop
 #
 # Knobs: WORK=/workspace  RUN=run9  DET=<best/> (default: the newest)  INIT=<identity.pt> (fine-tune it; default: from scratch)
-#        SOURCES="mmcows cobra sideview multicam cows2021 opencows"  EPOCHS=30  MCT=1  MINUTES=60
+#        SOURCES="mmcows cobra sideview multicam cows2021 opencows aerialcattle cowdataset"  EPOCHS=30  MCT=1
 #        LABEL_EVERY=15 (s between 7/25's human-labelled frames: every label MmCows has)
 #        UWB_DAYS="" (neck-tag days, e.g. "0722 0728 0801": off - ~4% of their labels are another cow, mostly a
 #        held-out one)  UWB_EVERY=30  WAIT_MIN=20 (how long the GPU waits for a background download)
@@ -36,7 +38,8 @@
 #        REQUIRE="multicam cows2021" (no training if these are not in; REQUIRE= trains without them)
 # A herd_reid_feat_*.tgz in WORK (the second export of a run) brings every set's frame vectors: nothing
 # of those sets is fetched again.
-# Every step resumes. Licences: MmCows CC BY-NC-SA, CoBRA and SideViewCows CC BY 4.0, the Bristol sets NCGL.
+# Every step resumes. Licences: MmCows CC BY-NC-SA, CoBRA and SideViewCows CC BY 4.0, the Bristol sets NCGL
+# (non-commercial), CowDataset as on Figshare 16879780.
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -80,7 +83,7 @@ step() { echo; echo "=== $*   [$(date '+%F %T')]"; }
 PY="$H/.venv/bin/python"
 export HF_HOME="$WORK/hf-cache"
 export PATH="$HOME/.local/bin:$PATH"
-SOURCES="${SOURCES:-mmcows cobra sideview multicam cows2021 opencows}"
+SOURCES="${SOURCES:-mmcows cobra sideview multicam cows2021 opencows aerialcattle cowdataset}"
 
 step "Models from the uploaded archive"
 for a in ${MODELS:-$(ls -t "$WORK"/herd_models_*.tgz 2>/dev/null | head -1)}; do
@@ -139,7 +142,7 @@ if [ -n "${DET:-}" ] && grep -qs '"kind": *"rfdetr"' "$DET/det_train_meta.json";
 fi
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
-# The downloads overlap the GPU: Zenodo's zips (whole, ~26 GB) and the Bristol crops come in the
+# The downloads overlap the GPU: Zenodo's zips (whole, ~26 GB) and WildlifeReID-10k's crops come in the
 # background, while MmCows is fetched a day at a time and each day is labelled (GPU) as the next downloads.
 want() { [[ " $SOURCES " == *" $1 "* ]]; }
 bg_fetch() {   # name, sources... -> a background fetch with its own log; its pid in BG_<name>
@@ -193,7 +196,7 @@ bg_wait() {    # name, sources... -> wait for it (at most WAIT_MIN minutes, its 
 
 step "Fetch the crops with cow ids ($SOURCES)"
 bg_fetch zenodo cobra sideview
-bg_fetch bristol multicam cows2021 opencows
+bg_fetch wildlife multicam cows2021 opencows aerialcattle cowdataset
 MCT_PID=""
 if [ "${MCT:-1}" = "1" ]; then                      # the last step's frames (mct_pod.sh fetches only what is missing)
     echo "fetching MmCows' frames for the check in the background (log: $R/fetch_mct.log)"
@@ -229,7 +232,7 @@ elif want mmcows; then
     "$PY" "$HERE/reid.py" extract --data "$R" --sources mmcows --model "$H/$RUN/model.pt"
 fi
 
-bg_wait bristol multicam cows2021 opencows
+bg_wait wildlife multicam cows2021 opencows aerialcattle cowdataset
 bg_wait zenodo cobra sideview
 
 # without the sets most cows come from the model learns too few cows and over-fits MmCows' ten
@@ -239,7 +242,7 @@ for s_ in ${REQUIRE-multicam cows2021}; do
     want "$s_" && [ ! -f "$R/feat/$s_/bursts.jsonl" ] && missing+=("$s_")
 done
 if [ ${#missing[@]} -gt 0 ] && [ "${TRAIN:-1}" != "0" ]; then
-    echo "!! ${missing[*]} not in (their fetch failed - see $R/fetch_bristol.log): no training without them."
+    echo "!! ${missing[*]} not in (their fetch failed - see $R/fetch_wildlife.log): no training without them."
     echo "   Run again later (what is in is kept), upload a herd_reid_feat_*.tgz that has them, or"
     echo "   REQUIRE= to train without them anyway."
     exit 1

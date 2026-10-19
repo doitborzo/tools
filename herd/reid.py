@@ -5,6 +5,8 @@ The herd model's fingerprint was taught on CBVD-5, which has no cow ids: it lear
 7 s" and knows the view, not the cow (MmCows: a cow seen by two cameras got one track by look in
 0.1-1.4% of cases). These sets name their cows:
 
+    (data.bris answers 404 since 2026-10: the four Bristol sets come from WildlifeReID-10k on Kaggle -
+    multicam thinned to every 20th crop - and cowdataset, 13 cows from the side, with them; see WR10K)
     multicam   MultiCamCows2024 (Yu et al., University of Bristol, data.bris 2inu67jru7a6821kkgehxg3cv2,
                Non-Commercial Government Licence): 90 Holstein-Friesians, 3 ceiling cameras over a
                walkway, 7 days, 101,329 crops - one folder per cow per day, the same number every day,
@@ -79,13 +81,21 @@ from common import read_jsonl, write_json  # noqa: E402
 
 ZENODO = "https://zenodo.org/records"
 MMCOWS = "https://huggingface.co/datasets/neis-lab/mmcows/resolve/main"
+# The Bristol sets' own server (data.bris) answers 404 since 2026-10: they come from WildlifeReID-10k (Kaggle,
+# public, read in place), which holds them with the cows' numbers - MultiCamCows2024 thinned to every 20th
+# crop, Cows2021 with its labels fixed - each with its own licence (Bristol's: non-commercial)
+WR10K = "https://www.kaggle.com/api/v1/datasets/download/wildlifedatasets/wildlifereid-10k"
 SOURCES = {
-    "multicam": {"url": "https://data.bris.ac.uk/datasets/tar/2inu67jru7a6821kkgehxg3cv2.zip",
-                 "licence": "Non-Commercial Government Licence", "cite": "Yu et al., MultiCamCows2024, arXiv 2410.12695"},
-    "cows2021": {"url": "https://data.bris.ac.uk/datasets/tar/4vnrca7qw1642qlwxjadp87h7.zip",
-                 "licence": "Non-Commercial Government Licence", "cite": "Gao et al., Cows2021, arXiv 2105.01938"},
-    "opencows": {"url": None, "licence": "UK Non-Commercial Government Licence v2",
-                 "cite": "Andrew et al., OpenCows2020"},          # the url is extra_det's (one zip for both)
+    "multicam": {"url": WR10K, "wr": "MultiCamCows2024", "licence": "Non-Commercial Government Licence",
+                 "cite": "Yu et al., MultiCamCows2024, arXiv 2410.12695; via WildlifeReID-10k"},
+    "cows2021": {"url": WR10K, "wr": "Cows2021", "licence": "Non-Commercial Government Licence",
+                 "cite": "Gao et al., Cows2021, arXiv 2105.01938; via WildlifeReID-10k"},
+    "opencows": {"url": WR10K, "wr": "OpenCows2020", "licence": "UK Non-Commercial Government Licence v2",
+                 "cite": "Andrew et al., OpenCows2020; via WildlifeReID-10k"},
+    "aerialcattle": {"url": WR10K, "wr": "AerialCattle2017", "licence": "Non-Commercial Government Licence",
+                     "cite": "Andrew et al., AerialCattle2017; via WildlifeReID-10k"},
+    "cowdataset": {"url": WR10K, "wr": "CowDataset", "licence": "see Figshare 16879780",
+                   "cite": "CowDataset (Figshare 16879780), side-view photos; via WildlifeReID-10k"},
     # Zenodo answers many Range requests with 429: its zips are downloaded whole (0.7 GB; 25 GB) and read locally
     "cobra": {"url": f"{ZENODO}/15018518/files/re_identification_youngstock.zip?download=1", "licence": "CC BY 4.0",
               "cite": "CoBRA re-identification youngstock, Zenodo 15018518", "whole": True},
@@ -133,6 +143,19 @@ def plan(source, names):
     return out
 
 
+def plan_wr(wr, meta):
+    """WildlifeReID-10k's metadata.csv rows of one set -> [(cow, day, cam, order, member)]: the cow's number
+    (without the set's prefix), the date (or "all"), MultiCamCows2024's camera from its file name."""
+    out = []
+    for r in meta:
+        if r.get("dataset") != wr:
+            continue
+        cow = r["identity"][len(wr) + 1:] if r["identity"].startswith(wr + "_") else r["identity"]
+        m = re.search(r"/\d+_(\d+)_\d+_\d{4}\w{3}\d\d_", r["path"]) if wr == "MultiCamCows2024" else None
+        out.append((cow, r.get("date") or "all", m.group(1) if m else "0", len(out), r["path"]))
+    return out
+
+
 def mask_crop(image, mask, pad=0.04, max_side=640):
     """SideViewCows: the frame cut to its cow's mask (other cows share the frame) -> JPEG bytes, or None."""
     import io
@@ -167,8 +190,11 @@ def as_jpeg(data):
 
 def cmd_fetch(args):
     sys.path.insert(0, os.path.join(os.path.dirname(HERE), "cowbench"))
+    import csv
+    import io
     from extra_det import SOURCES as DET_SOURCES
-    from extra_det import LocalZip, RemoteZip, download
+    from extra_det import LocalZip, RemoteZip, download, shrink
+    wr_zip, wr_meta = None, None
     for src in args.sources:
         if src == "mmcows":
             fetch_mmcows(args)
@@ -183,7 +209,12 @@ def cmd_fetch(args):
         rows, todo, zips = [], [], []
         urls = url if isinstance(url, dict) else {"": url}
         for part, url in urls.items():
-            if SOURCES[src].get("whole"):
+            if SOURCES[src].get("wr"):
+                if wr_zip is None:                               # one zip, one metadata for every such set
+                    wr_zip = RemoteZip(url)
+                    wr_meta = list(csv.DictReader(io.StringIO(wr_zip.read("metadata.csv").decode("utf-8"))))
+                z = wr_zip
+            elif SOURCES[src].get("whole"):
                 path = os.path.join(args.data, "zips", f"{src}{'_' + part if part else ''}.zip")
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 print(f"[fetch] {src}{' ' + part if part else ''}: downloading the zip whole", flush=True)
@@ -192,7 +223,7 @@ def cmd_fetch(args):
             else:
                 z = RemoteZip(url)
             names = z.names()
-            items = plan(src, names)
+            items = plan_wr(SOURCES[src]["wr"], wr_meta) if SOURCES[src].get("wr") else plan(src, names)
             if args.max_per_source:
                 items = items[:args.max_per_source]
             have = set(names)
@@ -213,7 +244,12 @@ def cmd_fetch(args):
             path = os.path.join(folder, name)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             try:
-                data = mask_crop(z.read(member), z.read(mask)) if mask else as_jpeg(z.read(member))
+                if mask:
+                    data = mask_crop(z.read(member), z.read(mask))
+                elif SOURCES[src].get("wr"):
+                    data = shrink(z.read(member), 1024)[0]     # CowDataset's photos are 4000 px wide
+                else:
+                    data = as_jpeg(z.read(member))
             except Exception as e:                         # retried already: this one is left for the next run
                 return f"{member}: {e.__class__.__name__}: {e}"
             if data is None:                               # an empty mask: no cow to cut
@@ -631,7 +667,8 @@ def cmd_extract(args):
         else:
             val = set(random.Random(args.seed).sample(cows, max(1, round(len(cows) * args.val_share))))
         check_split(src, rows, val)
-        bursts = make_bursts(rows, rng, val, tracklets=src == "multicam")
+        # MultiCamCows' 5 Hz tracklets: windows of 7 s; WildlifeReID-10k keeps every 20th crop - stills
+        bursts = make_bursts(rows, rng, val, tracklets=src == "multicam" and not SOURCES[src].get("wr"))
         write_bursts(os.path.join(args.data, "feat", src), bursts, src, dict(meta, dim=int(feats.shape[1])))
         for part in ("train", "val"):                     # an older extract's stretched copies (GBs)
             old = os.path.join(args.data, "feat", src, part)

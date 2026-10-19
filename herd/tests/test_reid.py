@@ -299,3 +299,15 @@ def test_nan_model_rows_balanced_across_sets():
     rows = [{"src": "mmcows", "sim": 0.9}] * 5000 + [{"src": "cobra", "sim": 0.8}] * 200
     out = reid.balance_rows(rows, cap=1000)
     assert sum(r["src"] == "mmcows" for r in out) == 1000 and sum(r["src"] == "cobra" for r in out) == 200
+
+
+def test_plan_reads_wildlifereid_metadata():
+    import reid
+    meta = [{"dataset": "MultiCamCows2024", "identity": "MultiCamCows2024_7", "date": "2023-08-14",
+             "path": "images/MultiCamCows2024/x/MultiCamCows2024Root/2023Aug14/007/00031_2_007_2023Aug14_00031_2.jpg.jpg"},
+            {"dataset": "Cows2021", "identity": "Cows2021_19", "date": "2020-02-13", "path": "images/Cows2021/a.jpg"},
+            {"dataset": "OpenCows2020", "identity": "OpenCows2020_16", "date": "", "path": "images/OpenCows2020/b.jpg"}]
+    assert reid.plan_wr("MultiCamCows2024", meta) == [("7", "2023-08-14", "2", 0, meta[0]["path"])]
+    assert reid.plan_wr("Cows2021", meta)[0][:3] == ("19", "2020-02-13", "0")
+    assert reid.plan_wr("OpenCows2020", meta)[0][:3] == ("16", "all", "0")              # no date: one "day"
+    assert all(reid.SOURCES[s]["url"] == reid.WR10K for s in ("multicam", "cows2021", "opencows"))

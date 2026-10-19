@@ -562,6 +562,16 @@ not in; the NaN model takes at most 1000 queries of each set; and every run also
 `herd_reid_feat_<date>.tgz` - every set's frame vectors and MmCows' crop index (~1-2 GB) - which a
 next pod unpacks and trains from without fetching any training set.
 
+**The Bristol sets from WildlifeReID-10k.** data.bris stays down, but WildlifeReID-10k (Kaggle,
+`wildlifedatasets/wildlifereid-10k`, public, read in place - no login) holds the Bristol cattle sets
+with their cows' numbers: Cows2021 (179 cows, 8,670 crops, 27 days), MultiCamCows2024 (90 cows, every
+20th crop: 5,112, 3 cameras, 7 days), OpenCows2020 (46 cows), AerialCattle2017 (23 cows) - and a
+side-view one, CowDataset (13 cows, 1,485 photos on 6 days). `reid.py` takes `multicam`, `cows2021`,
+`opencows`, `aerialcattle`, `cowdataset` from it (its `metadata.csv` gives cow, date, and from
+MultiCamCows' file names the camera). FriesianCattle2015/2017 are left out: whole frames of several cows
+with no box, so the number cannot be put on one of them. MultiCamCows' thinned crops are no longer
+5 Hz tracklets: they make bursts of stills, as the other sets.
+
 **The check alone, on a new pod** (`bash herd/eval_pod.sh`): with `herd_models_*.tgz` and
 `herd_reid_*.tgz` in `/workspace` it unpacks the identity model (`reid/id_model_all/`), recalibrates its
 thresholds on MmCows 7/25 alone (outside mct_eval's hours, ~4 GB read; the old file kept as
