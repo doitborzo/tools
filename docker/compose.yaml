@@ -1,0 +1,44 @@
+# herd in Docker Desktop, with an NVIDIA card (Windows: the WSL 2 backend and a current NVIDIA driver).
+# No NVIDIA card (Mac, a laptop): docker compose -f compose.cpu.yaml ... instead.
+#
+#   docker compose build                                build the image (models from docker/models/)
+#   docker compose run --rm herd models                 what is in it, and whether it sees the GPU
+#   docker compose run --rm herd <command>              any command (help lists them)
+#   docker compose --profile live up -d barn            the barn, live, restarted with Docker
+#
+# docker/data on this computer is /data in the container.
+name: herd
+
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+  herd:
+    <<: *gpu
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        TORCH_BACKEND: ${TORCH_BACKEND:-cu126}
+    image: herd:latest
+    environment:
+      TZ: ${TZ:-Europe/Kyiv}
+    volumes:
+      - ./data:/data
+
+  barn:
+    <<: *gpu
+    image: herd:latest
+    profiles: [live]
+    command: ["run", "--config", "/data/barn.toml"]
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Europe/Kyiv}
+    volumes:
+      - ./data:/data

@@ -132,6 +132,8 @@ by more than one batch.
 
 ## In the barn
 
+Docker Desktop (Windows / Mac): `docker/README.md` - one image with the code and the models.
+
 ```bash
 cp herd/config.example.toml barn.toml          # cameras, masks, paths
 python herd/herd.py run --config barn.toml                         # live
@@ -162,6 +164,7 @@ time on tracks no cow could be given.
 | `motion.py` | the rhythm of a burst's crops: what rumination (chewing) looks like |
 | `degrade.py` | bursts spoilt on purpose (occlusion, mud, blur, dark): what the quality heads learn on |
 | `barn_dataset.py` | the barn's own bursts (training cache, live or from recordings: `barn video`): the labelling page, `merges.csv`, the export to the identity model (`barn` in `reid.py`) and to `train.py --extra-train` |
+| `record.py` | every camera recorded at once, files named as the dataset tools read them |
 | `box_dataset.py` | cow boxes on frames of the barn's recordings: the detector's guess, a page to correct them, COCO export for `run_pod.sh detector` |
 | `cbvd_bursts.py` | CBVD-5 -> bursts + keyframes -> Stage A vectors |
 | `train.py` | Stage A training, re-ID / posture / rumination scoring, cowbench export |

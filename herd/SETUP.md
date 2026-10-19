@@ -3,6 +3,10 @@
 From an empty server to daily reports. Example paths: the code in `/opt/herd/tools`,
 models and the database in `/srv/herd`. How the system works inside: `GUIDE.md`.
 
+**Docker Desktop instead** (Windows or Mac, no Python set up): `docker/README.md` — one image with the
+code and the models; it replaces steps 1–2 and 7, and every command below runs as
+`docker compose run --rm herd <command>` with the paths under `/data`.
+
 ## 0. What is needed
 
 - **A Linux server** (Ubuntu 22.04 / 24.04) with an **NVIDIA GPU** and its driver

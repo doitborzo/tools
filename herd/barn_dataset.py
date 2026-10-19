@@ -73,8 +73,8 @@ class TrainingCache:
         self.lock = threading.Lock()
         self.n = 0
         os.makedirs(self.folder, exist_ok=True)
-        with open(os.path.join(self.folder, "meta.json"), "w", encoding="utf-8") as fh:
-            json.dump(features_meta, fh, indent=2)
+        with open(os.path.join(self.folder, "meta.json"), "w", encoding="utf-8") as fh:   # + the farm's clock
+            json.dump(dict(features_meta, tz_hours=cfg["farm"]["timezone_offset_hours"]), fh, indent=2)
         self.used = sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(self.folder) for f in fs)
         self.full = False
 
@@ -225,6 +225,10 @@ def track_table(rows, cache, page_dir, names=None, thumbs=12):
     by_track = collections.defaultdict(list)
     for r in rows:
         by_track[(r["day"], r["track"])].append(r)
+    try:                                       # the farm's clock (a cache written before it: this computer's)
+        tz = dt.timezone(dt.timedelta(hours=json.load(open(os.path.join(cache, "meta.json")))["tz_hours"]))
+    except (OSError, KeyError, ValueError):
+        tz = None
     out = []
     for (day, track), rs in sorted(by_track.items(), key=lambda kv: (kv[0][0], kv[1][0]["ts"], kv[0][1])):
         rs.sort(key=lambda r: r["ts"])
@@ -232,8 +236,8 @@ def track_table(rows, cache, page_dir, names=None, thumbs=12):
         g = guess.most_common(1)[0][0] if guess else ""
         pick = sorted({int(round(i)) for i in np.linspace(0, len(rs) - 1, min(thumbs, len(rs)))})
         out.append({"day": day, "track": track, "cam": "/".join(sorted({r["cam"] for r in rs})), "n": len(rs),
-                    "t0": dt.datetime.fromtimestamp(rs[0]["ts"]).strftime("%H:%M"),
-                    "t1": dt.datetime.fromtimestamp(rs[-1]["ts"]).strftime("%H:%M"),
+                    "t0": dt.datetime.fromtimestamp(rs[0]["ts"], tz).strftime("%H:%M"),
+                    "t1": dt.datetime.fromtimestamp(rs[-1]["ts"], tz).strftime("%H:%M"),
                     "guess": g, "guess_name": (names or {}).get(g, ""),
                     "thumbs": [os.path.relpath(os.path.join(cache, rs[i]["thumb"]), page_dir).replace(os.sep, "/")
                                for i in pick]})

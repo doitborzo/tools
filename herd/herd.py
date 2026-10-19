@@ -26,6 +26,8 @@ Barn data for identity (once the barn runs with [training_cache] enabled):
     herd.py barn video --config barn.toml --videos DIR --out D   recorded camera files -> D/training_cache
     herd.py barn build --cache C --out F [--merges merges.csv] [--val-from DAY]
     then train --extra-train F/train, eval --extra-val F/val
+Recordings for them:
+    herd.py record --config barn.toml --out DIR --minutes 60   every camera at once -> DIR/<cam>_<time>.mp4
 Cow boxes on the barn's cameras (detector training):
     herd.py boxes frames --config barn.toml --videos DIR --out D   frames + the detector's guess + D/boxes.html
     herd.py boxes export --data D --labels labels.json            -> herd_det_barn_*.tgz (run_pod.sh detector)
@@ -112,6 +114,9 @@ def main():
     if cmd == "boxes":
         import box_dataset
         return box_dataset.main(argv)
+    if cmd == "record":
+        import record
+        return record.main(argv)
     if cmd == "report":
         import report
         return report.main(argv)

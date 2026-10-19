@@ -1,0 +1,9 @@
+.git
+**/__pycache__
+**/*.pyc
+cowbench/runs
+docker/data
+**/*.tgz
+**/*.tar.gz
+!docker/models/*.tgz
+!docker/models/*.tar.gz

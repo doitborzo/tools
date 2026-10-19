@@ -1,0 +1,29 @@
+# herd in Docker without an NVIDIA card (Mac, a laptop): everything runs on the CPU - fine for the
+# labelling pages and a few recordings, too slow for a live barn.
+#
+#   docker compose -f compose.cpu.yaml build
+#   docker compose -f compose.cpu.yaml run --rm herd <command>
+name: herd
+
+services:
+  herd:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        TORCH_BACKEND: cpu
+    image: herd:cpu
+    environment:
+      TZ: ${TZ:-Europe/Kyiv}
+    volumes:
+      - ./data:/data
+
+  barn:
+    image: herd:cpu
+    profiles: [live]
+    command: ["run", "--config", "/data/barn.toml"]
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Europe/Kyiv}
+    volumes:
+      - ./data:/data

@@ -166,3 +166,22 @@ def test_barn_video_plays_sessions_into_a_cache_of_its_own():
             assert not [c for c in calls if c[0] == "run"]
         finally:
             pipeline.Models, pipeline.run = old
+
+
+def test_record_names_files_as_the_tools_read_them():
+    import common
+    import record
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "src.mp4")
+        _video(src, 4)
+        cfg = os.path.join(d, "barn.toml")
+        open(cfg, "w").write(f'[farm]\ntimezone_offset_hours = 2\n[[cameras]]\nid = "cam1"\nurl = "{src}"\n'
+                             f'[[cameras]]\nid = "cam2"\nurl = "{src}"\n')
+        import shutil
+        if not shutil.which("ffmpeg"):
+            assert record.command("rtsp://x", 60, "o.mp4")[5:7] == ["-rtsp_transport", "tcp"]
+            return
+        out = os.path.join(d, "rec")
+        assert record.main(["--config", cfg, "--out", out, "--minutes", "0.05", "--cameras", "cam2"]) == 0
+        recs, bad = common.recordings(out, ["cam1", "cam2"], 2)
+        assert [c for c, _, _ in recs] == ["cam2"] and not bad
