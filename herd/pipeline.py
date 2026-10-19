@@ -130,6 +130,13 @@ class Models:
         self.gpu = GpuLock()
         self.dev = device()
         ck_path = cfg["model"]["checkpoint"]
+        for what, path, needs in (("[model] checkpoint", ck_path, None),
+                                  ("[detector] weights", cfg["detector"]["weights"], "det_train_meta.json")):
+            if detector is not None and needs:
+                continue
+            if not path or not os.path.exists(os.path.join(path, needs) if needs else path):
+                raise SystemExit(f'{what} = "{path}": no such {"best/ folder" if needs else "file"} - set it in the '
+                                 f'config (in Docker: `models` lists what the image has, `init` fills it in)')
         self.model, ck = HerdModel.load(ck_path, map_location=self.dev)
         self.model.to(self.dev).eval()
         feat = ck.get("features", {})

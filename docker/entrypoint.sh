@@ -4,46 +4,58 @@ set -euo pipefail
 H=/opt/herd/herd
 PY=python
 
-newest() { # the newest file of these, by time
-    ls -t "$@" 2>/dev/null | head -1 || true
+found() { # every file of this name under /models, newest first (archives unpack at different depths)
+    find /models -name "$1" ${2:+-path "$2"} -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2- || true
 }
 
 models() {
     echo "Models in this image (/models):"
-    for m in /models/herd/*/model.pt; do [ -f "$m" ] && echo "  herd model   : $m"; done
-    for d in /models/herd/detector_*/best; do [ -d "$d" ] && echo "  detector     : $d"; done
-    for m in /models/reid/*/identity.pt; do [ -f "$m" ] && echo "  identity     : $m"; done
-    for m in /models/rum/*/rumination.pt; do [ -f "$m" ] && echo "  rumination   : $m"; done
+    found model.pt | sed 's/^/  herd model   : /'
+    found det_train_meta.json '*/best/*' | xargs -r -n1 dirname | sed 's/^/  detector     : /'
+    found identity.pt | sed 's/^/  identity     : /'
+    found rumination.pt | sed 's/^/  rumination   : /'
     "$PY" -c "import torch; print('  GPU          :', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none - running on the CPU (slow)')"
     return 0
 }
 
-init() { # /data/barn.toml from config.example.toml, with this image's models and /data paths filled in
-    local out=/data/barn.toml
-    if [ -f "$out" ]; then echo "$out is there already - not overwritten (delete it to make it again)"; return 0; fi
-    local det
-    det="$(ls -dt /models/herd/detector_*_ft/best 2>/dev/null | head -1 || true)"
-    [ -n "$det" ] || det="$(ls -dt /models/herd/detector_*/best 2>/dev/null | head -1 || true)"
-    MODEL="$(newest /models/herd/*/model.pt)" DET="$det" IDENT="$(newest /models/reid/id_model_all/identity.pt /models/reid/*/identity.pt)" \
-    RUM="$(newest /models/rum/*/rumination.pt)" "$PY" - "$H/config.example.toml" "$out" <<'PYEOF'
+init() { # /data/barn.toml from config.example.toml with this image's models and /data paths filled in; when it
+         # is there already, only its model paths that point at nothing in this image are filled in
+    local out=/data/barn.toml det ident
+    det="$(found det_train_meta.json '*_ft/best/*' | head -1)"
+    [ -n "$det" ] || det="$(found det_train_meta.json '*/best/*' | head -1)"
+    ident="$(found identity.pt '*id_model_all*' | head -1)"
+    [ -n "$ident" ] || ident="$(found identity.pt | head -1)"
+    MODEL="$(found model.pt | head -1)" DET="${det%/det_train_meta.json}" IDENT="$ident" \
+    RUM="$(found rumination.pt | head -1)" "$PY" - "$H/config.example.toml" "$out" <<'PYEOF'
 import os, re, sys
-src, out = sys.argv[1], sys.argv[2]
-text = open(src, encoding="utf-8").read()
-def put(pattern, line):
+example, out = sys.argv[1], sys.argv[2]
+fresh = not os.path.exists(out)
+text = open(example if fresh else out, encoding="utf-8").read()
+said = []
+def put(key, value):
+    """key = "value" in place of the example's (or a commented) line, when the value there points at nothing."""
     global text
-    text, n = re.subn(pattern, line, text, count=1, flags=re.M)
-    assert n, pattern
-put(r'^checkpoint = ".*?"', f'checkpoint = "{os.environ["MODEL"]}"')
-put(r'^weights = ".*?"', f'weights = "{os.environ["DET"]}"')
-put(r'^path = ".*?herd\.sqlite"', 'path = "/data/barn/herd.sqlite"')
-if os.environ["IDENT"]:
-    put(r'^# identity = ".*?"', f'identity = "{os.environ["IDENT"]}"')
-if os.environ["RUM"]:
-    put(r'^# rumination = ".*?"', f'rumination = "{os.environ["RUM"]}"')
+    m = re.search(rf'^#? ?{key} = "(.*?)"', text, flags=re.M)
+    if not value or not m:
+        return
+    old = m.group(1)
+    if not fresh and not m.group(0).startswith("#") and old and os.path.exists(old):
+        return
+    text = text[:m.start()] + f'{key} = "{value}"' + text[m.end():]
+    said.append(f"  {key} = \"{value}\"" + (f"   (was \"{old}\")" if not fresh else ""))
+put("checkpoint", os.environ["MODEL"])
+put("weights", os.environ["DET"])
+put("identity", os.environ["IDENT"])
+put("rumination", os.environ["RUM"])
+if fresh:
+    text = re.sub(r'^path = ".*?herd\.sqlite"', 'path = "/data/barn/herd.sqlite"', text, count=1, flags=re.M)
 open(out, "w", encoding="utf-8").write(text)
+print(("-> " if fresh else "updated ") + out + " (docker/data/barn.toml on your computer):")
+print("\n".join(said) if said else "  its model paths all point at models in this image - nothing changed")
+if not os.environ["MODEL"]:
+    print("!! no herd model (model.pt) in this image: put herd_models_*.tgz into docker/models/ and build again")
 PYEOF
-    echo "-> $out (docker/data/barn.toml on your computer): the models of this image filled in."
-    echo "   Now set [farm] timezone_offset_hours and the [[cameras]] (id, url, mask) - SETUP.md sections 3-4."
+    echo "   Then: [farm] timezone_offset_hours and the cameras (zones page) - docker/README.md section 4."
 }
 
 case "${1:-help}" in
@@ -53,7 +65,8 @@ herd in Docker. On your computer: docker compose run --rm herd <command>   (from
 docker/data on your computer is /data here: the config, the recordings, everything written.
 
   models                         the models in this image, and the GPU
-  init                           /data/barn.toml from the example, with the models filled in
+  init                           /data/barn.toml from the example, with the models filled in (run again
+                                 on an existing one: fills in model paths that point at nothing)
   zones page --config /data/barn.toml --videos /data/rec --cameras cam1 cam2 cam3 cam4 --out /data/zones
                                  a still of every camera -> zones.html: draw masks / excluded zones
   zones apply --config /data/barn.toml --cameras /data/cameras.toml   the drawn zones into barn.toml

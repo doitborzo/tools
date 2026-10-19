@@ -72,6 +72,8 @@ The config, with the image's model paths filled in:
 
 ```bash
 docker compose run --rm herd init                    # -> docker/data/barn.toml
+                                                     # (again on an existing one: fills in model paths
+                                                     #  that point at nothing, e.g. after a new build)
 ```
 
 Then edit `docker/data/barn.toml`:
