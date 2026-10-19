@@ -18,6 +18,8 @@
 #        LIVE_STEP=2 (s between 1-second frames used)  TRAIN_EVERY=60  WINDOW_EVERY=15
 #        SETUP_MIN=60  START=12  END=15  ID_EPOCHS=60  ASSOC_EPOCHS=60
 #        MCC_WAIT_H=12 (hours to wait for data.bris.ac.uk)  MCC_ZIP (where the MultiCamCows zip is / goes)
+#        PRETRAINED=<link to a V14A_MODELS.tgz> (a Google Drive share link works): no training - the
+#        weights are downloaded after the MmCows step and video_v14.sh runs on them (no steps 4-8)
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,6 +44,8 @@ MCC_WAIT_H="${MCC_WAIT_H:-12}"
 ID_DATA="${ID_DATA:-mmcows}"
 MCC_ZIP="${MCC_ZIP:-}"
 MCC_URL="${MCC_URL:-https://data.bris.ac.uk/datasets/tar/2inu67jru7a6821kkgehxg3cv2.zip}"
+PRETRAINED="${PRETRAINED:-}"
+VIDEO_END="${VIDEO_END:-13.5}"
 export HF_HOME="$WORK/hf-cache"
 
 case "${1:-}" in
@@ -61,7 +65,7 @@ if [ -z "${V14_IN_TMUX:-}" ]; then
     if tmux has-session -t "=$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     mkdir -p "$V"
     knobs=""
-    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP ID_DATA; do
+    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP ID_DATA PRETRAINED VIDEO_END; do
         knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env V14_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/run_v14.sh"); echo; echo '[run_v14.sh finished]'; exec bash"
@@ -107,6 +111,26 @@ step "3/8  MmCows: labels, labelled frames (training side + test window), the 1-
 "$PY" data_mmcows.py labels --out "$V/mmcows"
 "$PY" data_mmcows.py frames --out "$V/mmcows" --train-every "$TRAIN_EVERY" --window-every "$WINDOW_EVERY" --start "$START" --end "$END"
 "$PY" data_mmcows.py inspect --out "$V/mmcows" | tee "$V/mmcows_live_inspect.txt"
+if [ -n "$PRETRAINED" ]; then
+    # only what the video needs: the 1-second stream up to VIDEO_END, then the given weights
+    "$PY" data_mmcows.py live --out "$V/mmcows" --live-step "$LIVE_STEP" --start "$START" --end "$VIDEO_END"
+    step "4/4  Trained weights instead of training: $PRETRAINED"
+    ID="$(printf '%s' "$PRETRAINED" | sed -nE 's#.*(/d/|[?&]id=)([A-Za-z0-9_-]{20,}).*#\2#p')"
+    URL="$PRETRAINED"
+    [ -n "$ID" ] && URL="https://drive.usercontent.google.com/download?id=$ID&export=download&confirm=t"
+    A="$V/pretrained.tgz"
+    [ -s "$A" ] || curl -L --fail --retry 5 -o "$A" "$URL"
+    head -c 512 "$A" | grep -qi '<html' && { rm -f "$A"; echo "!! the link gives a web page: share it as 'Anyone with the link'"; exit 1; }
+    rm -rf "$V/pretrained" && mkdir -p "$V/pretrained" "$V/idnet" "$V/assoc"
+    tar -xzf "$A" -C "$V/pretrained"
+    IDP="$(find "$V/pretrained" -name idnet.pt | head -n 1)"; ASP="$(find "$V/pretrained" -name assoc.pt | head -n 1)"
+    [ -n "$IDP" ] || { echo "!! no idnet.pt in the archive:"; find "$V/pretrained"; exit 1; }
+    cp "$IDP" "$V/idnet/idnet.pt"
+    [ -n "$ASP" ] && cp "$ASP" "$V/assoc/assoc.pt"
+    "$PY" -c "import torch; ck = torch.load('$V/idnet/idnet.pt', weights_only=False); print('idnet: epoch', ck.get('epoch'), 'split', ck.get('split', {}).get('by'), 'test cows', ck.get('split', {}).get('test'))"
+    echo "weights in place - now the video (log: $V/video_log.txt)"
+    V14V_IN_TMUX=1 WORK="$WORK" DET_NAME="$DET_NAME" SYS_END="$VIDEO_END" exec bash "$HERE/video_v14.sh"
+fi
 "$PY" data_mmcows.py live --out "$V/mmcows" --live-step "$LIVE_STEP" --start "$START" --end "$END"
 "$PY" data_mmcows.py feats --out "$V/mmcows"
 "$PY" data_mmcows.py idcrops --out "$V/mmcows" --train-every "$TRAIN_EVERY" --start "$START" --end "$END"
