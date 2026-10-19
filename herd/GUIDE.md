@@ -572,6 +572,28 @@ MultiCamCows' file names the camera). FriesianCattle2015/2017 are left out: whol
 with no box, so the number cannot be put on one of them. MultiCamCows' thinned crops are no longer
 5 Hz tracklets: they make bursts of stills, as the other sets.
 
+**2026-10-19, the run on the WildlifeReID mirror** (300 cows: MmCows 7/25 every 15 s, the four Bristol
+sets and CowDataset from WildlifeReID-10k; CoBRA and SideViewCows missing - their zips came down
+broken, `BadZipFile`). In training it looked better than ever on the held-out cows (another day 93.5%,
+another camera 63.4%, MmCows' cows 11-16 frame vs frame 58.7%), but on mct_eval's hour it is worse by
+look and no better as a tracker:
+
+| | best model (60 s, 312 cows) | this run (15 s, 300 cows) |
+|---|---|---|
+| by look, cows 11-16 (never seen) | **51.1%** | 35.1% |
+| by look, all cows / cows 1-10 | **41.9%** / - | 32.0% / 30.6% |
+| IDF1 in a camera (`fid/still~0.9`) / purity | 0.593 / 88% | 0.593 / 89% |
+| IDF1 over all cameras, `link-final` (160) / purity / wrong joins | 0.540 / 77% / 1682 | 0.538 / 78% / 1637 |
+| ... `link-final+contra` | - | **0.547 / 82% / 1109** |
+
+Cows 1-10, trained on (other hours of the same day), are found by look *less* often than the unseen
+11-16: the model learnt MmCows' 7/25 outside 12-15 h, not the cows. Both runs with every 15 s (this one
+and the one without the Bristol sets, 31.7%) are far below the run at 60 s; at 15 s MmCows gives 79% of
+the training bursts (12,998 of 16,477) and four times the steps of its ten cows. So: `LABEL_EVERY=60` is
+the default again, `reid.py label` takes only the seconds of the last fetch (frames of a denser one stay
+on disk), and `reid_pod.sh` makes MmCows' vectors again when an archive's were made at another interval.
+Zenodo's zips are now checked: a transfer cut short is resumed, a file that is not a zip fetched again.
+
 **The check alone, on a new pod** (`bash herd/eval_pod.sh`): with `herd_models_*.tgz` and
 `herd_reid_*.tgz` in `/workspace` it unpacks the identity model (`reid/id_model_all/`), recalibrates its
 thresholds on MmCows 7/25 alone (outside mct_eval's hours, ~4 GB read; the old file kept as

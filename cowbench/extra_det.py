@@ -152,7 +152,10 @@ def download(url, path, tries=8):
                         break
                     fh.write(chunk)
                     print(f"\r  {fh.tell() / 2**20:.0f} / {total / 2**20:.0f} MB", end="", flush=True)
+                got = fh.tell()
             print(flush=True)
+            if total and got < total:              # the server closed early without an error: resume it
+                raise IOError(f"cut short at {got / 2**20:.0f} of {total / 2**20:.0f} MB")
             os.replace(part, path)
             return path
         except (urllib.error.URLError, http.client.HTTPException, IOError, TimeoutError, ConnectionError) as e:

@@ -7,7 +7,7 @@
 #      place); Zenodo, WildlifeReID-10k and the last step's MmCows frames download in the background while
 #      MmCows' training days are fetched one at a time, each labelled (GPU) as the next downloads
 #        mmcows    MmCows (the evaluation's own pen and cameras): 7/25 with its human labels outside
-#                  mct_eval's 12:00-15:00, every 15 s (cows 1-10 train, 11-16 held out: never trained on);
+#                  mct_eval's 12:00-15:00, every 60 s (cows 1-10 train, 11-16 held out: never trained on);
 #                  the neck-tag days only with UWB_DAYS
 #        cobra     CoBRA youngstock: 48 heifers from a roof camera, standing and lying (733 MB)
 #        sideview  SideViewCows2026: 110 cows from the side, parlor / barn / snapshots (25 GB of zips)
@@ -31,7 +31,8 @@
 #
 # Knobs: WORK=/workspace  RUN=run9  DET=<best/> (default: the newest)  INIT=<identity.pt> (fine-tune it; default: from scratch)
 #        SOURCES="mmcows cobra sideview multicam cows2021 opencows aerialcattle cowdataset"  EPOCHS=30  MCT=1
-#        LABEL_EVERY=15 (s between 7/25's human-labelled frames: every label MmCows has)
+#        LABEL_EVERY=60 (s between 7/25's human-labelled frames; 15: every label MmCows has - but two runs at 15
+#        knew cows 11-16 by look 32-35%, the run at 60 51%: MmCows' ten cows then outweigh the other sets)
 #        UWB_DAYS="" (neck-tag days, e.g. "0722 0728 0801": off - ~4% of their labels are another cow, mostly a
 #        held-out one)  UWB_EVERY=30  WAIT_MIN=20 (how long the GPU waits for a background download)
 #        TRAIN=0 (no training: the existing model's thresholds again - reid.py calibrate - and the MmCows check)
@@ -220,6 +221,14 @@ if [ "${MCT:-1}" = "1" ]; then                      # the last step's frames (mc
     MCT_PID=$!
 fi
 
+# MmCows' vectors from an archive count only when made at this LABEL_EVERY (an archive without
+# mmcows/fetch.json is from the 15 s runs)
+mm_every() { "$PY" -c 'import json, sys; print(json.load(open(sys.argv[1])).get("label_every", 15))' \
+                 "$R/mmcows/fetch.json" 2>/dev/null || echo 15; }
+if have mmcows && [ "$(mm_every)" != "${LABEL_EVERY:-60}" ]; then
+    echo "mmcows: the archive's vectors are of 7/25 every $(mm_every) s, LABEL_EVERY is ${LABEL_EVERY:-60}: made again"
+    rm -f "$R/feat/mmcows/bursts.jsonl"
+fi
 if have mmcows; then
     echo "mmcows: frame vectors from the archive, not fetched / labelled / extracted"
 elif want mmcows; then
@@ -229,7 +238,7 @@ elif want mmcows; then
     # (11-16, the held-out ones) lying next to a tagged one - a held-out cow would get into training
     DAYS=(${UWB_DAYS-})
     mm_fetch() { "$PY" "$HERE/reid.py" fetch --data "$R" --sources mmcows --mm-uwb-days "$@" \
-                     --mm-uwb-every "${UWB_EVERY:-30}" --mm-label-every "${LABEL_EVERY:-15}"; }
+                     --mm-uwb-every "${UWB_EVERY:-30}" --mm-label-every "${LABEL_EVERY:-60}"; }
     mm_label() { "$PY" "$HERE/reid.py" label --data "$R" --model "$H/$RUN/model.pt" --detector "$DET" --mm-days "$@"; }
     step "MmCows 0725 (human labels): fetch"
     mm_fetch                                        # 7/25 only (no other day)
@@ -293,7 +302,7 @@ echo "identity model + results: $T   (scp -P <port> root@<ip>:$T .)"
 F="$WORK/export/herd_reid_feat_$(date +%Y%m%d_%H%M).tgz"
 fparts=()
 for p in "$R"/feat/*/crops.npz "$R"/feat/*/crops.npz.json "$R"/feat/*/bursts.jsonl "$R"/feat/*/meta.json \
-         "$R/raw/mmcows/index.jsonl"; do
+         "$R/raw/mmcows/index.jsonl" "$R/mmcows/fetch.json"; do
     [ -e "$p" ] && fparts+=("${p#"$WORK"/}")
 done
 [ ${#fparts[@]} -gt 0 ] && (cd "$WORK" && tar -czf "$F" "${fparts[@]}") && \

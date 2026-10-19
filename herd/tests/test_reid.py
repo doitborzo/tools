@@ -182,12 +182,12 @@ def test_label_command_human_and_tag_days():
                 with open(os.path.join(root, "uwb", day, f"T{t:02d}.csv"), "w") as fh:
                     fh.write("timestamp,coord_x_cm,coord_y_cm,coord_z_cm\n")
                     for k in range(12):
-                        fh.write(f"{1690000011 + 30 * k}.0,{body[t][0]},{body[t][1] + 70},100.0\n")
+                        fh.write(f"{1690000031 + 30 * k}.0,{body[t][0]},{body[t][1] + 70},100.0\n")
             for cam in ("cam_1", "cam_2"):
                 os.makedirs(os.path.join(root, "frames", day, cam))
                 os.makedirs(os.path.join(root, "labels", cam), exist_ok=True)
                 for k in range(12):
-                    ts = 1690000011 + 30 * k
+                    ts = 1690000031 + 30 * k
                     Image.new("RGB", (448, 280), (90, 90, 90)).save(os.path.join(root, "frames", day, cam, f"{ts}.jpg"))
                     if day == "0725":
                         with open(os.path.join(root, "labels", cam, f"{ts}.txt"), "w") as fh:
@@ -218,6 +218,16 @@ def test_label_command_human_and_tag_days():
             pipeline.Models = real
         again = [json.loads(x) for x in open(os.path.join(d, "raw", "mmcows", "index.jsonl"))]
         assert len(again) == len(rows) and json.load(open(os.path.join(root, "label.json")))["tag_check"] == check
+        # a sparser fetch afterwards (LABEL_EVERY=60 on the frames of a 30 s one): only its seconds are labelled
+        json.dump({"label_every": 60, "uwb_every": 30}, open(os.path.join(root, "fetch.json"), "w"))
+        pipeline.Models = Stub
+        try:
+            reid.main(["label", "--data", d, "--model", "unused.pt", "--detector", "unused", "--mm-days", "0725"])
+        finally:
+            pipeline.Models = real
+        sparse = [json.loads(x) for x in open(os.path.join(d, "raw", "mmcows", "index.jsonl"))]
+        n60 = sum(1 for k in range(12) if reid._every(1690000031 + 30 * k, 60))
+        assert 0 < n60 < 12 and sum(1 for r in sparse if r["by"] == "human") == 3 * 2 * n60
 
 
 def test_moments_loss_and_the_models_own_thresholds():
@@ -311,3 +321,25 @@ def test_plan_reads_wildlifereid_metadata():
     assert reid.plan_wr("Cows2021", meta)[0][:3] == ("19", "2020-02-13", "0")
     assert reid.plan_wr("OpenCows2020", meta)[0][:3] == ("16", "all", "0")              # no date: one "day"
     assert all(reid.SOURCES[s]["url"] == reid.WR10K for s in ("multicam", "cows2021", "opencows"))
+
+
+def test_whole_zip_fetched_again_when_not_a_zip():
+    import io
+    import zipfile
+    import reid
+    good = io.BytesIO()
+    with zipfile.ZipFile(good, "w") as z:
+        z.writestr("a.txt", "x")
+    calls = []
+
+    def fake_download(url, path):
+        calls.append(path)
+        if not os.path.exists(path):
+            open(path, "wb").write(b"<html>429</html>" if len(calls) == 1 else good.getvalue())
+        return path
+
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "x.zip")
+        open(p, "wb").write(b"<html>Too Many Requests</html>")       # an earlier run kept an error page
+        assert reid.whole_zip(fake_download, "u", p) == p and zipfile.is_zipfile(p)
+        assert len(calls) == 2

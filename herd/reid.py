@@ -194,6 +194,22 @@ def as_jpeg(data):
     return buf.getvalue()
 
 
+def whole_zip(download, url, path, tries=2):
+    """A zip downloaded whole and checked: a file that is not a zip (a server's error page, a transfer an
+    earlier run kept cut short) is deleted and fetched again."""
+    import zipfile
+    for k in range(tries):
+        download(url, path)
+        if zipfile.is_zipfile(path):
+            return path
+        with open(path, "rb") as fh:
+            head = fh.read(200)
+        print(f"[fetch] {os.path.basename(path)}: not a zip ({os.path.getsize(path) / 2 ** 20:.1f} MB, begins "
+              f"{head[:80]!r}) - deleted, " + ("fetched again" if k + 1 < tries else "giving up"), flush=True)
+        os.remove(path)
+    raise IOError(f"{url}: no zip after {tries} downloads")
+
+
 def cmd_fetch(args):
     sys.path.insert(0, os.path.join(os.path.dirname(HERE), "cowbench"))
     import csv
@@ -226,7 +242,7 @@ def cmd_fetch(args):
                 path = os.path.join(args.data, "zips", f"{src}{'_' + part if part else ''}.zip")
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 print(f"[fetch] {src}{' ' + part if part else ''}: downloading the zip whole", flush=True)
-                z = LocalZip(download(url, path))
+                z = LocalZip(whole_zip(download, url, path))
                 zips.append(path)
             else:
                 z = RemoteZip(url)
@@ -358,6 +374,8 @@ def fetch_mmcows(args):
         z, n, path, image = job
         _save(path, (lambda: shrink(z.read(n), args.mm_max_side)[0]) if image else (lambda: z.read(n)))
 
+    # what this fetch asked for: label takes only these seconds (frames of an earlier, denser fetch stay on disk)
+    write_json(os.path.join(root, "fetch.json"), {"label_every": args.mm_label_every, "uwb_every": args.mm_uwb_every})
     t0, done = time.time(), 0
     with cf.ThreadPoolExecutor(args.workers) as ex:
         for _ in ex.map(one, todo):
@@ -479,14 +497,19 @@ def cmd_label(args):
     models = pipeline.Models(cfg)
     size, margin = models.crop_size, models.margin
     rows, check = [], collections.Counter()
+    fj = os.path.join(root, "fetch.json")
+    every = json.load(open(fj)) if os.path.exists(fj) else {}
     for day in days:
         mats, tags = mm_mats(root, day), mm_uwb(root, day)
+        step = every.get("label_every" if day == MM_DAY else "uwb_every")
         for cam in MM_CAMS:
             folder = os.path.join(root, "frames", day, cam)
             if not os.path.isdir(folder) or cam not in mats:
                 continue
             done_path = os.path.join(root, "labelled", f"{day}_{cam}.jsonl")
             tss = sorted(int(f[:-4]) for f in os.listdir(folder) if f.endswith(".jpg"))
+            if step:                                      # the last fetch's seconds only
+                tss = [ts for ts in tss if _every(ts, step)]
             n_path = done_path[:-6] + ".frames"
             same = os.path.exists(n_path) and open(n_path).read().strip() == str(len(tss))
             if os.path.exists(done_path) and same and not args.force:
@@ -1274,8 +1297,8 @@ def main(argv=None):
                    help="MmCows days labelled by the neck tags, e.g. 0722 0728 0801 (none by default: ~4%% of their "
                         "labels are another cow, mostly a held-out one; 7/25 is the human-labelled day)")
     f.add_argument("--mm-uwb-every", type=int, default=30, help="seconds between those days' frames (15, 30, 60...)")
-    f.add_argument("--mm-label-every", type=int, default=15, help="seconds between 7/25's labelled frames "
-                   "(15: every label MmCows has)")
+    f.add_argument("--mm-label-every", type=int, default=60, help="seconds between 7/25's labelled frames "
+                   "(15: every label MmCows has; 60 knew unseen cows better - MmCows' ten cows outweigh the rest at 15)")
     f.add_argument("--mm-max-side", type=int, default=1920)
     lb.add_argument("--data", required=True)
     lb.add_argument("--model", required=True, help="the herd model (crop size and margin)")
