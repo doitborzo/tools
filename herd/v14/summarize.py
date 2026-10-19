@@ -32,17 +32,17 @@ def main(argv=None):
     sys_b = load(os.path.join(a.work, "system", "system_iou_per_camera.json"))
     sp = (idn or {}).get("split") or {}
     by_cows = sp.get("by") == "cows"
-    ver = "B" if ((sys_a or {}).get("settings") or {}).get("way") == "B" else "A"
-    L = [f"# Version 14 ({ver}): cow identification" + (", version 14 (A)'s weights (one barn, MmCows)" if ver == "B" and not idn else ", one barn (MmCows): different cows for training and testing"
+    ver = "C" if ((sys_a or {}).get("settings") or {}).get("way") == "C" else "A"
+    L = [f"# Version 14 ({ver}): cow identification" + (", version 14 (A)'s weights (one barn, MmCows)" if ver == "C" and not idn else ", one barn (MmCows): different cows for training and testing"
                                                    if by_cows else ", trained on MultiCamCows2024 + MmCows"), "",
          "Nothing from CBVD-5. Detector: version 10's, not retrained. DINOv2-S frozen. The ID transformer "
          "and the association transformer trained from scratch.", ""]
-    if ver == "B":
-        L += ["Version 14 (B) uses version 14 (A)'s weights, nothing retrained. At onboarding it measures the "
+    if ver == "C":
+        L += ["Version 14 (C) - Версія 14 (В) - uses version 14 (A)'s weights, nothing retrained. At onboarding it measures the "
               "barn's average cow in the setup hour and takes it out of every fingerprint before the album is built; "
               "the album threshold is set from the setup hour too, without labels (the same track a minute later = "
               "the same cow, two tracks seen together = two cows). The 'not sure' model was fitted on A's "
-              "similarities, so B always answers. Way A is scored on the same run.", ""]
+              "similarities, so C always answers. Way A is scored on the same run.", ""]
     if idn:
         t, prf, alw = idn["test"], idn["test_id_with_not_sure"], idn["test_id_always_answer"]
         if by_cows:
@@ -95,7 +95,7 @@ def main(argv=None):
               f"| ID F1, always answering | {pct(i2['f1'])} |", ""]
         st = s.get("settings") or {}
         if st.get("way"):
-            way_txt = {"A": "A (fingerprints as they come)", "B": "B (the barn's average cow taken out first)"}
+            way_txt = {"A": "A (fingerprints as they come)", "C": "C (the barn's average cow taken out first)"}
             L.insert(len(L) - 1, f"| album built by way | {way_txt.get(st['way'], st['way'])}, threshold {st.get('enrol_threshold')} |")
             cal = st.get("self_calibration")
             if cal:
@@ -118,7 +118,7 @@ def main(argv=None):
           ("- One barn: the test cows are new to the ID transformer, but the pen, light and cameras are not; with "
            "few cows, picking the right one is easier than in a real herd. The association transformer trained on "
            "all 16 cows outside 12:00-15:00 (it learns which boxes are one cow, not who the cow is)."
-           if by_cows else
+           if by_cows or ver == "C" else
            "- MultiCamCows crops are torsos from a walkway; MmCows crops are whole cows in a pen: the ID transformer "
            "meets a new kind of crop in the onboarding test, as it would on a new farm."), ""]
     os.makedirs(a.out, exist_ok=True)

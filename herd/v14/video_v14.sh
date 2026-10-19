@@ -10,7 +10,7 @@
 # Knobs: WORK=/workspace  TAG=assoc (or iou_per_camera: each camera alone)  SYS_END=13.5
 #        (the system runs 12:00 -> SYS_END: setup hour + identification)  FPS=5 (10x speed)
 #        CLIPS="12:00-12:10 13:00-13:10 13:10-13:30" (HH:MM or HH:MM:SS)  REALTIME=0 (1: barn speed)
-#        CENTER=off (on: v14 B - the barn's average cow taken out of the fingerprints)  NAME=V14A
+#        CENTER=off (on: v14 C - the barn's average cow taken out of the fingerprints)  NAME=V14A
 # -> /workspace/<NAME>_VIDEO.tar (the clips), <NAME>_RESULTS.tar (RESULTS.md + scores), <NAME>_MODELS.tgz
 
 set -euo pipefail
@@ -104,7 +104,7 @@ cp "$V/idnet/idnet.pt" "$M/"; [ -f "$V/assoc/assoc.pt" ] && cp "$V/assoc/assoc.p
     echo "assoc.pt   association transformer: detections of all cameras -> one cow"
     echo "detector   version 10's: herd/$DET_NAME/best (in the version 10 archive)"
     echo "Run:       python herd/v14/system.py --data <mmcows> --detector <best/> --idnet idnet.pt --assoc assoc.pt --out <dir> --center $CENTER"
-    echo "           --center on = v14 B: the barn's average cow is taken out of every fingerprint (measured in the"
+    echo "           --center on = v14 C: the barn's average cow is taken out of every fingerprint (measured in the"
     echo "           setup hour) and the album threshold is calibrated there too, without labels"
 } > "$M/HOW_TO_USE.txt"
 tar -czf "$WORK/${NAME}_MODELS.tgz" -C "$WORK" "${NAME}_MODELS"

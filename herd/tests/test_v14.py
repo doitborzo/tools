@@ -327,7 +327,7 @@ def test_video_from_a_made_up_system_run():
         assert tally["right"] >= 1 and tally["wrong"] >= 1
 
 
-def test_v14b_taking_out_the_average_cow_splits_the_album():
+def test_v14c_taking_out_the_average_cow_splits_the_album():
     import system
     rng = np.random.default_rng(5)
     dim, cows = 32, 6
@@ -352,5 +352,5 @@ def test_v14b_taking_out_the_average_cow_splits_the_album():
     thr, cal = system.self_threshold(rb, det_log, t0)
     assert thr is not None and cal["different_pairs"] > 0 and cal["same_p10"] > cal["different_p99"]
     _, ids_b, ta = system.enrol(rb, thr, 5)
-    assert len(set(ids_b.tolist())) == cows                       # way B: one album cow per cow
+    assert len(set(ids_b.tolist())) == cows                       # way C: one album cow per cow
     assert ta[0] == ta[6]                                         # cow 0's two tracks: one album cow

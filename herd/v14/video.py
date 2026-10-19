@@ -217,7 +217,7 @@ def main(argv=None):
     p.add_argument("--to", dest="time_to", default="13:10")
     p.add_argument("--fps", type=float, default=5.0, help="video frames per second (one per 2-s step: 5 = 10x speed)")
     p.add_argument("--realtime", action="store_true", help="play at the barn's speed: each moment repeated to last its step")
-    p.add_argument("--title", default="", help="text before the header, e.g. 'v14 (B)  '")
+    p.add_argument("--title", default="", help="text before the header, e.g. 'v14 (C)  '")
     p.add_argument("--width", type=int, default=1920)
     p.add_argument("--match-iou", type=float, default=0.3)
     p.add_argument("--out", required=True)

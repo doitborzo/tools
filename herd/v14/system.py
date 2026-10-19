@@ -174,16 +174,16 @@ def run(args):
     print(flush=True)
 
     # --- album from the setup minutes, then identification (scoreboards + ID desk), both ways:
-    #     A = the fingerprints as they come; B = the barn's "average cow" removed first (v14 B)
+    #     A = the fingerprints as they come; C = the barn's "average cow" removed first (v14 C)
     setup_m = args.setup_min
     sp = idck.get("split") or {}
     groups = ({"unseen_by_id_model (its test cows)": sp["test"], "id_model_val_cows": sp["val"],
                "id_model_train_cows": sp["train"]} if sp.get("by") == "cows" else None)
     setup_recs = [r for r in minute_recs if r[0] < setup_m]
     out = {}
-    for way in ("A", "B"):
+    for way in ("A", "C"):
         recs, thr, nan_w, calib = minute_recs, enrol_thr, nan, None
-        if way == "B":
+        if way == "C":
             if len(setup_recs) < 3:
                 continue
             c = centering(setup_recs)
@@ -191,7 +191,7 @@ def run(args):
             thr, calib = self_threshold([r for r in recs if r[0] < setup_m], det_log, t_start)
             calib = {**calib, "setup_fingerprints": c["fingerprints"], "biggest_direction_share": round(c["top_share"], 4)}
             thr = thr if thr is not None else 0.5
-            nan_w = None          # the "not sure" model was fitted on A's similarities: B always answers
+            nan_w = None          # the "not sure" model was fitted on A's similarities: C always answers
         alb_P, alb_ids, track_album = enrol([r for r in recs if r[0] < setup_m], thr, args.min_minutes)
         print(f"[system:{way}] album: {len(set(alb_ids.tolist())) if len(alb_ids) else 0} cows from "
               f"{len({r[1] for r in recs if r[0] < setup_m})} setup tracks (threshold {thr})", flush=True)
@@ -203,9 +203,9 @@ def run(args):
         res["settings"].update({"way": way, "pair_threshold": pair_thr, "enrol_threshold": thr,
                                 "nan_threshold": (nan_w or {}).get("threshold"), "self_calibration": calib})
         out[way] = (res, names, track_album)
-    primary = "B" if args.center == "on" and "B" in out else "A"
+    primary = "C" if args.center == "on" and "C" in out else "A"
     res, names, track_album = out[primary]
-    other = "A" if primary == "B" else "B"
+    other = "A" if primary == "C" else "C"
     if other in out:
         o = out[other][0]
         res["other_way"] = {"way": other, "album": {k: v for k, v in o["album"].items() if k != "mapping"},
@@ -323,7 +323,7 @@ def fingerprints(idm, tracks, t0, t1, minute, dev, min_frames):
 
 
 def centering(recs, shrink=1.0):
-    """v14 (B): this barn's "average cow" and spread, from the setup fingerprints alone (no labels):
+    """v14 (C): this barn's "average cow" and spread, from the setup fingerprints alone (no labels):
     the mean is taken out and every direction scaled to an even spread (whitening, shrunk towards
     the mean spread so a few setup minutes cannot blow up noise)."""
     X = np.stack([r[2] for r in recs]).astype(np.float64)
@@ -550,7 +550,7 @@ def main(argv=None):
     p.add_argument("--ema", type=float, default=0.5, help="weight of the newest minute on the scoreboard")
     p.add_argument("--match-iou", type=float, default=0.3, help="detection to labelled box, for scoring")
     p.add_argument("--center", choices=("on", "off"), default="on",
-                   help="v14 (B): take the barn's average cow out of the fingerprints before the album "
+                   help="v14 (C): take the barn's average cow out of the fingerprints before the album "
                         "(on), or not (off = v14 A); the other way is scored too, as other_way")
     args = p.parse_args(argv)
     run(args)
