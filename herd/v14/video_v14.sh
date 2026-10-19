@@ -83,7 +83,9 @@ for c in $CLIPS; do
         --title "$TITLE" --out "$O/${lower}_${TAG}_${a//:/}-${b//:/}.mp4"
 done
 cp "$S/system_$TAG.json" "$O/" 2>/dev/null || true
-tar -cf "$WORK/${NAME}_VIDEO.tar" -C "$WORK" "${NAME}_VIDEO"
+# tar's exit 1 = "a file changed as we read it" (the last clip still being flushed): wait, pack again
+pack() { sync; sleep 3; tar "$@" || { r=$?; [ "$r" = 1 ] && { sleep 10; sync; tar "$@"; } || return "$r"; }; }
+pack -cf "$WORK/${NAME}_VIDEO.tar" -C "$WORK" "${NAME}_VIDEO"
 
 # results: RESULTS.md (with the other way, A or B, scored on the same run) + the raw scores
 R="$WORK/${NAME}_RESULTS"
@@ -97,7 +99,7 @@ VER="${NAME#V14}"; [ "$VER" = A ] && VER=""
 for d in system idnet assoc; do [ -d "$R/work/$d" ] && mv "$R/work/$d" "$R/$d"; done; rm -rf "$R/work"
 cp "$S/names_$TAG.json" "$R/system/"
 cp "$LOG" "$R/" 2>/dev/null || true
-tar -cf "$WORK/${NAME}_RESULTS.tar" -C "$WORK" "${NAME}_RESULTS"
+pack -cf "$WORK/${NAME}_RESULTS.tar" -C "$WORK" "${NAME}_RESULTS"
 
 # weights: the same files - B changes only how the album is built at onboarding
 M="$WORK/${NAME}_MODELS"
@@ -112,7 +114,7 @@ cp "$IDNET" "$M/idnet.pt"; [ -f "$V/assoc/assoc.pt" ] && cp "$V/assoc/assoc.pt" 
     echo "           --center on = v14 C: the barn's average cow is taken out of every fingerprint (measured in the"
     echo "           setup hour) and the album threshold is calibrated there too, without labels"
 } > "$M/HOW_TO_USE.txt"
-tar -czf "$WORK/${NAME}_MODELS.tgz" -C "$WORK" "${NAME}_MODELS"
+pack -czf "$WORK/${NAME}_MODELS.tgz" -C "$WORK" "${NAME}_MODELS"
 
 echo
 echo "Done:"
