@@ -39,6 +39,8 @@ COPY docker/entrypoint.sh docker/warmup.py /opt/herd/docker/
 # weights (configs, the detector's backbone) is kept in the image; after this the container is offline
 WORKDIR /models
 RUN python /opt/herd/docker/warmup.py
+# a checkout on Windows may have turned the script's line ends into CRLF: bash wants LF
+RUN sed -i 's/\r$//' /opt/herd/docker/entrypoint.sh
 ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 
 WORKDIR /data
