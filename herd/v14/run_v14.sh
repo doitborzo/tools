@@ -20,6 +20,10 @@
 #        MCC_WAIT_H=12 (hours to wait for data.bris.ac.uk)  MCC_ZIP (where the MultiCamCows zip is / goes)
 #        PRETRAINED=<link to a V14A_MODELS.tgz> (a Google Drive share link works): no training - the
 #        weights are downloaded after the MmCows step and video_v14.sh runs on them (no steps 4-8)
+#        ID_DATA=wr10k: v14 (D) - the ID transformer trains on WildlifeReID-10k's cattle (Kaggle) and is
+#        tested on all of MmCows' cows; ASSOC_PRETRAINED=<link to a *_MODELS.tgz>: its assoc.pt is used
+#        (scored on the test window) instead of training one; NAME=<V14D ..>: after step 6, video_v14.sh
+#        makes <NAME>_RESULTS.tar, <NAME>_MODELS.tgz, <NAME>_VIDEO.tar instead of steps 7-8
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,6 +49,7 @@ ID_DATA="${ID_DATA:-mmcows}"
 MCC_ZIP="${MCC_ZIP:-}"
 MCC_URL="${MCC_URL:-https://data.bris.ac.uk/datasets/tar/2inu67jru7a6821kkgehxg3cv2.zip}"
 PRETRAINED="${PRETRAINED:-}"
+ASSOC_PRETRAINED="${ASSOC_PRETRAINED:-}"
 VIDEO_END="${VIDEO_END:-13.5}"
 CENTER="${CENTER:-}"; NAME="${NAME:-}"; REALTIME="${REALTIME:-}"; CLIPS="${CLIPS:-}"; FPS="${FPS:-}"; TITLE="${TITLE:-}"
 export HF_HOME="$WORK/hf-cache"
@@ -66,7 +71,7 @@ if [ -z "${V14_IN_TMUX:-}" ]; then
     if tmux has-session -t "=$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     mkdir -p "$V"
     knobs=""
-    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP ID_DATA PRETRAINED VIDEO_END CENTER NAME REALTIME CLIPS FPS TITLE; do
+    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP ID_DATA PRETRAINED ASSOC_PRETRAINED VIDEO_END CENTER NAME REALTIME CLIPS FPS TITLE; do
         knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env V14_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/run_v14.sh"); echo; echo '[run_v14.sh finished]'; exec bash"
@@ -114,18 +119,20 @@ again() {   # a download step, tried up to 4 times (Hugging Face sometimes cuts 
 again "$PY" data_mmcows.py labels --out "$V/mmcows"
 again "$PY" data_mmcows.py frames --out "$V/mmcows" --train-every "$TRAIN_EVERY" --window-every "$WINDOW_EVERY" --start "$START" --end "$END"
 "$PY" data_mmcows.py inspect --out "$V/mmcows" | tee "$V/mmcows_live_inspect.txt"
+fetch_models() {   # $1 a link to a *_MODELS.tgz -> extracted in $V/pretrained; prints nothing on success
+    local id url a="$V/pretrained.tgz"
+    id="$(printf '%s' "$1" | sed -nE 's#.*(/d/|[?&]id=)([A-Za-z0-9_-]{20,}).*#\2#p')"
+    url="$1"; [ -n "$id" ] && url="https://drive.usercontent.google.com/download?id=$id&export=download&confirm=t"
+    [ -s "$a" ] || curl -L --fail --retry 5 -o "$a" "$url"
+    head -c 512 "$a" | grep -qi '<html' && { rm -f "$a"; echo "!! the link gives a web page: share it as 'Anyone with the link'"; exit 1; }
+    rm -rf "$V/pretrained" && mkdir -p "$V/pretrained" && tar -xzf "$a" -C "$V/pretrained"
+}
 if [ -n "$PRETRAINED" ]; then
     # only what the video needs: the 1-second stream up to VIDEO_END, then the given weights
     again "$PY" data_mmcows.py live --out "$V/mmcows" --live-step "$LIVE_STEP" --start "$START" --end "$VIDEO_END"
     step "4/4  Trained weights instead of training: $PRETRAINED"
-    ID="$(printf '%s' "$PRETRAINED" | sed -nE 's#.*(/d/|[?&]id=)([A-Za-z0-9_-]{20,}).*#\2#p')"
-    URL="$PRETRAINED"
-    [ -n "$ID" ] && URL="https://drive.usercontent.google.com/download?id=$ID&export=download&confirm=t"
-    A="$V/pretrained.tgz"
-    [ -s "$A" ] || curl -L --fail --retry 5 -o "$A" "$URL"
-    head -c 512 "$A" | grep -qi '<html' && { rm -f "$A"; echo "!! the link gives a web page: share it as 'Anyone with the link'"; exit 1; }
-    rm -rf "$V/pretrained" && mkdir -p "$V/pretrained" "$V/idnet" "$V/assoc"
-    tar -xzf "$A" -C "$V/pretrained"
+    fetch_models "$PRETRAINED"
+    mkdir -p "$V/idnet" "$V/assoc"
     IDP="$(find "$V/pretrained" -name idnet.pt | head -n 1)"; ASP="$(find "$V/pretrained" -name assoc.pt | head -n 1)"
     [ -n "$IDP" ] || { echo "!! no idnet.pt in the archive:"; find "$V/pretrained"; exit 1; }
     cp "$IDP" "$V/idnet/idnet.pt"
@@ -157,21 +164,46 @@ for j in 1 2 3 4 5 6; do
     [ "$j" = 6 ] && { echo "!! the MultiCamCows fetch failed 6 times"; exit 1; }
     echo "   fetch stopped - resume in 10 min"; sleep 600
 done
+elif [ "$ID_DATA" = wr10k ]; then
+    step "4/8  WildlifeReID-10k's cattle (Kaggle, read in place) -> DINOv2; + MmCows' boxes as the test"
+    again "$PY" data_wr10k.py fetch --out "$V/wr10k"
+    "$PY" data_wr10k.py combine --wr "$V/wr10k" --mm "$V/mmcows/idcrops" --out "$V/idd"
 else echo "skipped: the ID transformer trains on MmCows cows (ID_DATA=mmcows)"; fi
 
+IDN="$V/idnet"
 if [ "$ID_DATA" = mcc ]; then
     step "5/8  ID transformer (from scratch): MultiCamCows days 1-5 -> day 6 picks -> day 7 tests"
     ID_ARGS=(--feats "$V/mcc" --split days)
+elif [ "$ID_DATA" = wr10k ]; then
+    step "5/8  ID transformer (from scratch): WildlifeReID-10k cows train, held-out ones pick, MmCows' 16 test it"
+    IDN="$V/idnet_wr10k"
+    ID_ARGS=(--feats "$V/idd" --split groups --time-aug 0.25 --time-aug-max 15 --P 32)
 else
     step "5/8  ID transformer (from scratch): MmCows, 8 cows train, 3 pick the epoch, 5 never seen test it"
     ID_ARGS=(--feats "$V/mmcows/idcrops" --split cows --val-cows 3 --test-cows 5 --time-aug 0.02 --P 8)
 fi
-if [ -f "$V/idnet/idnet.pt" ] && [ -f "$V/idnet/eval_id.json" ]; then echo "trained already"; else
-    "$PY" idnet.py train "${ID_ARGS[@]}" --out "$V/idnet" --epochs "$ID_EPOCHS"; fi
+if [ -f "$IDN/idnet.pt" ] && [ -f "$IDN/eval_id.json" ]; then echo "trained already"; else
+    "$PY" idnet.py train "${ID_ARGS[@]}" --out "$IDN" --epochs "$ID_EPOCHS"; fi
 
+if [ -n "$ASSOC_PRETRAINED" ]; then
+    step "6/8  Association transformer: the trained one from $ASSOC_PRETRAINED, scored on the test window"
+    if [ ! -f "$V/assoc/eval_assoc.json" ] || [ ! -f "$V/assoc/.from_pretrained" ]; then
+        fetch_models "$ASSOC_PRETRAINED"
+        ASP="$(find "$V/pretrained" -name assoc.pt | head -n 1)"
+        [ -n "$ASP" ] || { echo "!! no assoc.pt in the archive:"; find "$V/pretrained"; exit 1; }
+        mkdir -p "$V/assoc" && cp "$ASP" "$V/assoc/assoc.pt" && touch "$V/assoc/.from_pretrained"
+        "$PY" assoc.py eval --data "$V/mmcows" --out "$V/assoc"
+    else echo "in place already"; fi
+else
 step "6/8  Association transformer (from scratch): MmCows outside the test window -> the window"
 if [ -f "$V/assoc/assoc.pt" ] && [ -f "$V/assoc/eval_assoc.json" ]; then echo "trained already"; else
     "$PY" assoc.py train --data "$V/mmcows" --out "$V/assoc" --epochs "$ASSOC_EPOCHS"; fi
+fi
+
+if [ -n "$NAME" ]; then
+    echo "models ready - now $NAME's onboarding test, videos, results and weights (log: $V/video_log.txt)"
+    V14V_IN_TMUX=1 WORK="$WORK" DET_NAME="$DET_NAME" SYS_END="$END" IDNET="$IDN/idnet.pt" exec bash "$HERE/video_v14.sh"
+fi
 
 step "7/8  Onboarding test on MmCows (inference only): setup $SETUP_MIN min, then identification"
 "$PY" system.py --data "$V/mmcows" --detector "$DET" --idnet "$V/idnet/idnet.pt" --assoc "$V/assoc/assoc.pt" \

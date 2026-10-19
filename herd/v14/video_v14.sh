@@ -29,6 +29,7 @@ CENTER="${CENTER:-off}"
 NAME="${NAME:-V14A}"
 REALTIME="${REALTIME:-0}"
 TITLE="${TITLE:-}"
+IDNET="${IDNET:-$V/idnet/idnet.pt}"
 export HF_HOME="$WORK/hf-cache"
 
 case "${1:-}" in
@@ -42,12 +43,12 @@ case "${1:-}" in
 esac
 
 if [ -z "${V14V_IN_TMUX:-}" ]; then
-    for f in "$PY" "$V/idnet/idnet.pt" "$V/mmcows/live.jsonl"; do
+    for f in "$PY" "$IDNET" "$V/mmcows/live.jsonl"; do
         [ -e "$f" ] || { echo "missing $f - run herd/v14/run_v14.sh first"; exit 1; }; done
     [ "$TAG" = iou_per_camera ] || [ -f "$V/assoc/assoc.pt" ] || { echo "missing $V/assoc/assoc.pt"; exit 1; }
     if tmux has-session -t "=$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     knobs=""
-    for v in WORK TAG SYS_END FPS CLIPS DET_NAME CENTER NAME REALTIME TITLE; do knobs+="$v=$(printf '%q' "${!v}") "; done
+    for v in WORK TAG SYS_END FPS CLIPS DET_NAME CENTER NAME REALTIME TITLE IDNET; do knobs+="$v=$(printf '%q' "${!v}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env V14V_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/video_v14.sh"); echo; echo '[video_v14.sh finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log"
@@ -67,7 +68,7 @@ step "2/3  onboarding test again, keeping what it said (12:00 -> $SYS_END h, tra
 S="$V/system_video"; [ "$NAME" = V14A ] || S="$V/system_$NAME"
 if [ -f "$S/names_$TAG.json" ]; then echo "done already: $S/names_$TAG.json"; else
     ASSOC="$V/assoc/assoc.pt"; [ "$TAG" = iou_per_camera ] && ASSOC=none
-    "$PY" system.py --data "$V/mmcows" --detector "$WORK/herd/$DET_NAME/best" --idnet "$V/idnet/idnet.pt" \
+    "$PY" system.py --data "$V/mmcows" --detector "$WORK/herd/$DET_NAME/best" --idnet "$IDNET" \
         --assoc "$ASSOC" --out "$S" --start 12 --end "$SYS_END" --setup-min 60 --step 2 --center "$CENTER"
 fi
 
@@ -88,8 +89,12 @@ tar -cf "$WORK/${NAME}_VIDEO.tar" -C "$WORK" "${NAME}_VIDEO"
 R="$WORK/${NAME}_RESULTS"
 rm -rf "$R"; mkdir -p "$R/work/system"
 cp "$S/system_$TAG.json" "$R/work/system/system_$TAG.json"
-"$PY" summarize.py --work "$R/work" --out "$R" > /dev/null
-mv "$R/work/system" "$R/system"; rm -rf "$R/work"
+ID_DIR="$(dirname "$IDNET")"
+for f in eval_id.json history.json; do [ -f "$ID_DIR/$f" ] && mkdir -p "$R/work/idnet" && cp "$ID_DIR/$f" "$R/work/idnet/"; done
+for f in eval_assoc.json history.json; do [ -f "$V/assoc/$f" ] && mkdir -p "$R/work/assoc" && cp "$V/assoc/$f" "$R/work/assoc/"; done
+VER="${NAME#V14}"; [ "$VER" = A ] && VER=""
+"$PY" summarize.py --work "$R/work" --out "$R" ${VER:+--version "$VER"} > /dev/null
+for d in system idnet assoc; do [ -d "$R/work/$d" ] && mv "$R/work/$d" "$R/$d"; done; rm -rf "$R/work"
 cp "$S/names_$TAG.json" "$R/system/"
 cp "$LOG" "$R/" 2>/dev/null || true
 tar -cf "$WORK/${NAME}_RESULTS.tar" -C "$WORK" "${NAME}_RESULTS"
@@ -97,7 +102,7 @@ tar -cf "$WORK/${NAME}_RESULTS.tar" -C "$WORK" "${NAME}_RESULTS"
 # weights: the same files - B changes only how the album is built at onboarding
 M="$WORK/${NAME}_MODELS"
 rm -rf "$M"; mkdir -p "$M"
-cp "$V/idnet/idnet.pt" "$M/"; [ -f "$V/assoc/assoc.pt" ] && cp "$V/assoc/assoc.pt" "$M/"
+cp "$IDNET" "$M/idnet.pt"; [ -f "$V/assoc/assoc.pt" ] && cp "$V/assoc/assoc.pt" "$M/"
 {
     echo "$NAME models, $(date '+%F %T')"
     echo "idnet.pt   ID transformer: crop sequence -> fingerprint"

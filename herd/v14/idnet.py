@@ -246,8 +246,22 @@ def split_plan(store, args):
     cows: the store has two parts of the day ("A" earlier, "B" later); cows are split at random
           (split_seed) into train / val / test; val and test cows: album from A, queries from B -
           cows the model never saw (MmCows, one barn)."""
-    keys = sorted(store.seqs)
+    keys = sorted(store.seqs, key=lambda k: (k[0], str(k[1]), k[2]))
     days = store.days()
+    if args.split == "groups":
+        # v14 (D): the parts are named in the rows (data_wr10k.py combine): train, valA/valB (held-out
+        # cows), testA/testB (MmCows' cows, never trained on)
+        need = {"train", "valA", "valB", "testA", "testB"}
+        if not need <= set(days):
+            sys.exit(f"--split groups needs parts {sorted(need)}, found {days}")
+        of = lambda d: [k for k in keys if k[0] == d]
+        cows = lambda d: sorted({k[1] for k in of(d)}, key=str)
+        print(f"[idnet] groups: {len(cows('train'))} training cows, {len(cows('valA'))} val cows, "
+              f"{len(cows('testA'))} test cows (never trained on)", flush=True)
+        return {"train": of("train"), "val_album": of("valA"), "val_query": of("valB"),
+                "test_album": of("testA"), "test_query": of("testB"),
+                "about": {"by": "groups", "train": cows("train"), "val": cows("valA"), "test": cows("testA"),
+                          "args": {"split": "groups"}}}
     if args.split == "days":
         if len(days) < 3:
             sys.exit(f"need at least 3 days, found {days}")
@@ -293,6 +307,15 @@ def cmd_train(args):
         if len(tr[k]) >= 2:
             by_cow[k[1]].append(k)
     cows = [c for c, ks in by_cow.items() if len(ks) >= 2]
+    # batches from one source set at a time (--pure-batches): a cow in two sets under two names never
+    # meets herself as a "different cow"
+    ds_of = {c: store.rows[tr[by_cow[c][0]][0]].get("dataset") for c in cows}
+    pools = collections.defaultdict(list)
+    for c in cows:
+        pools[ds_of[c]].append(c)
+    pure = bool(getattr(args, "pure_batches", 1)) and len(pools) > 1
+    if pure:
+        print(f"[idnet] batches from one set at a time: {({k: len(v) for k, v in pools.items()})}", flush=True)
     print(f"[idnet] {len(tr)} train sequences, {len(cows)} cows with >= 2 sequences", flush=True)
     model = build(store.feats.shape[1], d=args.d, layers=args.layers, heads=args.heads, dropout=args.dropout).to(dev)
     n_par = sum(p.numel() for p in model.parameters())
@@ -307,7 +330,11 @@ def cmd_train(args):
         model.train()
         losses = []
         for _ in range(steps_per_epoch):
-            pick = rng.sample(cows, min(args.P, len(cows)))
+            if pure:
+                ds = rng.choices(list(pools), weights=[len(v) for v in pools.values()])[0]
+                pick = rng.sample(pools[ds], min(args.P, len(pools[ds])))
+            else:
+                pick = rng.sample(cows, min(args.P, len(cows)))
             seqs, labels = [], []
             for ci, c in enumerate(pick):
                 ks = by_cow[c]
@@ -317,8 +344,8 @@ def cmd_train(args):
                 for k in (a, b):
                     L = rng.randint(args.min_len, args.max_len)
                     f, t = store.seq(tr[k], rng, L, rng.choice((1, 1, 2, 3, 5)))   # 5, 2.5, 1.7, 1 Hz
-                    if args.time_aug < 1:      # sparse frames (one a minute) taught at the live stream's pace too
-                        t = t * float(np.exp(rng.uniform(np.log(args.time_aug), 0)))
+                    if args.time_aug < 1 or getattr(args, "time_aug_max", 1.0) > 1:   # the gaps between frames, stretched or squeezed
+                        t = t * float(np.exp(rng.uniform(np.log(args.time_aug), np.log(getattr(args, "time_aug_max", 1.0)))))
                     keep = np.array([rng.random() > args.drop for _ in range(len(f))]) if len(f) > 2 else np.ones(len(f), bool)
                     keep[rng.randrange(len(f))] = True
                     seqs.append((f[keep], t[keep] - t[keep][0])), labels.append(ci)
@@ -408,7 +435,7 @@ def main(argv=None):
         s.add_argument("--feats", required=True, help="data_mcc.py's or data_mmcows.py idcrops' feature folder")
         s.add_argument("--out", required=True)
         s.add_argument("--max-error", type=float, default=0.01)
-        s.add_argument("--split", choices=("days", "cows"), default="days",
+        s.add_argument("--split", choices=("days", "cows", "groups"), default="days",
                        help="days: train on early days, test on the last (MultiCamCows); cows: one barn, "
                             "train on some cows, test on others never seen (MmCows)")
         s.add_argument("--val-cows", type=int, default=3)
@@ -432,6 +459,8 @@ def main(argv=None):
             s.add_argument("--seed", type=int, default=0)
             s.add_argument("--time-aug", type=float, default=1.0,
                            help="< 1: sequence times squeezed by up to this factor at random")
+            s.add_argument("--time-aug-max", type=float, default=1.0, help="> 1: ... or stretched up to this factor")
+            s.add_argument("--pure-batches", type=int, default=1, help="1: each batch from one source set")
     args = p.parse_args(argv)
     return {"train": cmd_train, "eval": cmd_eval}[args.cmd](args)
 

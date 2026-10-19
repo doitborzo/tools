@@ -25,6 +25,7 @@ def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--work", required=True, help="the v14 folder (idnet/, assoc/, system/ inside)")
     p.add_argument("--out", required=True)
+    p.add_argument("--version", default=None, help="A, C, D ... (default: from the run)")
     a = p.parse_args(argv)
     idn = load(os.path.join(a.work, "idnet", "eval_id.json"))
     asc = load(os.path.join(a.work, "assoc", "eval_assoc.json"))
@@ -32,8 +33,10 @@ def main(argv=None):
     sys_b = load(os.path.join(a.work, "system", "system_iou_per_camera.json"))
     sp = (idn or {}).get("split") or {}
     by_cows = sp.get("by") == "cows"
-    ver = "C" if ((sys_a or {}).get("settings") or {}).get("way") == "C" else "A"
-    L = [f"# Version 14 ({ver}): cow identification" + (", version 14 (A)'s weights (one barn, MmCows)" if ver == "C" and not idn else ", one barn (MmCows): different cows for training and testing"
+    by_groups = sp.get("by") == "groups"
+    ver = a.version or ("C" if ((sys_a or {}).get("settings") or {}).get("way") == "C" else "A")
+    L = [f"# Version 14 ({ver}): cow identification" + (", trained on WildlifeReID-10k's cattle, tested on MmCows' "
+                                                        "16 cows (none trained on)" if by_groups else ", version 14 (A)'s weights (one barn, MmCows)" if ver == "C" and not idn else ", one barn (MmCows): different cows for training and testing"
                                                    if by_cows else ", trained on MultiCamCows2024 + MmCows"), "",
          "Nothing from CBVD-5. Detector: version 10's, not retrained. DINOv2-S frozen. The ID transformer "
          "and the association transformer trained from scratch.", ""]
@@ -43,9 +46,22 @@ def main(argv=None):
               "the album threshold is set from the setup hour too, without labels (the same track a minute later = "
               "the same cow, two tracks seen together = two cows). The 'not sure' model was fitted on A's "
               "similarities, so C always answers. Way A is scored on the same run.", ""]
+    if ver == "D":
+        L += ["Version 14 (D): the ID transformer trained from scratch on the cattle of WildlifeReID-10k (Cows2021, "
+              "MultiCamCows2024, OpenCows2020, CowDataset - about 300 cows; each batch from one set, so a cow in two "
+              "sets never meets herself as another cow). Held-out WildlifeReID-10k cows pick the epoch, the 'not "
+              "sure' model and the enrolment threshold. Nothing from MmCows trains it: every MmCows cow is new. "
+              "The association transformer and the detector are version 14 (A)'s / version 10's.", ""]
     if idn:
         t, prf, alw = idn["test"], idn["test_id_with_not_sure"], idn["test_id_always_answer"]
-        if by_cows:
+        if by_groups:
+            n = len(sp["test"])
+            L += ["## 1. ID transformer on MmCows' 16 cows (a barn and cows it never saw)", "",
+                  f"Trained on {len(sp['train'])} WildlifeReID-10k cows; epoch, 'not sure' model and enrolment "
+                  f"threshold picked on {len(sp['val'])} held-out ones; tested on MmCows' {n} cows: album from "
+                  f"before 12:00, queries every sequence after 15:00 (labelled frames a minute apart). With {n} "
+                  f"cows, guessing gets {1 / max(1, n):.0%} top-1.", ""]
+        elif by_cows:
             L += ["## 1. ID transformer on MmCows cows it never saw", "",
                   f"Trained on cows {sp['train']} ({len(sp['train'])}); epoch, 'not sure' model and enrolment "
                   f"threshold picked on cows {sp['val']}; tested on cows {sp['test']} ({len(sp['test'])}, never "
@@ -118,7 +134,11 @@ def main(argv=None):
           ("- One barn: the test cows are new to the ID transformer, but the pen, light and cameras are not; with "
            "few cows, picking the right one is easier than in a real herd. The association transformer trained on "
            "all 16 cows outside 12:00-15:00 (it learns which boxes are one cow, not who the cow is)."
-           if by_cows or ver == "C" else
+           if (by_cows or ver == "C") and not by_groups else
+           "- WildlifeReID-10k: non-commercial, no re-upload of its images, every source set attributed (its "
+           "citation folder). Its cattle are top-down torso crops (Bristol's sets) and side views (CowDataset); "
+           "MmCows' cameras look down at an angle on whole cows: a new kind of view for the ID transformer."
+           if by_groups else
            "- MultiCamCows crops are torsos from a walkway; MmCows crops are whole cows in a pen: the ID transformer "
            "meets a new kind of crop in the onboarding test, as it would on a new farm."), ""]
     os.makedirs(a.out, exist_ok=True)

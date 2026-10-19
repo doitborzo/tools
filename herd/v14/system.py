@@ -178,7 +178,8 @@ def run(args):
     setup_m = args.setup_min
     sp = idck.get("split") or {}
     groups = ({"unseen_by_id_model (its test cows)": sp["test"], "id_model_val_cows": sp["val"],
-               "id_model_train_cows": sp["train"]} if sp.get("by") == "cows" else None)
+               "id_model_train_cows": sp["train"]} if sp.get("by") == "cows" else
+              {"unseen_by_id_model (all MmCows cows)": sp["test"]} if sp.get("by") == "groups" else None)
     setup_recs = [r for r in minute_recs if r[0] < setup_m]
     out = {}
     for way in ("A", "C"):

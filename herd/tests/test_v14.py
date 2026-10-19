@@ -354,3 +354,50 @@ def test_v14c_taking_out_the_average_cow_splits_the_album():
     _, ids_b, ta = system.enrol(rb, thr, 5)
     assert len(set(ids_b.tolist())) == cows                       # way C: one album cow per cow
     assert ta[0] == ta[6]                                         # cow 0's two tracks: one album cow
+
+
+def test_v14d_wildlifereid_plan_combine_and_training():
+    import data_wr10k as W
+    import idnet
+    rng = np.random.default_rng(7)
+    meta = []
+    for ds, n_cows in (("Cows2021", 12), ("OpenCows2020", 6), ("AerialCattle2017", 3)):
+        for c in range(n_cows):
+            for i in range(10):
+                meta.append({"identity": f"{ds}_{c}", "path": f"images/{ds}/{c}/{i}.jpg", "date": f"2020-02-{i + 1:02d}",
+                             "dataset": ds, "split": "train"})
+    meta.append({"identity": "Cows2021_tiny", "path": "images/Cows2021/tiny/0.jpg", "date": "", "dataset": "Cows2021", "split": "train"})
+    keep = W.plan(meta, "Cows2021,OpenCows2020", min_images=4, val_share=0.2, seq_len=4, spacing=4.0)
+    assert {r["dataset"] for r in keep} == {"Cows2021", "OpenCows2020"}         # AerialCattle2017 left out
+    assert "Cows2021_tiny" not in {r["cow"] for r in keep}                       # too few images
+    val = {r["cow"] for r in keep if r["day"] != "train"}
+    assert len(val) == 2 + 1 and not val & {r["cow"] for r in keep if r["day"] == "train"}
+    a = [r for r in keep if r["cow"] == sorted(val)[0]]
+    assert max(r["name"] for r in a if r["day"] == "valA") < min(r["name"] for r in a if r["day"] == "valB")
+    assert max(r["t"] for r in keep) == 12.0                                     # 4 per sequence, 4 s apart
+    with tempfile.TemporaryDirectory() as d:
+        wr, mm, out = (os.path.join(d, x) for x in ("wr", "mm", "idd"))
+        dim = 48
+        proto = {c: rng.normal(size=dim) for c in {r["cow"] for r in keep}}
+        os.makedirs(wr)
+        np.save(os.path.join(wr, "feats.npy"), np.array([proto[r["cow"]] + rng.normal(scale=0.5, size=dim) for r in keep], np.float16))
+        with open(os.path.join(wr, "crops.jsonl"), "w") as fh:
+            for r in keep:
+                fh.write(json.dumps(r) + "\n")
+        json.dump({"encoder": "stub", "grid": 2, "crop": 224, "dim": dim}, open(os.path.join(wr, "meta.json"), "w"))
+        fake_mcc(mm, days=2, cows=6, seqs=3, frames=6, dim=dim, seed=3)           # stands in for MmCows' idcrops
+        rows = [json.loads(l) for l in open(os.path.join(mm, "crops.jsonl"))]
+        with open(os.path.join(mm, "crops.jsonl"), "w") as fh:
+            for r in rows:
+                fh.write(json.dumps({**r, "day": "A" if r["day"].endswith("14") else "B"}) + "\n")
+        W.main(["combine", "--wr", wr, "--mm", mm, "--out", out])
+        days = collections.Counter(json.loads(l)["day"] for l in open(os.path.join(out, "crops.jsonl")))
+        assert set(days) == {"train", "valA", "valB", "testA", "testB"}
+        a = argparse.Namespace(feats=out, out=os.path.join(d, "idnet"), max_error=0.05, epochs=3, patience=3, P=8,
+                               min_len=2, max_len=4, drop=0.1, noise=0.01, d=32, layers=1, heads=2, dropout=0.0,
+                               lr=2e-3, wd=0.0, temperature=0.1, seed=0, split="groups", val_cows=3, test_cows=5,
+                               split_seed=0, time_aug=0.25, time_aug_max=15.0, pure_batches=1)
+        idnet.cmd_train(a)
+        ev = json.load(open(os.path.join(d, "idnet", "eval_id.json")))
+        assert ev["split"]["by"] == "groups" and len(ev["split"]["test"]) == 6 and ev["test"]["queries"] > 0
+        assert not set(map(str, ev["split"]["test"])) & set(map(str, ev["split"]["train"]))
