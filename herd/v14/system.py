@@ -197,6 +197,12 @@ def run(args):
     with open(os.path.join(args.out, f"tracks_{tag}.jsonl"), "w", encoding="utf-8") as fh:
         for tm, cam, box, tid, conf in det_log:
             fh.write(json.dumps({"t": tm, "cam": cam, "box": box, "track": tid, "conf": round(conf, 3)}) + "\n")
+    # what the system said, for video.py: album cow per setup track, and per (track, minute) after setup
+    write_json(os.path.join(args.out, f"names_{tag}.json"), {
+        "t_start": t_start, "t_setup": t_setup, "step": args.step, "setup_min": args.setup_min,
+        "track_album": {str(k): v for k, v in track_album.items()},
+        "names": [[k[0], k[1], v, names.get(("always",) + k)] for k, v in names.items() if len(k) == 2],
+        "album_to_cow": res["album"]["mapping"]})
     report(res, tag)
     return res
 

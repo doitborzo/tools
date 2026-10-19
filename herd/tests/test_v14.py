@@ -282,3 +282,45 @@ def test_one_barn_split_by_cow():
         assert ev["test"]["queries"] > 0 and ev["test"]["top1"] >= 0.6     # new cows, easy made-up ones
         ck = torch.load(os.path.join(d, "idnet", "idnet.pt"), weights_only=False)
         assert ck["split"]["test"] == sp["test"]
+
+
+def test_video_from_a_made_up_system_run():
+    import cv2
+    import video
+    t0 = 1690304400.0                                         # 12:00 local
+    with tempfile.TemporaryDirectory() as d:
+        data, sysd = os.path.join(d, "mm"), os.path.join(d, "sys")
+        os.makedirs(os.path.join(data, "live"), exist_ok=True)
+        os.makedirs(sysd)
+        live, labels, tracks = [], [], []
+        for k in range(0, 50):                                # 100 s from 12:59:20, 2 cameras
+            ts = t0 + 3560 + 2 * k
+            for cam in ("cam_1", "cam_2"):
+                p = os.path.join(data, "live", f"{cam}_{k}.jpg")
+                cv2.imwrite(p, np.full((200, 320, 3), 90, np.uint8))
+                live.append({"cam": cam, "ts": ts, "path": p})
+                b = [0.1 + 0.002 * k, 0.2, 0.3 + 0.002 * k, 0.5]
+                tracks.append({"t": ts, "cam": cam, "box": b, "track": 1 if cam == "cam_1" else 2, "conf": 0.9})
+                if k % 7 == 0:
+                    labels.append({"cam": cam, "ts": ts, "boxes": [[5 if cam == "cam_1" else 9, b]]})
+        for name, rows in (("live.jsonl", live), ("labels.jsonl", labels)):
+            with open(os.path.join(data, name), "w") as fh:
+                for r in rows:
+                    fh.write(json.dumps(r) + "\n")
+        with open(os.path.join(sysd, "tracks_assoc.jsonl"), "w") as fh:
+            for r in tracks:
+                fh.write(json.dumps(r) + "\n")
+        np.savez(os.path.join(data, "masks.npz"), cam_1=np.ones((35, 56), bool))
+        json.dump({"t_start": t0, "t_setup": t0 + 3600, "step": 2, "setup_min": 60,
+                   "track_album": {"1": "A01", "2": "A02"},
+                   "names": [[1, 60, "A01", "A01"], [2, 60, "A01", "A01"], [1, 61, None, "A01"]],
+                   "album_to_cow": {"A01": 5, "A02": 9}}, open(os.path.join(sysd, "names_assoc.json"), "w"))
+        out = os.path.join(d, "v.mp4")
+        tally = video.render(argparse.Namespace(data=data, system=sysd, tag="assoc", time_from="12:59",
+                                                time_to="13:01", fps=5.0, width=640, match_iou=0.3, out=out))
+        cap = cv2.VideoCapture(out)
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        ok, frame = cap.read()
+        assert ok and n >= 45 and frame.shape[1] == 640
+        # after 13:00: cam_1's cow 5 named A01 = cow 5 (right), cam_2's cow 9 named A01 too (wrong)
+        assert tally["right"] >= 1 and tally["wrong"] >= 1
