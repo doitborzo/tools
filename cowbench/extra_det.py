@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import http.client
 import io
 import json
 import os
@@ -105,7 +106,7 @@ class RemoteZip:
                 if len(data) != end - start + 1:
                     raise IOError(f"short read {len(data)} of {end - start + 1}")
                 return data
-            except (urllib.error.URLError, IOError, TimeoutError, ConnectionError) as e:
+            except (urllib.error.URLError, http.client.HTTPException, IOError, TimeoutError, ConnectionError) as e:
                 if k == self.tries - 1:
                     raise
                 time.sleep(2 ** k)
@@ -154,7 +155,7 @@ def download(url, path, tries=8):
             print(flush=True)
             os.replace(part, path)
             return path
-        except (urllib.error.URLError, IOError, TimeoutError, ConnectionError) as e:
+        except (urllib.error.URLError, http.client.HTTPException, IOError, TimeoutError, ConnectionError) as e:
             if k == tries - 1:
                 raise
             print(f"\n  retry {k + 1} ({e.__class__.__name__}: {e})", flush=True)
@@ -168,7 +169,7 @@ def open_zip(url, cache_dir, name, whole_below=1 << 30):
             with urllib.request.urlopen(urllib.request.Request(url, method="HEAD", headers=UA), timeout=60) as r:
                 size = int(r.headers["Content-Length"])
             break
-        except (urllib.error.URLError, IOError, TimeoutError, ConnectionError):
+        except (urllib.error.URLError, http.client.HTTPException, IOError, TimeoutError, ConnectionError):
             if k == 5:
                 raise
             time.sleep(2 ** k)

@@ -108,12 +108,14 @@ fi
 echo "detector: $DET"
 
 step "3/8  MmCows: labels, labelled frames (training side + test window), the 1-second stream"
-"$PY" data_mmcows.py labels --out "$V/mmcows"
-"$PY" data_mmcows.py frames --out "$V/mmcows" --train-every "$TRAIN_EVERY" --window-every "$WINDOW_EVERY" --start "$START" --end "$END"
+again() {   # a download step, tried up to 4 times (Hugging Face sometimes cuts a connection)
+    for i in 1 2 3 4; do "$@" && return 0; echo "   stopped (try $i of 4) - again in 30 s"; sleep 30; done; return 1; }
+again "$PY" data_mmcows.py labels --out "$V/mmcows"
+again "$PY" data_mmcows.py frames --out "$V/mmcows" --train-every "$TRAIN_EVERY" --window-every "$WINDOW_EVERY" --start "$START" --end "$END"
 "$PY" data_mmcows.py inspect --out "$V/mmcows" | tee "$V/mmcows_live_inspect.txt"
 if [ -n "$PRETRAINED" ]; then
     # only what the video needs: the 1-second stream up to VIDEO_END, then the given weights
-    "$PY" data_mmcows.py live --out "$V/mmcows" --live-step "$LIVE_STEP" --start "$START" --end "$VIDEO_END"
+    again "$PY" data_mmcows.py live --out "$V/mmcows" --live-step "$LIVE_STEP" --start "$START" --end "$VIDEO_END"
     step "4/4  Trained weights instead of training: $PRETRAINED"
     ID="$(printf '%s' "$PRETRAINED" | sed -nE 's#.*(/d/|[?&]id=)([A-Za-z0-9_-]{20,}).*#\2#p')"
     URL="$PRETRAINED"
@@ -131,7 +133,7 @@ if [ -n "$PRETRAINED" ]; then
     echo "weights in place - now the video (log: $V/video_log.txt)"
     V14V_IN_TMUX=1 WORK="$WORK" DET_NAME="$DET_NAME" SYS_END="$VIDEO_END" exec bash "$HERE/video_v14.sh"
 fi
-"$PY" data_mmcows.py live --out "$V/mmcows" --live-step "$LIVE_STEP" --start "$START" --end "$END"
+again "$PY" data_mmcows.py live --out "$V/mmcows" --live-step "$LIVE_STEP" --start "$START" --end "$END"
 "$PY" data_mmcows.py feats --out "$V/mmcows"
 "$PY" data_mmcows.py idcrops --out "$V/mmcows" --train-every "$TRAIN_EVERY" --start "$START" --end "$END"
 
