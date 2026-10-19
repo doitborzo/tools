@@ -401,3 +401,38 @@ def test_v14d_wildlifereid_plan_combine_and_training():
         ev = json.load(open(os.path.join(d, "idnet", "eval_id.json")))
         assert ev["split"]["by"] == "groups" and len(ev["split"]["test"]) == 6 and ev["test"]["queries"] > 0
         assert not set(map(str, ev["split"]["test"])) & set(map(str, ev["split"]["train"]))
+
+
+def test_rescore_a_saved_run_on_chosen_cows_and_eval_on_some_cows():
+    import rescore
+    t0 = 1690304400.0
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "labels.jsonl"), "w") as fh:
+            for k in range(0, 600, 15):
+                fh.write(json.dumps({"cam": "cam_1", "ts": t0 + k, "boxes": [[1, [0.1, 0.1, 0.3, 0.3]],
+                                                                             [2, [0.6, 0.6, 0.8, 0.8]]]}) + "\n")
+        with open(os.path.join(d, "tracks_assoc.jsonl"), "w") as fh:
+            for k in range(0, 600, 2):
+                fh.write(json.dumps({"t": t0 + k, "cam": "cam_1", "box": [0.1, 0.1, 0.3, 0.3], "track": 11, "conf": 0.9}) + "\n")
+                fh.write(json.dumps({"t": t0 + k, "cam": "cam_1", "box": [0.6, 0.6, 0.8, 0.8], "track": 12, "conf": 0.9}) + "\n")
+        names = [[11, m, "A01", "A01"] for m in range(10)] + [[12, m, None, "A01"] for m in range(5, 10)]
+        json.dump({"t_start": t0, "t_setup": t0 + 300, "step": 2, "setup_min": 5, "track_album": {"11": "A01", "12": "A02"},
+                   "names": names, "album_to_cow": {}}, open(os.path.join(d, "names_assoc.json"), "w"))
+        res = rescore.rescore(d, d, "assoc", {"one": [1], "two": [2]}, start=12.0, end=12.17)
+        g = res["identification"]["by_cow_group"]
+        assert g["one"]["with_not_sure"]["recall"] == 1.0
+        assert g["two"]["with_not_sure"]["recall"] == 0.0 and g["two"]["always_answer"]["recall"] == 0.0
+    import idnet
+    with tempfile.TemporaryDirectory() as d:
+        fake_mcc(os.path.join(d, "mcc"))
+        a = argparse.Namespace(feats=os.path.join(d, "mcc"), out=os.path.join(d, "idnet"), max_error=0.05, epochs=2,
+                               patience=2, P=8, min_len=3, max_len=8, drop=0.1, noise=0.01, d=32, layers=1, heads=2,
+                               dropout=0.0, lr=2e-3, wd=0.0, temperature=0.1, seed=0,
+                               split="days", val_cows=3, test_cows=5, split_seed=0, time_aug=1.0)
+        idnet.cmd_train(a)
+        before = os.path.getmtime(os.path.join(d, "idnet", "idnet.pt"))
+        idnet.main(["eval", "--feats", os.path.join(d, "mcc"), "--out", os.path.join(d, "idnet"),
+                    "--only-cows", "1,2", "--eval-name", "some.json", "--keep-model"])
+        ev = json.load(open(os.path.join(d, "idnet", "some.json")))
+        assert ev["test"]["queries"] == 2 * 3 and ev["test_cows_only"] == ["1", "2"]
+        assert os.path.getmtime(os.path.join(d, "idnet", "idnet.pt")) == before

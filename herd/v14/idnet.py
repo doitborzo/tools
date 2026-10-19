@@ -398,6 +398,12 @@ def cmd_eval(args):
     model.to(dev)
     store = Store(args.feats)
     plan = split_plan(store, argparse.Namespace(**{**vars(args), **ck["split"]["args"]}))
+    only = getattr(args, "only_cows", None)
+    if isinstance(only, str) and only:            # score the test on some of its cows only (e.g. v14 A's five)
+        keep = {c.strip() for c in only.split(",")}
+        for k in ("test_album", "test_query"):
+            plan[k] = [q for q in plan[k] if str(q[1]) in keep]
+        print(f"[idnet] test on cows {sorted(keep)} only: {len(plan['test_query'])} queries", flush=True)
     # the "not sure" model and the enrolment threshold, on the val part
     vres, vrows, vtruth, vfp, vids = score_keys(model, store, dev, plan["val_album"], plan["val_query"])
     nan = fit_nan(vrows, vtruth, args.max_error)
@@ -410,7 +416,8 @@ def cmd_eval(args):
     prf = metrics.id_prf(pred, ttruth)
     always = metrics.id_prf([r["cow"] for r in trows], ttruth)
     ck.update({"nan": nan, "enrol_threshold": thr})
-    torch.save(ck, os.path.join(args.out, "idnet.pt"))
+    if not getattr(args, "keep_model", False):
+        torch.save(ck, os.path.join(args.out, "idnet.pt"))
     out = {"model": {"epoch": ck["epoch"], "parameters": int(sum(v.numel() for v in ck["state"].values())), **ck["kw"]},
            "split": ck["split"], "val": vres, "test": tres,
            "test_id_with_not_sure": prf, "test_id_always_answer": always,
@@ -418,7 +425,9 @@ def cmd_eval(args):
            "enrol_threshold": thr,
            "what": "album = sequences of the earlier part (k-means looks per cow), queries = every sequence "
                    "of the later part; precision / recall / F1 count 'not sure' as a miss"}
-    write_json(os.path.join(args.out, "eval_id.json"), out)
+    if isinstance(only, str) and only:
+        out["test_cows_only"] = sorted(only.split(","))
+    write_json(os.path.join(args.out, getattr(args, "eval_name", None) or "eval_id.json"), out)
     pct = lambda v: "-" if v is None else f"{v:.1%}"
     print(f"[idnet] test ({ck['split']['test']}): top-1 {pct(tres['top1'])}, top-5 {pct(tres['top5'])}, "
           f"mAP {tres['mAP'] if tres['mAP'] is None else round(tres['mAP'], 3)}", flush=True)
@@ -441,6 +450,10 @@ def main(argv=None):
         s.add_argument("--val-cows", type=int, default=3)
         s.add_argument("--test-cows", type=int, default=5)
         s.add_argument("--split-seed", type=int, default=0)
+        if name == "eval":
+            s.add_argument("--only-cows", default=None, help="comma list: score the test on these cows only")
+            s.add_argument("--eval-name", default=None, help="file name of the scores (default eval_id.json)")
+            s.add_argument("--keep-model", action="store_true", help="do not write the refitted 'not sure' model back")
         if name == "train":
             s.add_argument("--epochs", type=int, default=60)
             s.add_argument("--patience", type=int, default=10)
