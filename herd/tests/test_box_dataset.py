@@ -143,7 +143,9 @@ def test_barn_video_plays_sessions_into_a_cache_of_its_own():
             def __init__(self, c):
                 calls.append(("models",))
 
-        def _run(c, start, models=None):
+        def _run(c, start, models=None, status=None):
+            if interrupt and status is not None:
+                status["interrupted"] = True
             calls.append(("run", start, [(x["id"], os.path.basename(x["url"]), x["start_ts"]) for x in c["cameras"]],
                           c["store"]["path"], dict(c["training_cache"]), c["sampling"]["burst_every_s"]))
             return {x["id"]: {"id_confirmed": 1} for x in c["cameras"]}
@@ -152,6 +154,11 @@ def test_barn_video_plays_sessions_into_a_cache_of_its_own():
         pipeline.Models, pipeline.run = _M, _run
         try:
             out = os.path.join(d, "vid")
+            interrupt = True                              # Ctrl+C: the session is not marked done
+            barn_dataset.main(["video", "--config", cfg, "--videos", rec, "--out", out + "\\"])
+            assert not os.path.exists(os.path.join(out, "videos_done.txt")) and os.path.isdir(out)
+            calls.clear()
+            interrupt = False
             barn_dataset.main(["video", "--config", cfg, "--videos", rec, "--out", out])
             runs = [c for c in calls if c[0] == "run"]
             assert len(runs) == 2 and sum(1 for c in calls if c[0] == "models") == 1     # the models loaded once
@@ -220,3 +227,13 @@ def test_zones_page_and_apply():
         got = common.load_config(cfg)
         assert [c["id"] for c in got["cameras"]] == ["cam1", "cam3"] and len(got["cameras"][0]["exclude"]) == 2
         assert got["detector"]["weights"].endswith("det") and os.path.exists(cfg + ".bak")
+
+
+def test_file_frames_on_the_recordings_own_clock():
+    import pipeline
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "v.mp4")
+        _video(path, 3, fps=5)
+        ts = [t for t, _ in pipeline.frames_from(path, 1000.0)]
+        assert len(ts) == 15 and ts[0] == 1000.0 and abs(ts[-1] - 1002.8) < 0.05
+        assert all(b > a for a, b in zip(ts, ts[1:]))

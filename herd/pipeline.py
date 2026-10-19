@@ -640,21 +640,41 @@ def frames_from(url, start_ts=None):
     if not cap.isOpened():
         raise RuntimeError(f"cannot open {url}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    if not 1.0 <= fps <= 120.0:                # a container's time base, not a frame rate (some .mkv)
+        fps = 25.0
     live = start_ts is None
-    i = 0
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    i, t, bad = 0, -1.0, 0
     while True:
         ok, f = cap.read()
         if not ok:
-            break
-        yield (time.time() if live else start_ts + i / fps), cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+            # a damaged stretch of a recording (a recorder's file): skip it, unless this is its end
+            bad += 1
+            if live or bad > 100 or (n and cap.get(cv2.CAP_PROP_POS_FRAMES) >= n - 1):
+                break
+            continue
+        bad = 0
+        if not live:
+            # the file's own clock (its frames' time stamps) - right when the rate it states is not
+            ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            t = ms / 1000.0 if ms / 1000.0 > t else t + 1.0 / fps
+        yield (time.time() if live else start_ts + t), cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
         i += 1
     cap.release()
 
 
-def run_file(camera, url, start_ts):
+def run_file(camera, url, start_ts, every_s=60.0):
+    """A recording on its own clock, as fast as it can go; where it is, every every_s of recording."""
+    t0, said = time.time(), start_ts
     for ts, img in frames_from(url, start_ts):
         camera.push(ts, img)
         camera.step(ts)
+        if ts - said >= every_s:
+            said = ts
+            done = ts - start_ts
+            print(f"[{camera.id}] {int(done // 60)}:{int(done % 60):02d} of the recording "
+                  f"({done / max(1e-6, time.time() - t0):.1f}x real time)", flush=True)
+    print(f"[{camera.id}] the recording is done", flush=True)
 
 
 def run_live(camera, source, stop):
@@ -692,7 +712,8 @@ def run_live(camera, source, stop):
         th.join()
 
 
-def run(cfg, start=None, models=None, max_wall_s=None):
+def run(cfg, start=None, models=None, max_wall_s=None, status=None):
+    """status (a dict): "interrupted" is set when Ctrl+C stopped it before the files ended."""
     import gallery as gallery_mod
     from store import Store
     store = Store(cfg["store"]["path"])
@@ -749,6 +770,8 @@ def run(cfg, start=None, models=None, max_wall_s=None):
                 break
     except KeyboardInterrupt:
         stop.set()
+        if status is not None:
+            status["interrupted"] = True
     shared.save()
     return {c.id: dict(c.stats) for c in cams}
 

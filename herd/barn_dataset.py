@@ -106,13 +106,16 @@ class TrainingCache:
 
 
 def read_cache(folder):
-    rows = []
+    rows = {}
     for day in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
         p = os.path.join(folder, day, "index.jsonl")
         if os.path.exists(p):
             with open(p, encoding="utf-8") as fh:
-                rows += [json.loads(line) for line in fh if line.strip()]
-    return rows
+                for line in fh:
+                    if line.strip():
+                        r = json.loads(line)
+                        rows[r["file"]] = r          # a session played again writes its bursts again: once
+    return list(rows.values())
 
 
 # --------------------------------------------------------------- identities
@@ -514,7 +517,7 @@ def cmd_video(args):
             sys.exit(f"no recordings under {args.videos} named <camera>..<YYYY-MM-DD_HH-MM-SS> (or --video cam=file "
                      f"--start ISO)")
         groups = sessions(recs, args.gap)
-    out = os.path.abspath(args.out)
+    out = os.path.abspath(args.out.rstrip("\\"))           # a PowerShell line's "\" typed at the end
     os.makedirs(out, exist_ok=True)
     done_path = os.path.join(out, "videos_done.txt")
     done = set(open(done_path, encoding="utf-8").read().split("\n")) if os.path.exists(done_path) else set()
@@ -538,11 +541,16 @@ def cmd_video(args):
         print(f"[video] session {k}/{len(todo)}: {when}, {', '.join(cam for cam, _, _ in g)}", flush=True)
         models = models or pipeline.Models(c)
         t = dt.datetime.now()
-        stats = pipeline.run(c, start, models=models)
+        status = {}
+        stats = pipeline.run(c, start, models=models, status=status)
         print(f"[video]   done in {(dt.datetime.now() - t).total_seconds() / 60:.0f} min, "
               f"{sum(v.get('bursts_missed', 0) for v in stats.values())} bursts missed; "
               f"{json.dumps({cam: {k: v for k, v in s.items() if k.startswith('id_')} for cam, s in stats.items()})}",
               flush=True)
+        if status.get("interrupted"):
+            print("[video] stopped (Ctrl+C): this session is not marked done - run the same command again and it "
+                  "plays it again from its start (its bursts are kept once)", flush=True)
+            return
         with open(done_path, "a", encoding="utf-8") as fh:
             fh.writelines(p + "\n" for _, p, _ in g)
     rows = read_cache(cfg["training_cache"]["folder"])
