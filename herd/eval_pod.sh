@@ -125,7 +125,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 if [ "${CALIBRATE:-1}" = "1" ]; then
     step "Thresholds again: MmCows 7/25 outside mct_eval's hours (no other day, no other set)"
     # --mm-uwb-days with nothing after it: 7/25 alone (its labelled frames, every 60 s)
-    "$PY" "$HERE/reid.py" fetch --data "$R" --sources mmcows --mm-uwb-days
+    "$PY" "$HERE/reid.py" fetch --data "$R" --sources mmcows --mm-uwb-days --mm-label-every 60
     "$PY" "$HERE/reid.py" label --data "$R" --model "$H/$RUN/model.pt" --detector "$DET" --mm-days 0725
     "$PY" "$HERE/reid.py" extract --data "$R" --sources mmcows --model "$H/$RUN/model.pt"
     if [ -f "$ID_DIR/thresholds.json" ] && [ ! -f "$ID_DIR/thresholds.old.json" ]; then

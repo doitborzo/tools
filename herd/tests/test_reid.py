@@ -279,3 +279,16 @@ def test_moments_loss_and_the_models_own_thresholds():
         reid.main(["calibrate", "--data", d, "--identity", os.path.join(d, "id_model", "identity.pt")])
         again = reid.identity_thresholds(os.path.join(d, "id_model", "identity.pt"))
         assert abs(again["reacquire_sim"] - th["reacquire_sim"]) < 1e-3
+
+
+def test_a_held_out_cow_never_in_training():
+    import reid
+    rows = [{"cow": "01", "split": "train"}, {"cow": "13", "split": "val"}, {"cow": "01", "split": "train", "by": "uwb"}]
+    reid.check_split("mmcows", rows, set())                              # clean: passes
+    try:
+        reid.check_split("mmcows", rows + [{"cow": "13", "split": "train"}], set())
+    except SystemExit as e:
+        assert "13" in str(e)
+    else:
+        raise AssertionError("a held-out cow in training was let through")
+    reid.check_split("cows2021", [{"cow": "a"}, {"cow": "b"}], {"b"})    # split by the held-out set

@@ -545,6 +545,14 @@ late check (its same-cow pairs were any two pieces of the day, not a cow lost an
 `new_cow_similarity` is the best split of same and two cows (at least above 90% of two cows) and the
 late check's positives are a cow's consecutive pieces.
 
+**No held-out cow in training.** `reid_pod.sh` now takes 7/25's human labels every 15 s (every label
+MmCows has: ~16k frames, four times the earlier 60 s) and **no neck-tag days by default**: their
+labels are ~4% wrong, mostly an untagged cow - one of the held-out 11-16 - lying next to a tagged one,
+so a held-out cow would get into training under another's number (`UWB_DAYS="0722 0728 0801"` puts
+them back, knowingly). `reid.py extract` stops if a cow of any set is both trained on and held out, and
+`train` checks it again on the bursts. Still true: cows 1-10 are trained on (7/25 outside 11:30-15:30)
+and are in mct_eval's hour - its `look` for cows 11-16 and the calibration are the clean numbers.
+
 **The check alone, on a new pod** (`bash herd/eval_pod.sh`): with `herd_models_*.tgz` and
 `herd_reid_*.tgz` in `/workspace` it unpacks the identity model (`reid/id_model_all/`), recalibrates its
 thresholds on MmCows 7/25 alone (outside mct_eval's hours, ~4 GB read; the old file kept as

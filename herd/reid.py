@@ -442,10 +442,12 @@ def cmd_label(args):
             if not os.path.isdir(folder) or cam not in mats:
                 continue
             done_path = os.path.join(root, "labelled", f"{day}_{cam}.jsonl")
-            if os.path.exists(done_path) and not args.force:
+            tss = sorted(int(f[:-4]) for f in os.listdir(folder) if f.endswith(".jpg"))
+            n_path = done_path[:-6] + ".frames"
+            same = os.path.exists(n_path) and open(n_path).read().strip() == str(len(tss))
+            if os.path.exists(done_path) and same and not args.force:
                 rows += read_jsonl(done_path)
                 continue
-            tss = sorted(int(f[:-4]) for f in os.listdir(folder) if f.endswith(".jpg"))
             load = lambda ts: np.asarray(Image.open(os.path.join(folder, f"{ts}.jpg")).convert("RGB"))
             frames, t0 = [], time.time()
             with cf.ThreadPoolExecutor(4) as ex:
@@ -489,6 +491,7 @@ def cmd_label(args):
             os.makedirs(os.path.dirname(done_path), exist_ok=True)
             with open(done_path, "w", encoding="utf-8") as fh:
                 fh.writelines(json.dumps(r) + "\n" for r in mine)
+            open(n_path, "w").write(str(len(tss)))          # labelled again when more frames come
             rows += mine
             print(f"\r[label] {day} {cam}: {len(frames)} frames, {sum(len(b) for _, b in frames)} boxes, "
                   f"{len(mine)} crops with a cow's number ({'human labels' if day == MM_DAY else 'neck tags'})",
@@ -540,6 +543,23 @@ def make_bursts(rows, rng, val_cows, tracklets):
                 split = ch[0].get("split") or ("val" if cow in val_cows else "train")    # mmcows: set by label
                 out.append({"cow": cow, "day": day, "cam": cam, "frames": [r["k"] for r in ch], "split": split})
     return out
+
+
+def check_split(src, rows, val):
+    """No held-out cow in training: a cow is wholly train or wholly val (stops otherwise). MmCows' neck-tag
+    days can still hold another cow under a tag's number (~4%) - said, since that one may be held out."""
+    split = collections.defaultdict(set)
+    for r in rows:
+        split[r["cow"]].add(r.get("split") or ("val" if r["cow"] in val else "train"))
+    both = sorted(c for c, v in split.items() if len(v) > 1)
+    if both:
+        sys.exit(f"[extract] {src}: cows both in training and held out: {both} - a held-out cow must never be "
+                 f"trained on")
+    n_val = sum(1 for v in split.values() if v == {"val"})
+    uwb = sum(1 for r in rows if r.get("by") == "uwb")
+    print(f"[extract] {src}: {n_val} held-out cows, none of them in training"
+          + (f"; {uwb} crops labelled by neck tags (about 4% of those are another cow, possibly a held-out "
+             f"one: UWB_DAYS off keeps training clean)" if uwb else ""), flush=True)
 
 
 def write_bursts(folder, bursts, src, meta):
@@ -610,6 +630,7 @@ def cmd_extract(args):
             val = {r["cow"] for r in rows if r.get("split") == "val"}
         else:
             val = set(random.Random(args.seed).sample(cows, max(1, round(len(cows) * args.val_share))))
+        check_split(src, rows, val)
         bursts = make_bursts(rows, rng, val, tracklets=src == "multicam")
         write_bursts(os.path.join(args.data, "feat", src), bursts, src, dict(meta, dim=int(feats.shape[1])))
         for part in ("train", "val"):                     # an older extract's stretched copies (GBs)
@@ -1019,6 +1040,9 @@ def cmd_train(args):
         sys.exit("no features: reid.py extract first")
     if tr.dim != base.in_dim:
         sys.exit(f"features of {tr.dim} dims, the model takes {base.in_dim}: extract with this model")
+    leak = {b["identity"] for b in tr.bursts} & {b["identity"] for b in va.bursts}
+    if leak:
+        sys.exit(f"[train] held-out cows in the training bursts: {sorted(leak)[:10]} - reid.py extract again")
     print(f"[train] {len(tr.bursts)} bursts of {len(set(tr.identity.tolist()))} cows; val {len(va.bursts)} bursts "
           f"of {len({b['identity'] for b in va.bursts})} unseen cows", flush=True)
     # MmCows' seconds: one frame of a cow from two cameras at once, the cows beside her the negatives
@@ -1169,10 +1193,12 @@ def main(argv=None):
     f.add_argument("--workers", type=int, default=48)
     f.add_argument("--max-per-source", type=int, default=0, help="a quick look: only this many crops a set")
     f.add_argument("--keep-zips", action="store_true", help="keep the zips downloaded whole (Zenodo's)")
-    f.add_argument("--mm-uwb-days", nargs="*", default=["0722", "0728", "0801"],
-                   help="MmCows days labelled by the neck tags (7/25 is the human-labelled one)")
+    f.add_argument("--mm-uwb-days", nargs="*", default=[],
+                   help="MmCows days labelled by the neck tags, e.g. 0722 0728 0801 (none by default: ~4%% of their "
+                        "labels are another cow, mostly a held-out one; 7/25 is the human-labelled day)")
     f.add_argument("--mm-uwb-every", type=int, default=30, help="seconds between those days' frames (15, 30, 60...)")
-    f.add_argument("--mm-label-every", type=int, default=60, help="seconds between 7/25's labelled frames")
+    f.add_argument("--mm-label-every", type=int, default=15, help="seconds between 7/25's labelled frames "
+                   "(15: every label MmCows has)")
     f.add_argument("--mm-max-side", type=int, default=1920)
     lb.add_argument("--data", required=True)
     lb.add_argument("--model", required=True, help="the herd model (crop size and margin)")

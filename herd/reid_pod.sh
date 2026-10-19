@@ -7,7 +7,8 @@
 #      place); Zenodo, Bristol and the last step's MmCows frames download in the background while
 #      MmCows' training days are fetched one at a time, each labelled (GPU) as the next downloads
 #        mmcows    MmCows (the evaluation's own pen and cameras): 7/25 with its human labels outside
-#                  mct_eval's 12:00-15:00 (cows 1-10 train, 11-16 held out), and 3 other days every 30 s
+#                  mct_eval's 12:00-15:00, every 15 s (cows 1-10 train, 11-16 held out: never trained on);
+#                  the neck-tag days only with UWB_DAYS
 #        cobra     CoBRA youngstock: 48 heifers from a roof camera, standing and lying (733 MB)
 #        sideview  SideViewCows2026: 110 cows from the side, parlor / barn / snapshots (25 GB of zips)
 #        multicam cows2021 opencows   the top-down sets the first model was trained on
@@ -28,7 +29,9 @@
 #
 # Knobs: WORK=/workspace  RUN=run9  DET=<best/> (default: the newest)  INIT=<identity.pt> (fine-tune it; default: from scratch)
 #        SOURCES="mmcows cobra sideview multicam cows2021 opencows"  EPOCHS=30  MCT=1  MINUTES=60
-#        UWB_DAYS="0722 0728 0801"  UWB_EVERY=30  WAIT_MIN=20 (how long the GPU waits for a background download)
+#        LABEL_EVERY=15 (s between 7/25's human-labelled frames: every label MmCows has)
+#        UWB_DAYS="" (neck-tag days, e.g. "0722 0728 0801": off - ~4% of their labels are another cow, mostly a
+#        held-out one)  UWB_EVERY=30  WAIT_MIN=20 (how long the GPU waits for a background download)
 #        TRAIN=0 (no training: the existing model's thresholds again - reid.py calibrate - and the MmCows check)
 # Every step resumes. Licences: MmCows CC BY-NC-SA, CoBRA and SideViewCows CC BY 4.0, the Bristol sets NCGL.
 
@@ -59,7 +62,7 @@ if [ -z "${HERD_REID_IN_TMUX:-}" ]; then
     fi
     mkdir -p "$R"
     knobs=""
-    for v in WORK RUN DET SOURCES EPOCHS MCT MINUTES MODELS INIT UWB_DAYS UWB_EVERY WAIT_MIN TRAIN; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
+    for v in WORK RUN DET SOURCES EPOCHS MCT MINUTES MODELS INIT UWB_DAYS UWB_EVERY LABEL_EVERY WAIT_MIN TRAIN; do knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env HERD_REID_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/reid_pod.sh"); echo; echo '[reid finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log   ($LOG)"
@@ -180,9 +183,11 @@ fi
 if want mmcows; then
     [ -n "${DET:-}" ] && [ -f "$DET/det_train_meta.json" ] || { echo "!! no detector best/ under $H (DET=<it>)"; exit 1; }
     echo "detector $DET"
-    DAYS=(${UWB_DAYS:-0722 0728 0801})
+    # no neck-tag days unless UWB_DAYS names them: their labels are ~4% wrong, mostly an untagged cow
+    # (11-16, the held-out ones) lying next to a tagged one - a held-out cow would get into training
+    DAYS=(${UWB_DAYS-})
     mm_fetch() { "$PY" "$HERE/reid.py" fetch --data "$R" --sources mmcows --mm-uwb-days "$@" \
-                     --mm-uwb-every "${UWB_EVERY:-30}"; }
+                     --mm-uwb-every "${UWB_EVERY:-30}" --mm-label-every "${LABEL_EVERY:-15}"; }
     mm_label() { "$PY" "$HERE/reid.py" label --data "$R" --model "$H/$RUN/model.pt" --detector "$DET" --mm-days "$@"; }
     step "MmCows 0725 (human labels): fetch"
     mm_fetch                                        # 7/25 only (no other day)
