@@ -212,6 +212,7 @@ def run(args):
         for i, cid in enumerate(assign):
             if cid is None:
                 cid = chains.new()
+                assign[i] = cid
             d = cur[i]
             chains.add(cid, t, d["cam"], d["box"], feats[i], d["conf"])
             det_log.append((t, d["cam"], d["box"], cid, d["conf"]))
