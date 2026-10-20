@@ -399,6 +399,11 @@ labels.json`).
 How much: 200–400 frames over all cameras, from different times of day (morning, night light,
 feeding) and days. Boxes drawn tightly, the same way on every frame.
 
+A camera's zone changed after its frames were cut: `herd.py boxes frames ... --cameras cam2 --again` cuts
+that camera's frames again (same moments, the new grey zone), the detector looks again, and the page asks to
+check each of them (your boxes stay, minus those now in the grey). `herd.py barn video ... --cameras cam2`
+does the same for the cows' tracks: that camera's bursts made anew, the others kept.
+
 **3. Export:**
 
 ```bash
