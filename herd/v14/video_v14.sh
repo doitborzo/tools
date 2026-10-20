@@ -7,8 +7,9 @@
 #   bash herd/v14/video_v14.sh stop
 #
 # Needs run_v14.sh's steps 1-6 done (/workspace/v14: mmcows/, idnet/idnet.pt, assoc/assoc.pt).
-# Knobs: WORK=/workspace  TAG=assoc (or iou_per_camera: each camera alone)  SYS_END=13.5
-#        (the system runs 12:00 -> SYS_END: setup hour + identification)  FPS=5 (10x speed)
+# Knobs: WORK=/workspace  TAG=assoc (or iou_per_camera: each camera alone)  SYS_START=12  SETUP_MIN=60
+#        SYS_END=13.5 (the system runs SYS_START -> SYS_END: SETUP_MIN of onboarding, then identification;
+#        frames outside 12:00-15:00 come from MmCows' whole-day zips, see run_v14.sh)  FPS=5 (10x speed)
 #        CLIPS="12:00-12:10 13:00-13:10 13:10-13:30" (HH:MM or HH:MM:SS)  REALTIME=0 (1: barn speed)
 #        CENTER=off (on: v14 C - the barn's average cow taken out of the fingerprints)  NAME=V14A
 #        MODE=e: v14 E (system_e.py: no tracking model, every box named on its own); TAG then picks the
@@ -24,6 +25,8 @@ LOG="$V/video_log.txt"
 SESSION=v14video
 TAG="${TAG:-assoc}"
 SYS_END="${SYS_END:-13.5}"
+SYS_START="${SYS_START:-12}"
+SETUP_MIN="${SETUP_MIN:-60}"
 FPS="${FPS:-5}"
 CLIPS="${CLIPS:-12:00-12:10 13:00-13:10 13:10-13:30}"
 DET_NAME="${DET_NAME:-detector_rfdetr_large_zenodo_mmcows_opencows_ft}"
@@ -53,7 +56,7 @@ if [ -z "${V14V_IN_TMUX:-}" ]; then
     [ "$TAG" = iou_per_camera ] || [ "$MODE" = e ] || [ -f "$V/assoc/assoc.pt" ] || { echo "missing $V/assoc/assoc.pt"; exit 1; }
     if tmux has-session -t "=$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     knobs=""
-    for v in WORK TAG SYS_END FPS CLIPS DET_NAME CENTER NAME REALTIME TITLE IDNET MODE ID_DATA; do knobs+="$v=$(printf '%q' "${!v}") "; done
+    for v in WORK TAG SYS_START SETUP_MIN SYS_END FPS CLIPS DET_NAME CENTER NAME REALTIME TITLE IDNET MODE ID_DATA; do knobs+="$v=$(printf '%q' "${!v}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env V14V_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/video_v14.sh"); echo; echo '[video_v14.sh finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log"
@@ -69,16 +72,16 @@ step "1/3  video packages"
 "$PY" -c "import imageio, imageio_ffmpeg" 2>/dev/null || uv pip install --python "$PY" imageio imageio-ffmpeg \
     || echo "   (no imageio-ffmpeg: videos in mp4v, play them in VLC)"
 
-step "2/3  onboarding test again, keeping what it said (12:00 -> $SYS_END h, tracking: $TAG, centering: $CENTER)"
+step "2/3  onboarding test again, keeping what it said ($SYS_START h + $SETUP_MIN min onboarding -> $SYS_END h, tracking: $TAG, centering: $CENTER)"
 S="$V/system_video"; [ "$NAME" = V14A ] || S="$V/system_$NAME"
 if [ -f "$S/names_$TAG.json" ]; then echo "done already: $S/names_$TAG.json"
 elif [ "$MODE" = e ]; then
     "$PY" system_e.py --data "$V/mmcows" --detector "$WORK/herd/$DET_NAME/best" --idnet "$IDNET" \
-        --out "$S" --start 12 --end "$SYS_END" --setup-min 60 --step 2
+        --out "$S" --start "$SYS_START" --end "$SYS_END" --setup-min "$SETUP_MIN" --step 2
 else
     ASSOC="$V/assoc/assoc.pt"; [ "$TAG" = iou_per_camera ] && ASSOC=none
     "$PY" system.py --data "$V/mmcows" --detector "$WORK/herd/$DET_NAME/best" --idnet "$IDNET" \
-        --assoc "$ASSOC" --out "$S" --start 12 --end "$SYS_END" --setup-min 60 --step 2 --center "$CENTER"
+        --assoc "$ASSOC" --out "$S" --start "$SYS_START" --end "$SYS_END" --setup-min "$SETUP_MIN" --step 2 --center "$CENTER"
 fi
 
 step "3/3  videos, results and weights: $CLIPS"

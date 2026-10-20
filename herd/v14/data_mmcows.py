@@ -47,6 +47,9 @@ from v14common import MMCOWS_DAY, local_hour, parse_id_boxes, read_jsonl, unix_f
 HF = "https://huggingface.co/datasets/neis-lab/mmcows/resolve/main/"
 VISUAL = HF + "visual_data.zip"
 LIVE = HF + "1s_interval_images_3hr/0725_cam_{k}_1200-1500.zip"
+LIVE_DAY = HF + "1s_interval_images/0725_cam_{k}.zip.part.{p}"      # the whole day, one zip in two pieces
+LIVE_DAY_PARTS = ("aa", "ab")
+LIVE_HOURS = (12.0, 15.0)                                           # what LIVE covers
 LABEL = re.compile(r"(?:^|/)labels/combined/(\d{4})/(cam_\d)/([^/]+)\.txt$")
 IMAGE = re.compile(r"(?:^|/)images/(\d{4})/(cam_\d)/([^/]+)\.(?:jpe?g|png)$", re.I)
 
@@ -54,6 +57,16 @@ IMAGE = re.compile(r"(?:^|/)images/(\d{4})/(cam_\d)/([^/]+)\.(?:jpe?g|png)$", re
 def remote(url):
     import extra_det
     return extra_det.RemoteZip(url)
+
+
+def live_zip(args, k):
+    """Camera k's 1-second frames: the 3-hour zip (12:00-15:00) when the window fits in it, else the whole
+    day's zip (two pieces, read as one; ~56 GB of which only the frames wanted are fetched)."""
+    if LIVE_HOURS[0] <= args.start and args.end <= LIVE_HOURS[1] or args.live != LIVE:
+        return remote(args.live.format(k=k))
+    import extra_det
+    print(f"[mmcows] cam_{k}: {args.start:g}:00-{args.end:g}:00 is outside the 3-hour zip - the whole day's", flush=True)
+    return extra_det.SplitRemoteZip([LIVE_DAY.format(k=k, p=p) for p in LIVE_DAY_PARTS])
 
 
 def in_window(ts, a):
@@ -173,7 +186,7 @@ def cmd_live(args):
     index = []
     for k in args.cams.split(","):
         cam = f"cam_{k}"
-        z = remote(args.live.format(k=k))
+        z = live_zip(args, k)
         names = live_names(z)
         if not names:
             sys.exit(f"[mmcows] {cam}: no frame names with a readable time - run `inspect --zip-url ...`")
@@ -193,9 +206,13 @@ def cmd_live(args):
                     print(f"\r  {j}/{len(todo)}  {(time.time() - t0) / 60:.1f} min", end="", flush=True)
         print(flush=True)
         index += [{"cam": cam, "ts": ts, "path": live_path(args.out, cam, ts)} for ts, _ in pick]
-    with open(os.path.join(args.out, "live.jsonl"), "w", encoding="utf-8") as fh:
-        for r in sorted(index, key=lambda r: (r["ts"], r["cam"])):
+    # merged with what is there: another window (an earlier onboarding) adds frames, never drops them
+    have = {r["path"]: r for r in read_jsonl(os.path.join(args.out, "live.jsonl"))}
+    have.update({r["path"]: r for r in index})
+    with open(os.path.join(args.out, "live.jsonl.part"), "w", encoding="utf-8") as fh:
+        for r in sorted(have.values(), key=lambda r: (r["ts"], r["cam"])):
             fh.write(json.dumps(r) + "\n")
+    os.replace(os.path.join(args.out, "live.jsonl.part"), os.path.join(args.out, "live.jsonl"))
 
 
 def live_path(out, cam, ts):

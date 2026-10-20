@@ -651,22 +651,26 @@ def test_v14f_pictures_of_mmcows_boxes_and_combine():
 
 
 def test_freshness_finds_a_drifting_look():
-    """Made-up day: every cow's look drifts slowly, so an album fits the minutes around it best."""
+    """Made-up day: each cow's look is a little of herself and a lot of her pose (lying here, standing there,
+    shared by every cow in it), and she changes pose and place now and then - so an album fits the minutes
+    around it best, before and after, and a cow in the same spot best of all."""
     import freshness as Fr
     import idnet
     rng = np.random.default_rng(5)
-    cows, dim, t0 = 8, 32, 1690275600.0                          # 05:00 local
-    base = rng.normal(size=(cows, dim))
-    walk = np.cumsum(rng.normal(scale=0.12, size=(600, cows, dim)), 0)   # the look drifts minute by minute
+    cows, dim, t0, n_pose = 8, 32, 1690275600.0, 4              # 04:00 local
+    base = rng.normal(size=(cows, dim)) * 0.6
+    poses = rng.normal(size=(n_pose, dim)) * 2.0
+    pose = rng.integers(0, n_pose, cows)
     frames, rows, feats = [], [], []
-    for m in range(0, 600, 1):
+    for m in range(600):
+        pose = np.where(rng.random(cows) < 0.01, rng.integers(0, n_pose, cows), pose)   # a change every ~100 min
         boxes = []
         for c in range(cows):
-            x = 0.1 + 0.1 * c + (0.2 if m > 300 else 0.0) * (c % 2)     # odd cows move to another spot at minute 300
-            b = [min(x, 0.9), 0.4, min(x + 0.08, 0.98), 0.5]
+            x = 0.05 + 0.1 * c + 0.05 * pose[c]                    # a new pose is a new spot
+            b = [min(x, 0.9), 0.4, min(x + 0.04, 0.98), 0.5]
             boxes.append([c, b])
             rows.append({"frame": len(frames), "cow": c, "box": b})
-            feats.append(base[c] + walk[m, c] + rng.normal(scale=0.3, size=dim))
+            feats.append(base[c] + poses[pose[c]] + rng.normal(scale=0.3, size=dim))
         frames.append({"cam": "cam_1", "ts": t0 + 60 * m + 1, "split": "train", "boxes": boxes})
     with tempfile.TemporaryDirectory() as d:
         np.savez(os.path.join(d, "assoc.npz"), box_feats=np.array(feats, np.float16))
@@ -677,8 +681,12 @@ def test_freshness_finds_a_drifting_look():
         Fr.main(["--data", d, "--model", "none", "--out", os.path.join(d, "fr"), "--min-cows", "8", "--every-min", "60"])
         out = json.load(open(os.path.join(d, "fr", "freshness.json")))
         g = out["by_gap"]
-        assert g["+0..+5"]["top1"] > 0.9 and g[">= +180"]["top1"] < g["+0..+5"]["top1"] - 0.3
-        assert g["-5..+0"]["top1"] > g["-180..-120"]["top1"]          # stale in both directions
+        # queries are timed from the middle of a 10-minute album: the nearest are 5 minutes off
+        assert "+0..+5" not in g and "-5..+0" not in g
+        assert g["+5..+15"]["top1"] > 0.9 and g[">= +180"]["top1"] < g["+5..+15"]["top1"] - 0.2
+        assert g["-15..-5"]["top1"] > g["-180..-120"]["top1"] + 0.2    # stale in both directions
+        pl = out["by_gap_and_place"]
+        assert pl["+30..+60 | same spot"]["top1"] > pl["+30..+60 | near"]["top1"] + 0.2   # same gap, moved: worse
         assert all(out["by_window_near"][h]["top1"] > out["by_window_far"][h]["top1"] for h in out["by_window_far"])
         assert out["chance"] == pytest.approx(1 / 8)
         assert any("| moved" in k for k in out["by_gap_and_place"]) and any("| same spot" in k for k in out["by_gap_and_place"])
@@ -688,3 +696,65 @@ def test_freshness_finds_a_drifting_look():
         Fr.main(["--data", d, "--idnet", os.path.join(d, "idnet.pt"), "--out", os.path.join(d, "fr2"), "--min-cows", "8",
                  "--every-min", "120"])
         assert os.path.exists(os.path.join(d, "fr2", "FRESHNESS.md"))
+
+
+def test_split_zip_and_live_frames_from_two_windows():
+    """A zip cut in two pieces reads as one (MmCows' whole-day 1-second zips), and a second window of live
+    frames is added to live.jsonl next to the first (a 3-hour onboarding before the 12:00-15:00 stream)."""
+    import io as _io
+    import zipfile
+    import data_mmcows as M
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "cowbench"))
+    import extra_det as X
+    from PIL import Image
+    t9 = 1690293600                                                   # 09:00 local on 25 July
+    buf = _io.BytesIO()
+    jpg = _io.BytesIO()
+    Image.fromarray(np.full((20, 30, 3), 90, np.uint8)).save(jpg, "JPEG")
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+        for s in range(0, 4 * 3600, 1):                              # 09:00-13:00, every second
+            if s % 30 == 0:                                           # (every 30 s, to keep the test small)
+                hh, mm, ss = 9 + s // 3600, s // 60 % 60, s % 60
+                z.writestr(f"{t9 + s}_{hh:02d}-{mm:02d}-{ss:02d}.jpg", jpg.getvalue())
+    data = buf.getvalue()
+    cut = len(data) // 2 + 7
+
+    class Piece:
+        def __init__(self, b):
+            self.b, self.size = b, len(b)
+
+        def get(self, a, e):
+            return self.b[a:e + 1]
+
+    sz = object.__new__(X.SplitRemoteZip)
+    sz.parts, sz.starts, sz.size = [Piece(data[:cut]), Piece(data[cut:])], [0, cut, len(data)], len(data)
+    sz.zip = zipfile.ZipFile(_io.BufferedReader(X._RangeFile(sz), buffer_size=1 << 12))
+    names = sz.names()
+    assert len(names) == 480 and all(sz.read(n) == jpg.getvalue() for n in names[::37])
+    straddle = [i for i in sz.zip.infolist() if i.header_offset < cut < i.header_offset + i.compress_size + 60]
+    assert straddle and sz.read(straddle[0].filename) == jpg.getvalue()        # a frame cut in two
+    # which zip a window reads from
+    a = argparse.Namespace(start=12.0, end=15.0, live=M.LIVE)
+    assert M.LIVE_HOURS[0] <= a.start and a.end <= M.LIVE_HOURS[1]
+    picked = []
+    real = X.SplitRemoteZip
+    X.SplitRemoteZip = lambda urls: picked.append(urls) or sz
+    try:
+        assert M.live_zip(argparse.Namespace(start=9.0, end=13.0, live=M.LIVE), 1) is sz
+        assert picked[0] == [M.LIVE_DAY.format(k=1, p=p) for p in M.LIVE_DAY_PARTS]
+        real_remote = M.remote
+        M.remote = lambda url: ("3h", url)
+        assert M.live_zip(a, 2) == ("3h", M.LIVE.format(k=2))
+        M.remote = real_remote
+        # two windows into one live.jsonl
+        with tempfile.TemporaryDirectory() as d:
+            M.live_zip = lambda args, k: sz
+            for s_, e_ in ((12.0, 13.0), (9.0, 12.0)):
+                M.cmd_live(argparse.Namespace(out=d, cams="1", start=s_, end=e_, live_step=60.0, workers=2, max_side=64))
+            rows = [json.loads(l) for l in open(os.path.join(d, "live.jsonl"))]
+            hours = sorted({int(C.local_hour(r["ts"])) for r in rows})
+            assert hours == [9, 10, 11, 12] and len(rows) == 4 * 60 and all(os.path.exists(r["path"]) for r in rows)
+    finally:
+        X.SplitRemoteZip = real
+        import importlib
+        importlib.reload(M)

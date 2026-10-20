@@ -27,6 +27,9 @@
 #        ID_DATA=ocid: v14 (F) - OpenCowID's model (ResNet-50 + 128 numbers, centroid metric learning) as the ID
 #        model, trained on its synthetic coats then on WildlifeReID-10k's cattle (ID_STAGES=synth,wr10k; the
 #        pictures, not DINOv2 vectors), tested on all of MmCows' cows; the rest as v14 (D)
+#        SYS_START=<hour> SETUP_MIN=<min> SYS_END=<hour> (with NAME): the onboarding test runs SYS_START ->
+#        SYS_END with SETUP_MIN of onboarding (default START, 60, END); 1-second frames outside 12:00-15:00
+#        come from MmCows' whole-day zips (only the frames used are fetched, ~1.3 GB per camera-hour)
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,6 +57,8 @@ MCC_URL="${MCC_URL:-https://data.bris.ac.uk/datasets/tar/2inu67jru7a6821kkgehxg3
 PRETRAINED="${PRETRAINED:-}"
 ASSOC_PRETRAINED="${ASSOC_PRETRAINED:-}"
 ID_STAGES="${ID_STAGES:-synth,wr10k}"
+SYS_START="${SYS_START:-$START}"
+SYS_END="${SYS_END:-$END}"
 VIDEO_END="${VIDEO_END:-13.5}"
 MODE="${MODE:-}"; CENTER="${CENTER:-}"; NAME="${NAME:-}"; REALTIME="${REALTIME:-}"; CLIPS="${CLIPS:-}"; FPS="${FPS:-}"; TITLE="${TITLE:-}"
 export HF_HOME="$WORK/hf-cache"
@@ -75,7 +80,7 @@ if [ -z "${V14_IN_TMUX:-}" ]; then
     if tmux has-session -t "=$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     mkdir -p "$V"
     knobs=""
-    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP ID_DATA ID_STAGES PRETRAINED ASSOC_PRETRAINED VIDEO_END CENTER NAME REALTIME CLIPS FPS TITLE MODE TAG; do
+    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP ID_DATA ID_STAGES SYS_START SYS_END PRETRAINED ASSOC_PRETRAINED VIDEO_END CENTER NAME REALTIME CLIPS FPS TITLE MODE TAG; do
         knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env V14_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/run_v14.sh"); echo; echo '[run_v14.sh finished]'; exec bash"
@@ -146,6 +151,10 @@ if [ -n "$PRETRAINED" ]; then
     V14V_IN_TMUX=1 WORK="$WORK" DET_NAME="$DET_NAME" SYS_END="$VIDEO_END" exec bash "$HERE/video_v14.sh"
 fi
 again "$PY" data_mmcows.py live --out "$V/mmcows" --live-step "$LIVE_STEP" --start "$START" --end "$END"
+if [ "$SYS_START" != "$START" ] || [ "$SYS_END" != "$END" ]; then
+    echo "   the onboarding test runs $SYS_START:00 -> $SYS_END:00: its 1-second frames too"
+    again "$PY" data_mmcows.py live --out "$V/mmcows" --live-step "$LIVE_STEP" --start "$SYS_START" --end "$SYS_END"
+fi
 "$PY" data_mmcows.py feats --out "$V/mmcows"
 "$PY" data_mmcows.py idcrops --out "$V/mmcows" --train-every "$TRAIN_EVERY" --start "$START" --end "$END"
 
@@ -220,7 +229,8 @@ fi
 
 if [ -n "$NAME" ]; then
     echo "models ready - now $NAME's onboarding test, videos, results and weights (log: $V/video_log.txt)"
-    V14V_IN_TMUX=1 WORK="$WORK" DET_NAME="$DET_NAME" SYS_END="$END" IDNET="$IDN/idnet.pt" MODE="$MODE" exec bash "$HERE/video_v14.sh"
+    V14V_IN_TMUX=1 WORK="$WORK" DET_NAME="$DET_NAME" SYS_START="$SYS_START" SETUP_MIN="$SETUP_MIN" SYS_END="$SYS_END" \
+        IDNET="$IDN/idnet.pt" MODE="$MODE" exec bash "$HERE/video_v14.sh"
 fi
 
 step "7/8  Onboarding test on MmCows (inference only): setup $SETUP_MIN min, then identification"
