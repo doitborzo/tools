@@ -505,3 +505,144 @@ def test_v14e_album_merging_scoring_and_video():
                                                 fps=2.0, width=320, match_iou=0.3, out=os.path.join(d, "v.mp4"),
                                                 realtime=False, title=""))
         assert tally["right"] >= 1 and tally["wrong"] >= 1 and tally.get("guess right", 0) >= 1
+
+
+
+def test_freshness_finds_a_drifting_look():
+    """Made-up day: each cow's look is a little of herself and a lot of her pose (lying here, standing there,
+    shared by every cow in it), and she changes pose and place now and then - so an album fits the minutes
+    around it best, before and after, and a cow in the same spot best of all."""
+    import freshness as Fr
+    import idnet
+    rng = np.random.default_rng(5)
+    cows, dim, t0, n_pose = 8, 32, 1690275600.0, 4              # 04:00 local
+    base = rng.normal(size=(cows, dim)) * 0.6
+    poses = rng.normal(size=(n_pose, dim)) * 2.0
+    pose = rng.integers(0, n_pose, cows)
+    frames, rows, feats = [], [], []
+    for m in range(600):
+        pose = np.where(rng.random(cows) < 0.01, rng.integers(0, n_pose, cows), pose)   # a change every ~100 min
+        boxes = []
+        for c in range(cows):
+            x = 0.05 + 0.1 * c + 0.05 * pose[c]                    # a new pose is a new spot
+            b = [min(x, 0.9), 0.4, min(x + 0.04, 0.98), 0.5]
+            boxes.append([c, b])
+            rows.append({"frame": len(frames), "cow": c, "box": b})
+            feats.append(base[c] + poses[pose[c]] + rng.normal(scale=0.3, size=dim))
+        frames.append({"cam": "cam_1", "ts": t0 + 60 * m + 1, "split": "train", "boxes": boxes})
+    with tempfile.TemporaryDirectory() as d:
+        np.savez(os.path.join(d, "assoc.npz"), box_feats=np.array(feats, np.float16))
+        for name, data in (("frames.jsonl", frames), ("assoc_rows.jsonl", rows)):
+            with open(os.path.join(d, name), "w") as fh:
+                for r in data:
+                    fh.write(json.dumps(r) + "\n")
+        Fr.main(["--data", d, "--model", "none", "--out", os.path.join(d, "fr"), "--min-cows", "8", "--every-min", "60"])
+        out = json.load(open(os.path.join(d, "fr", "freshness.json")))
+        g = out["by_gap"]
+        # queries are timed from the middle of a 10-minute album: the nearest are 5 minutes off
+        assert "+0..+5" not in g and "-5..+0" not in g
+        assert g["+5..+15"]["top1"] > 0.9 and g[">= +180"]["top1"] < g["+5..+15"]["top1"] - 0.2
+        assert g["-15..-5"]["top1"] > g["-180..-120"]["top1"] + 0.2    # stale in both directions
+        pl = out["by_gap_and_place"]
+        assert pl["+30..+60 | same spot"]["top1"] > pl["+30..+60 | near"]["top1"] + 0.2   # same gap, moved: worse
+        assert all(out["by_window_near"][h]["top1"] > out["by_window_far"][h]["top1"] for h in out["by_window_far"])
+        assert out["chance"] == pytest.approx(1 / 8)
+        assert any("| moved" in k for k in out["by_gap_and_place"]) and any("| same spot" in k for k in out["by_gap_and_place"])
+        # with an ID model (untrained here): runs on one-frame sequences
+        m = idnet.build(dim, d=16, layers=1, heads=2)
+        torch.save({"kw": m.kw, "state": m.state_dict(), "epoch": 0, "split": {}, "feats": {}}, os.path.join(d, "idnet.pt"))
+        Fr.main(["--data", d, "--idnet", os.path.join(d, "idnet.pt"), "--out", os.path.join(d, "fr2"), "--min-cows", "8",
+                 "--every-min", "120"])
+        assert os.path.exists(os.path.join(d, "fr2", "FRESHNESS.md"))
+
+
+
+def test_split_zip_and_live_frames_from_two_windows():
+    """A zip cut in two pieces reads as one (MmCows' whole-day 1-second zips), and a second window of live
+    frames is added to live.jsonl next to the first (a 3-hour onboarding before the 12:00-15:00 stream)."""
+    import io as _io
+    import zipfile
+    import data_mmcows as M
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "cowbench"))
+    import extra_det as X
+    from PIL import Image
+    t9 = 1690293600                                                   # 09:00 local on 25 July
+    buf = _io.BytesIO()
+    jpg = _io.BytesIO()
+    Image.fromarray(np.full((20, 30, 3), 90, np.uint8)).save(jpg, "JPEG")
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+        for s in range(0, 4 * 3600, 1):                              # 09:00-13:00, every second
+            if s % 30 == 0:                                           # (every 30 s, to keep the test small)
+                hh, mm, ss = 9 + s // 3600, s // 60 % 60, s % 60
+                z.writestr(f"{t9 + s}_{hh:02d}-{mm:02d}-{ss:02d}.jpg", jpg.getvalue())
+    data = buf.getvalue()
+    cut = len(data) // 2 + 7
+
+    class Piece:
+        def __init__(self, b):
+            self.b, self.size = b, len(b)
+
+        def get(self, a, e):
+            return self.b[a:e + 1]
+
+    sz = object.__new__(X.SplitRemoteZip)
+    sz.parts, sz.starts, sz.size = [Piece(data[:cut]), Piece(data[cut:])], [0, cut, len(data)], len(data)
+    sz.zip = zipfile.ZipFile(_io.BufferedReader(X._RangeFile(sz), buffer_size=1 << 12))
+    names = sz.names()
+    assert len(names) == 480 and all(sz.read(n) == jpg.getvalue() for n in names[::37])
+    straddle = [i for i in sz.zip.infolist() if i.header_offset < cut < i.header_offset + i.compress_size + 60]
+    assert straddle and sz.read(straddle[0].filename) == jpg.getvalue()        # a frame cut in two
+    # which zip a window reads from
+    a = argparse.Namespace(start=12.0, end=15.0, live=M.LIVE)
+    assert M.LIVE_HOURS[0] <= a.start and a.end <= M.LIVE_HOURS[1]
+    picked = []
+    real = X.SplitRemoteZip
+    X.SplitRemoteZip = lambda urls: picked.append(urls) or sz
+    try:
+        assert M.live_zip(argparse.Namespace(start=9.0, end=13.0, live=M.LIVE), 1) is sz
+        assert picked[0] == [M.LIVE_DAY.format(k=1, p=p) for p in M.LIVE_DAY_PARTS]
+        real_remote = M.remote
+        M.remote = lambda url: ("3h", url)
+        assert M.live_zip(a, 2) == ("3h", M.LIVE.format(k=2))
+        M.remote = real_remote
+        # two windows into one live.jsonl
+        with tempfile.TemporaryDirectory() as d:
+            M.live_zip = lambda args, k: sz
+            for s_, e_ in ((12.0, 13.0), (9.0, 12.0)):
+                M.cmd_live(argparse.Namespace(out=d, cams="1", start=s_, end=e_, live_step=60.0, workers=2, max_side=64))
+            rows = [json.loads(l) for l in open(os.path.join(d, "live.jsonl"))]
+            hours = sorted({int(C.local_hour(r["ts"])) for r in rows})
+            assert hours == [9, 10, 11, 12] and len(rows) == 4 * 60 and all(os.path.exists(r["path"]) for r in rows)
+    finally:
+        X.SplitRemoteZip = real
+        import importlib
+        importlib.reload(M)
+
+
+
+def test_v14g_results_page_and_comparison_with_the_control():
+    import system_e as E
+
+    def run(start, setup_min, f1s):
+        prf = lambda f: {"f1": f, "precision": f, "recall": f, "answered_share": 1.0}
+        return {"settings": {"start": start, "setup_min": setup_min, "end": 13.0},
+                "identification": {w: {"with_not_sure": prf(f / 2), "always_answer": prf(f)} for w, f in f1s.items()},
+                "album": {"built": {"album_cows": 30, "true_cows": 16, "purity": 0.9, "coverage": 1.0},
+                          "confirmed_cows": 16, "oracle_cows": 16, "threshold": 0.7, "self_calibration": {}},
+                "detector": {"recall": 0.95, "precision": 0.96}, "chains": 900}
+
+    g = run(9.0, 180, {"built": 0.2, "confirmed": 0.45, "oracle": 0.5})
+    c = run(11.0, 60, {"built": 0.1, "confirmed": 0.3, "oracle": 0.3})
+    assert E.window_text(g["settings"]) == "onboarding 09:00-12:00 (180 min), scored 12:00-13:00"
+    with tempfile.TemporaryDirectory() as d:
+        page = os.path.join(d, "RESULTS.md")
+        E.report_e(g, page, "G")
+        text = open(page).read()
+        assert text.startswith("# Version 14 (G):") and "onboarding 09:00-12:00 (180 min), scored 12:00-13:00" in text
+        for name, obj in (("g.json", g), ("c.json", c)):
+            json.dump(obj, open(os.path.join(d, name), "w"))
+        E.compare_main(["--main", os.path.join(d, "g.json"), "--control", os.path.join(d, "c.json"), "--append", page])
+        text = open(page).read()
+        assert "control: onboarding 11:00-12:00 (60 min), scored 12:00-13:00" in text
+        assert "| confirmed | **45.0%** | 30.0% | 22.5% | 15.0% |" in text
+        assert "| oracle | **50.0%** | 30.0% |" in text
