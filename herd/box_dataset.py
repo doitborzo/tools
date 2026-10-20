@@ -18,6 +18,7 @@ and pens are its own. A few hundred frames of them, boxes corrected by hand, tea
     python herd/herd.py boxes frames --config /srv/herd/barn.toml --videos /srv/herd/rec --out /srv/herd/boxes
     python herd/herd.py boxes page   --data /srv/herd/boxes --labels labels.json   # the page again, names kept
     python herd/herd.py boxes export --data /srv/herd/boxes --labels labels.json
+    python herd/herd.py boxes ids    --data /srv/herd/boxes --labels labels.json   # boxes named with a cow id
 
 Recordings are named by camera and local start time (cam1_2026-10-20_06-00-00.mp4, cam1/20261020T060000.mkv
 ...): see common.recordings. One file: --video cam1=file.mp4 --start 2026-10-20T06:00:00.
@@ -342,6 +343,75 @@ def cmd_export(args):
           f"({os.path.getsize(out) / 2 ** 20:.0f} MB)")
 
 
+def cmd_ids(args):
+    """Boxes named with a cow's id -> the identity model's set "barn_ids" (reid.py): each such box of a done
+    frame cut as the barn cuts a cow (square, with the model's margin), its cow's id, camera and time; a
+    sixth of the cows held out whole (never trained on: they score the model and set its thresholds).
+    reid_pod.sh takes herd_barn_ids_<date>.tgz in and runs DINOv2 on the crops there."""
+    import random
+    import shutil
+    import tarfile
+    import tempfile
+    from PIL import Image
+    from common import crop, square_crop_box
+    src = os.path.abspath(args.data)
+    index = json.load(open(os.path.join(src, "frames.json"), encoding="utf-8"))
+    labels = read_labels(args.labels)
+    items, stale = [], 0
+    for f in index["frames"]:
+        lab = labels.get(f["file"])
+        if not lab or lab.get("status") != "done":
+            continue
+        if f.get("cut") and lab.get("cut") != f["cut"]:
+            stale += 1
+            continue
+        for b in lab.get("boxes", []):
+            if len(b) > 4 and str(b[4]).strip() and not in_grey(b, f.get("exclude")):
+                items.append((str(b[4]).strip(), f, b[:4]))
+    count = collections.Counter(cow for cow, _, _ in items)
+    few = sorted(c for c, n in count.items() if n < args.min_crops)
+    items = [it for it in items if count[it[0]] >= args.min_crops]
+    cows = sorted({cow for cow, _, _ in items})
+    if len(cows) < 2:
+        sys.exit(f"{len(cows)} cow(s) with {args.min_crops}+ named boxes in done frames: name more boxes "
+                 f"(select a box, I, her tag, Enter; Save labels.json)")
+    k = max(1, round(len(cows) * args.val_share)) if args.val_share > 0 else 0
+    val = set(random.Random(args.seed).sample(cows, min(k, len(cows) - 1)))
+    tmp = tempfile.mkdtemp()
+    raw = os.path.join(tmp, "reid", "raw", "barn_ids")
+    rows, images = [], {}
+    for cow, f, box in sorted(items, key=lambda it: (it[0], it[1]["ts"])):
+        if f["file"] not in images:
+            images = {f["file"]: Image.open(os.path.join(src, f["file"])).convert("RGB")}
+        img = images[f["file"]]
+        x1, _, x2, _ = square_crop_box(box, img.width, img.height, args.margin)
+        safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in cow)
+        name = f"{safe}/{f['cam']}_{int(f['ts'])}_{len(rows)}.jpg"
+        os.makedirs(os.path.join(raw, safe), exist_ok=True)
+        # as the barn cuts a cow: square, the margin round her, grey past the frame's edge
+        sq = crop(np.asarray(img), box, max(32, min(448, x2 - x1)), args.margin)
+        Image.fromarray(sq).save(os.path.join(raw, name), quality=92)
+        day = f["time"][:10].replace("-", "")
+        rows.append({"file": name, "cow": cow, "day": day, "cam": f["cam"], "order": int(f["ts"]), "ready": True,
+                     "split": "val" if cow in val else "train", "by": "box"})
+    with open(os.path.join(raw, "index.jsonl"), "w", encoding="utf-8") as fh:
+        fh.writelines(json.dumps(r) + "\n" for r in rows)
+    with open(os.path.join(raw, "complete.json"), "w", encoding="utf-8") as fh:
+        json.dump({"crops": len(rows), "cows": len(cows), "held_out": sorted(val), "margin": args.margin}, fh)
+    out = args.out or f"herd_barn_ids_{dt.datetime.now():%Y%m%d_%H%M}.tgz"
+    with tarfile.open(out, "w:gz") as tar:
+        tar.add(os.path.join(tmp, "reid"), arcname="reid")
+    shutil.rmtree(tmp)
+    cams = collections.Counter(r["cam"] for r in rows)
+    multi = sum(1 for c in cows if len({r["cam"] for r in rows if r["cow"] == c}) > 1)
+    print(f"[ids] {len(rows)} named boxes of {len(cows)} cows ({', '.join(f'{c} {n}' for c, n in sorted(cams.items()))}); "
+          f"{multi} cows seen by 2+ cameras; held out: {', '.join(sorted(val))} -> {out}")
+    if few:
+        print(f"[ids] fewer than {args.min_crops} named boxes, left out: {', '.join(few)}")
+    if stale:
+        print(f"[ids] {stale} frames cut again after they were labelled - left out until checked on the page")
+
+
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Barn cow boxes</title>
@@ -365,7 +435,9 @@ over other cows' boxes). Draw round the part of her you can see. A click selects
 to resize; <kbd>Del</kbd> removes it. Dashed boxes are cows the detector was unsure of: click to keep, <kbd>A</kbd> keeps all.
 <kbd>+</kbd> <kbd>&minus;</kbd> zoom (far cows). Grey is the camera's excluded zone: no boxes there. <kbd>Enter</kbd> marks the
 frame done and opens the next; only frames marked done are exported. <kbd>S</kbd> skips a frame (spoilt, or unsure);
-<kbd>&larr;</kbd> <kbd>&rarr;</kbd> move without marking; <kbd>Ctrl+Z</kbd> undoes.</p>
+<kbd>&larr;</kbd> <kbd>&rarr;</kbd> move without marking; <kbd>Ctrl+Z</kbd> undoes. <b>Which cow</b> (for the identity
+model): select a box, <kbd>I</kbd>, her ear tag, <kbd>Enter</kbd> - the next box without an id is selected; <kbd>P</kbd> takes
+the ids of this camera's frame before for boxes in the same place (check them).</p>
 <div class="bar">
 <button id="prev">&larr;</button><span id="pos"></span><button id="next">&rarr;</button>
 <select id="cam"></select><label><input type="checkbox" id="todo"> only not done</label>
@@ -373,6 +445,10 @@ frame done and opens the next; only frames marked done are exported. <kbd>S</kbd
 <button class="main" id="done">Done &#10003;</button><button id="skip">Skip</button><button id="reset">Detector's boxes</button>
 <button class="main" id="save">Save labels.json</button><button id="loadbtn">Load labels.json</button><input type="file" id="load" accept=".json" hidden>
 </div>
+<div class="bar"><label>cow id <input id="cid" list="ids" size="12" placeholder="ear tag" disabled></label>
+<button id="lastid" title="the id typed last">= last</button><button id="previd" title="ids from this camera's frame before (P)">ids from previous (P)</button>
+<span class="mute">select a box, <kbd>I</kbd> - type her tag - <kbd>Enter</kbd> (the next box without an id is selected)</span></div>
+<datalist id="ids"></datalist>
 <div class="bar"><span id="info"></span><span id="status"></span><span class="mute" id="stat"></span></div>
 </header>
 <main><div id="wrap"><canvas id="cv"></canvas></div></main>
@@ -434,7 +510,8 @@ function status() {
   $("status").textContent = s === "done" ? "done" : s === "skip" ? "skipped" : s === "stale" ? "cut again - check it, Enter" : "not done";
   $("status").className = s;
   const all = DATA.frames.filter(isDone).map(f => labels[f.file]), d = all;
-  $("stat").textContent = `${d.length} of ${DATA.frames.length} frames done, ${d.reduce((n, l) => n + l.boxes.length, 0)} cows, ${DATA.frames.filter(f => labels[f.file] && labels[f.file].status === "skip" && !stale(f)).length} skipped${DATA.frames.some(stale) ? `, ${DATA.frames.filter(stale).length} cut again - to check` : ""}`;
+  const named = d.reduce((n, l) => n + l.boxes.filter(b => b[4]).length, 0), cows = Object.keys(knownIds()).length;
+  $("stat").textContent = `${d.length} of ${DATA.frames.length} frames done, ${d.reduce((n, l) => n + l.boxes.length, 0)} cows (${named} with an id; ${cows} ids), ${DATA.frames.filter(f => labels[f.file] && labels[f.file].status === "skip" && !stale(f)).length} skipped${DATA.frames.some(stale) ? `, ${DATA.frames.filter(stale).length} cut again - to check` : ""}`;
 }
 function draw() {
   ctx.drawImage(img, 0, 0, cv.width, cv.height);
@@ -443,17 +520,67 @@ function draw() {
   ctx.setLineDash([6, 4]); ctx.strokeStyle = "#f0a020"; ctx.font = "12px sans-serif"; ctx.fillStyle = "#f0a020";
   cands.forEach(c => { ctx.strokeRect(X(c[0]), Y(c[1]), X(c[2] - c[0]), Y(c[3] - c[1])); ctx.fillText(c[4].toFixed(2), X(c[0]) + 3, Y(c[1]) + 13); });
   ctx.setLineDash([]);
+  const anyId = boxes.some(b => b[4]);
   boxes.forEach((b, i) => {
     ctx.strokeStyle = i === sel ? "#ffe94a" : "#3ee07a";
     ctx.strokeRect(X(b[0]), Y(b[1]), X(b[2] - b[0]), Y(b[3] - b[1]));
     if (i === sel) { ctx.fillStyle = "#ffe94a"; corners(b).forEach(([x, y]) => ctx.fillRect(X(x) - 5, Y(y) - 5, 10, 10)); }
+    if (b[4] || anyId) {                              // its cow id ("?" once the frame has some)
+      const t = b[4] || "?";
+      ctx.font = "bold 14px sans-serif";
+      const w = ctx.measureText(t).width + 8;
+      ctx.fillStyle = b[4] ? "rgba(20,20,20,0.75)" : "rgba(160,40,40,0.8)";
+      ctx.fillRect(X(b[0]), Y(b[1]) - 19, w, 19);
+      ctx.fillStyle = "#fff"; ctx.fillText(t, X(b[0]) + 4, Y(b[1]) - 5);
+    }
   });
+  $("cid").disabled = sel < 0;
+  $("cid").value = sel >= 0 ? (boxes[sel][4] || "") : "";
 }
 const corners = b => [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]];
+// a box is [x1, y1, x2, y2] or [x1, y1, x2, y2, "cow id"]
+const withId = (xy, b) => b && b[4] ? xy.concat([b[4]]) : xy;
+const rnd = b => withId(b.slice(0, 4).map(v => Math.round(v * 1e4) / 1e4), b);
+function knownIds() {
+  const n = {};
+  Object.values(labels).forEach(l => (l.boxes || []).forEach(b => { if (b[4]) n[b[4]] = (n[b[4]] || 0) + 1; }));
+  return n;
+}
+function idList() { $("ids").innerHTML = Object.keys(knownIds()).sort().map(k => `<option value="${k.replace(/"/g, "&quot;")}">`).join(""); }
+function setId(v) {
+  if (sel < 0) return;
+  v = (v || "").trim().replace(/,/g, " ");
+  push();
+  boxes[sel] = v ? boxes[sel].slice(0, 4).concat([v]) : boxes[sel].slice(0, 4);
+  if (v) lastId = v;
+  edited(); idList();
+}
+function nextUnnamed() {          // left to right: the next box with no id, or none
+  const order = boxes.map((b, i) => [i, b]).sort((p, q) => p[1][0] - q[1][0]);
+  const k = order.find(([i, b]) => !b[4] && i !== sel);
+  return k ? k[0] : -1;
+}
+function idsFromPrevious() {      // each box without an id takes the id of the box most like it on this camera's
+  const f = frame(), i = DATA.frames.indexOf(f);   // frame before (a lying cow keeps her place)
+  const prev = DATA.frames.slice(0, i).reverse().find(g => g.cam === f.cam && labels[g.file] && (labels[g.file].boxes || []).some(b => b[4]));
+  if (!prev) { alert("no earlier frame of this camera with ids"); return; }
+  push();
+  const pb = labels[prev.file].boxes.filter(b => b[4]), used = new Set(boxes.filter(b => b[4]).map(b => b[4]));
+  let n = 0;
+  boxes = boxes.map(b => {
+    if (b[4]) return b;
+    const best = pb.filter(q => !used.has(q[4])).map(q => [iou(b, q), q]).sort((x, y) => y[0] - x[0])[0];
+    if (!best || best[0] < 0.3) return b;
+    used.add(best[1][4]); n++;
+    return b.slice(0, 4).concat([best[1][4]]);
+  });
+  edited();
+  $("info").textContent = `${f.cam}  ${f.time}  - ${n} ids from ${prev.time}: check them`;
+}
 function edited() {
   const f = frame();
   const was = labels[f.file] || {};
-  labels[f.file] = {status: was.status || "", cut: was.cut, boxes: boxes.map(b => b.map(v => Math.round(v * 1e4) / 1e4))};
+  labels[f.file] = {status: was.status || "", cut: was.cut, boxes: boxes.map(rnd)};
   store(); status(); draw();
 }
 function push() { undo.push(JSON.stringify([boxes, cands])); if (undo.length > 50) undo.shift(); }
@@ -485,14 +612,14 @@ cv.addEventListener("pointermove", e => {
   const b = boxes[sel];
   if (drag.mode === "move") {
     const dx = Math.min(1 - drag.b[2], Math.max(-drag.b[0], x - drag.x)), dy = Math.min(1 - drag.b[3], Math.max(-drag.b[1], y - drag.y));
-    boxes[sel] = [drag.b[0] + dx, drag.b[1] + dy, drag.b[2] + dx, drag.b[3] + dy];
+    boxes[sel] = withId([drag.b[0] + dx, drag.b[1] + dy, drag.b[2] + dx, drag.b[3] + dy], drag.b);
   } else if (drag.mode === "new") {
     boxes[sel] = [Math.min(drag.x, x), Math.min(drag.y, y), Math.max(drag.x, x), Math.max(drag.y, y)];
   } else {
     const k = drag.k;
     if (k === 0 || k === 3) b[0] = x; else b[2] = x;
     if (k === 0 || k === 1) b[1] = y; else b[3] = y;
-    boxes[sel] = [Math.min(b[0], b[2]), Math.min(b[1], b[3]), Math.max(b[0], b[2]), Math.max(b[1], b[3])];
+    boxes[sel] = withId([Math.min(b[0], b[2]), Math.min(b[1], b[3]), Math.max(b[0], b[2]), Math.max(b[1], b[3])], b);
     if (b[0] > b[2]) drag.k = [1, 0, 3, 2][drag.k];
     if (b[1] > b[3]) drag.k = [3, 2, 1, 0][drag.k];
   }
@@ -513,11 +640,23 @@ cv.addEventListener("pointerup", () => {
 });
 function mark(s) {
   const f = frame(); if (!f) return;
-  labels[f.file] = {status: s, cut: f.cut, boxes: boxes.map(b => b.map(v => Math.round(v * 1e4) / 1e4))};
+  labels[f.file] = {status: s, cut: f.cut, boxes: boxes.map(rnd)};
   store(); status();
   if (at + 1 < order.length) { at++; open(); } else draw();
 }
 function go(d) { if (!order.length) return; at = Math.min(order.length - 1, Math.max(0, at + d)); open(); }
+let lastId = "";
+$("cid").addEventListener("keydown", e => {
+  if (e.key === "Enter") {
+    setId($("cid").value);
+    const k = nextUnnamed();
+    if (k >= 0) { sel = k; draw(); $("cid").focus(); } else { sel = -1; draw(); $("cid").blur(); }
+    e.preventDefault(); e.stopPropagation();
+  } else if (e.key === "Escape") { $("cid").blur(); }
+});
+$("cid").addEventListener("change", () => { if (sel >= 0 && $("cid").value.trim() !== (boxes[sel][4] || "")) setId($("cid").value); });
+$("lastid").onclick = () => { if (sel >= 0 && lastId) setId(lastId); };
+$("previd").onclick = () => idsFromPrevious();
 const ZOOMS = [1, 1.5, 2, 3, 4];
 function setZoom(d) { zoom = ZOOMS[Math.min(ZOOMS.length - 1, Math.max(0, ZOOMS.indexOf(zoom) + d))]; if (img.naturalWidth) { fit(); draw(); } }
 $("zin").onclick = () => setZoom(1); $("zout").onclick = () => setZoom(-1);
@@ -535,6 +674,8 @@ document.addEventListener("keydown", e => {
   else if ((e.key === "Delete" || e.key === "Backspace") && sel >= 0) { push(); boxes.splice(sel, 1); sel = -1; edited(); e.preventDefault(); }
   else if (e.key === "a" || e.key === "A") { push(); boxes.push(...cands.map(c => c.slice(0, 4))); cands = []; edited(); }
   else if (e.key === "Escape") { sel = -1; draw(); }
+  else if ((e.key === "i" || e.key === "I") && sel >= 0) { $("cid").focus(); $("cid").select(); e.preventDefault(); }
+  else if (e.key === "p" || e.key === "P") idsFromPrevious();
   else if (e.key === "+" || e.key === "=") setZoom(1);
   else if (e.key === "-") setZoom(-1);
 });
@@ -546,6 +687,7 @@ $("save").onclick = () => {
 $("loadbtn").onclick = () => $("load").click();
 $("load").onchange = e => { const f = e.target.files[0]; if (!f) return;
   f.text().then(t => { const d = JSON.parse(t); Object.assign(labels, d.frames || d); store(); open(); }); };
+idList();
 window.addEventListener("resize", () => { if (img.naturalWidth) { fit(); draw(); } });
 filter(0); open();
 </script></body></html>
@@ -578,10 +720,18 @@ def main(argv=None):
     x.add_argument("--val-share", type=float, default=0.2, help="frames held out to check the detector")
     x.add_argument("--block-min", type=float, default=60.0, help="held out by whole blocks of a camera's minutes")
     x.add_argument("--seed", type=int, default=0)
+    n = sub.add_parser("ids", help="boxes named with a cow id -> herd_barn_ids_<date>.tgz (the identity model)")
+    n.add_argument("--data", required=True)
+    n.add_argument("--labels", required=True)
+    n.add_argument("--out", default=None)
+    n.add_argument("--min-crops", type=int, default=6, help="cows with fewer named boxes are left out")
+    n.add_argument("--val-share", type=float, default=1 / 6, help="cows held out (never trained on)")
+    n.add_argument("--margin", type=float, default=0.1, help="context round the box (the herd model's margin)")
+    n.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
     if args.cmd == "frames" and not (args.videos or args.video):
         p.error("frames: --videos DIR or --video cam=file")
-    {"frames": cmd_frames, "page": cmd_page, "export": cmd_export}[args.cmd](args)
+    {"frames": cmd_frames, "page": cmd_page, "export": cmd_export, "ids": cmd_ids}[args.cmd](args)
 
 
 if __name__ == "__main__":

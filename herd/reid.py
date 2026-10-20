@@ -29,6 +29,8 @@ The herd model's fingerprint was taught on CBVD-5, which has no cow ids: it lear
                in mct_eval's hours). Other days have no labels, but cows 1-10 wear a UWB neck tag:
                its position every 15 s, against the detector's boxes on the floor, labels whole tracks
                (tag_tracks; 95% right when checked on 7/25 against the human labels).
+    barn_ids   the barn's frames, each cow's box named by hand on the box page (herd.py boxes ids ->
+               herd_barn_ids_*.tgz): crops with the cow's tag, camera and time; extract like any set.
     barn       the barn's own cows, its tracks named by hand (herd.py barn sheet -> barn export ->
                herd_barn_feat_*.tgz): its bursts as they are, no fetch, no extract; a sixth of the
                named cows held out (the export decides).
@@ -108,6 +110,9 @@ SOURCES = {
     # the barn's own cows, labelled by hand (barn_dataset.py sheet -> export): feat/barn comes ready from
     # herd_barn_feat_*.tgz - nothing to fetch or extract
     "barn": {"local": True, "licence": "the barn's own footage"},
+    # the barn's frames, each cow's box named by hand (box_dataset.py ids): crops in raw/barn_ids from
+    # herd_barn_ids_*.tgz - nothing to fetch; extract runs DINOv2 on them like on any set
+    "barn_ids": {"upload": True, "licence": "the barn's own footage"},
 }
 SIDEVIEW_STRIDE = {"snapshots": 1, "barn": 5, "parlor": 10}   # video frames: every k-th (neighbours are alike)
 SLOTS, FPS = 175, 25.0                   # the barn's burst: 7 s at 25 fps
@@ -221,7 +226,7 @@ def cmd_fetch(args):
         if src == "mmcows":
             fetch_mmcows(args)
             continue
-        if SOURCES[src].get("local"):
+        if SOURCES[src].get("local") or SOURCES[src].get("upload"):
             continue
         url = SOURCES[src]["url"] or DET_SOURCES["opencows"]["url"]
         folder = os.path.join(args.data, "raw", src)

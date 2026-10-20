@@ -333,3 +333,53 @@ def test_barn_video_one_camera_again():
             assert [r["cam"] for r in rows] == ["cam2"] and not os.path.exists(os.path.join(day, "cam1"))
         finally:
             pipeline.Models, pipeline.run = old
+
+
+def test_boxes_named_by_cow_go_to_the_identity_model():
+    import box_dataset
+    import reid
+    with tempfile.TemporaryDirectory() as d:
+        cfg, rec = _setup(d)
+        out = os.path.join(d, "boxes")
+        box_dataset.main(["frames", "--config", cfg, "--videos", rec, "--out", out, "--every", "10", "--detector", "none"])
+        fr = json.load(open(os.path.join(out, "frames.json")))["frames"]
+        tags = ["UA01", "UA02", "UA03", "UA04", "UA05", "UA06"]
+        labels = {}
+        for k, f in enumerate(fr):            # two named cows a frame, one box without an id
+            a, b = tags[k % 6], tags[(k + 1) % 6]
+            labels[f["file"]] = {"status": "done", "boxes": [[0.1, 0.4, 0.3, 0.8, a], [0.5, 0.4, 0.7, 0.8, b],
+                                                             [0.75, 0.5, 0.9, 0.7]]}
+        labels[fr[0]["file"]]["status"] = ""                                             # not done: not taken
+        lp = os.path.join(d, "labels.json")
+        json.dump({"frames": labels}, open(lp, "w"))
+        tgz = os.path.join(d, "ids.tgz")
+        box_dataset.main(["ids", "--data", out, "--labels", lp, "--out", tgz, "--min-crops", "2"])
+        work = os.path.join(d, "work")
+        with tarfile.open(tgz) as t:
+            t.extractall(work)
+        R = os.path.join(work, "reid")
+        rows = [json.loads(x) for x in open(os.path.join(R, "raw", "barn_ids", "index.jsonl"))]
+        assert len(rows) == 2 * (len(fr) - 1) and {r["cow"] for r in rows} == set(tags)
+        assert {r["cam"] for r in rows} == {"cam1", "cam2"} and all(r["ready"] for r in rows)
+        val = {r["cow"] for r in rows if r["split"] == "val"}
+        assert len(val) == 1 and not val & {r["cow"] for r in rows if r["split"] == "train"}
+        from PIL import Image
+        im = Image.open(os.path.join(R, "raw", "barn_ids", rows[0]["file"]))
+        assert im.width == im.height
+        # reid: no fetch; extract makes bursts of the crops with the held-out split kept
+        reid.main(["fetch", "--data", R, "--sources", "barn_ids"])
+        real = reid.encode_all
+        reid.encode_all = lambda paths, meta, batch=256, ready=None: np.random.default_rng(0).normal(
+            size=(len(paths), 16)).astype(np.float16)
+        try:
+            import torch
+            import model as mdl
+            m = mdl.HerdModel(16, d=32, layers=1, heads=2)
+            mp = os.path.join(d, "model.pt")
+            m.save(mp, {"features": {"encoder": "x", "grid": 2, "crop": 224, "margin": 0.1}, "crop_s": 3.5, "dev_clips": []})
+            reid.main(["extract", "--data", R, "--sources", "barn_ids", "--model", mp])
+        finally:
+            reid.encode_all = real
+        bursts = [json.loads(x) for x in open(os.path.join(R, "feat", "barn_ids", "bursts.jsonl"))]
+        assert bursts and {b["identity"].split(":")[0] for b in bursts} == {"barn_ids"}
+        assert {b["cow"] for b in bursts if b["split"] == "val"} == val

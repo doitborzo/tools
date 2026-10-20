@@ -173,6 +173,20 @@ the pod's `/workspace`. Training writes new archives
 (`herd_reid_*.tgz`, a detector in `herd_models_*.tgz`). Put those in `docker/models/` (move the old
 ones out) and build again.
 
+**Cows named on the boxes** (instead of, or besides, naming tracks). On the box page select a box,
+press `I`, type her ear tag, `Enter`: the next box without an id is selected. `P` takes the ids of this
+camera's frame before for boxes in the same place (a lying cow keeps her place): check them and fix
+the few that moved. The same cow seen by two cameras at once gets the same tag on both: that is what the
+model needs most. Save labels.json, then:
+
+```bash
+docker compose run --rm herd boxes ids --data /data/boxes --labels /data/labels.json
+```
+
+It writes `docker/data/herd_barn_ids_<date>.tgz`: each named box cut as the barn cuts a cow, a sixth of
+the cows held out. Put it in the pod's `/workspace`; `reid_pod.sh` adds the set `barn_ids` to training.
+The same labels.json also makes the detector's set (`boxes export`).
+
 **One camera's zone changed** (`zones page` → `zones apply` again). Redo only that camera:
 
 ```bash

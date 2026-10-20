@@ -40,7 +40,8 @@
 # A herd_reid_feat_*.tgz in WORK (the second export of a run) brings every set's frame vectors: nothing
 # of those sets is fetched again.
 # A herd_barn_feat_*.tgz in WORK (herd.py barn export: the barn's own cows, named by hand) adds the set
-# "barn" to SOURCES (BARN=0: not); its held-out cows are scored with the others and set the thresholds.
+# "barn" to SOURCES, a herd_barn_ids_*.tgz (herd.py boxes ids: cows' boxes named on the box page) the set
+# "barn_ids" (BARN=0: neither); their held-out cows are scored with the others and set the thresholds.
 # Every step resumes. Licences: MmCows CC BY-NC-SA, CoBRA and SideViewCows CC BY 4.0, the Bristol sets NCGL
 # (non-commercial), CowDataset as on Figshare 16879780.
 
@@ -146,6 +147,19 @@ if [ -n "$b" ] && [ "$(cat "$R/feat/barn/.from" 2>/dev/null || true)" != "$(base
     mkdir -p "$R"
     tar -xzf "$b" -C "$WORK"
     basename "$b" > "$R/feat/barn/.from"
+fi
+# the barn's frames with each cow's box named (herd.py boxes ids): crops, made into vectors below
+bi="$(ls -t "$WORK"/herd_barn_ids_*.tgz 2>/dev/null | head -1 || true)"
+if [ -n "$bi" ] && [ "$(cat "$R/raw/barn_ids/.from" 2>/dev/null || true)" != "$(basename "$bi")" ]; then
+    step "The barn's named boxes from $bi"
+    rm -rf "$R/raw/barn_ids" "$R/feat/barn_ids"
+    mkdir -p "$R"
+    tar -xzf "$bi" -C "$WORK"
+    basename "$bi" > "$R/raw/barn_ids/.from"
+fi
+if [ "${BARN:-1}" = "1" ] && [ -f "$R/raw/barn_ids/index.jsonl" ] && [[ " $SOURCES " != *" barn_ids "* ]]; then
+    SOURCES="$SOURCES barn_ids"
+    echo "barn_ids: $(grep -c . "$R/raw/barn_ids/index.jsonl") named boxes of the barn's cows"
 fi
 if [ "${BARN:-1}" = "1" ] && [ -f "$R/feat/barn/bursts.jsonl" ] && [[ " $SOURCES " != *" barn "* ]]; then
     SOURCES="$SOURCES barn"
@@ -259,6 +273,10 @@ fi
 
 bg_wait wildlife multicam cows2021 opencows aerialcattle cowdataset
 bg_wait zenodo cobra sideview
+if want barn_ids; then
+    step "Extract the barn's named boxes: DINOv2 on every crop (GPU)"
+    "$PY" "$HERE/reid.py" extract --data "$R" --sources barn_ids --model "$H/$RUN/model.pt"
+fi
 
 # without the sets most cows come from the model learns too few cows and over-fits MmCows' ten
 # (2026-10-19, data.bris down: 142 cows instead of 312, cows 11-16 by look 51% -> 32%): stop instead
