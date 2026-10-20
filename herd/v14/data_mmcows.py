@@ -246,6 +246,33 @@ def cmd_feats(args):
     print(f"[mmcows] {len(box_rows)} boxes, {len(frames)} scene grids -> {out_npz}", flush=True)
 
 
+def id_sequences(frames, items, start, train_every, seq_len):
+    """Labelled boxes outside the test window -> ID sequences per (part, cow, camera): consecutive frames,
+    at most seq_len long, no gap over 2.5 x train_every; part A before `start`, B after the window.
+    items = [(frame index, cow, box)] -> rows {name, day, cow, seq, t, cam} and the item index of each row."""
+    by = collections.defaultdict(list)
+    for i, (fi, cow, _) in enumerate(items):
+        f = frames[fi]
+        if f["split"] != "train":
+            continue
+        part = "A" if local_hour(f["ts"]) < start else "B"
+        by[(part, cow, f["cam"])].append((f["ts"], i))
+    out_rows, idx = [], []
+    for (part, cow, cam), seen in sorted(by.items()):
+        seen.sort()
+        t0 = last = None
+        count = 0
+        for ts, i in seen:
+            if last is None or ts - last > 2.5 * train_every or count >= seq_len:
+                t0, count = ts, 0                       # a new sequence
+            count += 1
+            last = ts
+            out_rows.append({"name": f"{cam}/{ts:.1f}/{cow}", "day": part, "cow": cow, "seq": f"{cam}_{int(t0)}",
+                             "t": round(ts - t0, 2), "cam": cam})
+            idx.append(i)
+    return out_rows, idx
+
+
 def cmd_idcrops(args):
     """One barn, different cows (idnet.py --split cows): every labelled box outside the test
     window, chained per (cow, camera) into sequences of up to --seq-len frames with no gap
@@ -255,26 +282,8 @@ def cmd_idcrops(args):
     if not rows:
         sys.exit("run `feats` first")
     feats = np.load(os.path.join(args.out, "assoc.npz"))["box_feats"]
-    by = collections.defaultdict(list)
-    for i, r in enumerate(rows):
-        f = frames[r["frame"]]
-        if f["split"] != "train":
-            continue
-        part = "A" if local_hour(f["ts"]) < args.start else "B"
-        by[(part, r["cow"], f["cam"])].append((f["ts"], i))
-    out_rows, idx = [], []
-    for (part, cow, cam), seen in sorted(by.items()):
-        seen.sort()
-        t0 = last = None
-        count = 0
-        for ts, i in seen:
-            if last is None or ts - last > 2.5 * args.train_every or count >= args.seq_len:
-                t0, count = ts, 0                       # a new sequence
-            count += 1
-            last = ts
-            out_rows.append({"name": f"{cam}/{ts:.1f}/{cow}", "day": part, "cow": cow, "seq": f"{cam}_{int(t0)}",
-                             "t": round(ts - t0, 2), "cam": cam})
-            idx.append(i)
+    out_rows, idx = id_sequences(frames, [(r["frame"], r["cow"], r["box"]) for r in rows], args.start,
+                                 args.train_every, args.seq_len)
     d = os.path.join(args.out, "idcrops")
     os.makedirs(d, exist_ok=True)
     np.save(os.path.join(d, "feats.npy"), feats[np.array(idx, int)].astype(np.float16))

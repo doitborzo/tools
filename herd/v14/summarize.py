@@ -28,6 +28,7 @@ def main(argv=None):
     p.add_argument("--version", default=None, help="A, C, D ... (default: from the run)")
     a = p.parse_args(argv)
     idn = load(os.path.join(a.work, "idnet", "eval_id.json"))
+    idn_synth = load(os.path.join(a.work, "idnet", "eval_id_synth.json"))
     asc = load(os.path.join(a.work, "assoc", "eval_assoc.json"))
     sys_a = load(os.path.join(a.work, "system", "system_assoc.json"))
     sys_b = load(os.path.join(a.work, "system", "system_iou_per_camera.json"))
@@ -35,11 +36,18 @@ def main(argv=None):
     by_cows = sp.get("by") == "cows"
     by_groups = sp.get("by") == "groups"
     ver = a.version or ("C" if ((sys_a or {}).get("settings") or {}).get("way") == "C" else "A")
-    L = [f"# Version 14 ({ver}): cow identification" + (", trained on WildlifeReID-10k's cattle, tested on MmCows' "
+    ocid = ver == "F" or (((idn or {}).get("model") or {}).get("backbone") is not None)
+    id_name = "OpenCowID model" if ocid else "ID transformer"
+    L = [f"# Version 14 ({ver}): cow identification" + (", OpenCowID's model trained on its synthetic coats and "
+                                                        "WildlifeReID-10k's cattle, tested on MmCows' 16 cows (none trained on)" if ocid else
+                                                        ", trained on WildlifeReID-10k's cattle, tested on MmCows' "
                                                         "16 cows (none trained on)" if by_groups else ", version 14 (A)'s weights (one barn, MmCows)" if ver == "C" and not idn else ", one barn (MmCows): different cows for training and testing"
                                                    if by_cows else ", trained on MultiCamCows2024 + MmCows"), "",
-         "Nothing from CBVD-5. Detector: version 10's, not retrained. DINOv2-S frozen. The ID transformer "
-         "and the association transformer trained from scratch.", ""]
+         ("Nothing from CBVD-5. Detector: version 10's, not retrained. DINOv2-S frozen, for the association transformer "
+          "only. The ID model is OpenCowID's: a ResNet-50 with ImageNet weights and a 128-number projection, fine-tuned."
+          if ocid else
+          "Nothing from CBVD-5. Detector: version 10's, not retrained. DINOv2-S frozen. The ID transformer "
+          "and the association transformer trained from scratch."), ""]
     if ver == "C":
         L += ["Version 14 (C) - Версія 14 (В) - uses version 14 (A)'s weights, nothing retrained. At onboarding it measures the "
               "barn's average cow in the setup hour and takes it out of every fingerprint before the album is built; "
@@ -52,11 +60,23 @@ def main(argv=None):
               "sets never meets herself as another cow). Held-out WildlifeReID-10k cows pick the epoch, the 'not "
               "sure' model and the enrolment threshold. Nothing from MmCows trains it: every MmCows cow is new. "
               "The association transformer and the detector are version 14 (A)'s / version 10's.", ""]
+    if ver == "F":
+        tr = (idn or {}).get("training") or {}
+        L += ["Version 14 (F): OpenCowID (Prabhune and Kim, WACV 2026; github.com/neis-lab/OpenCowID, MIT) as the ID "
+              "model, on version 14 (D)'s data and tests. One picture -> one embedding (128 numbers, unit length); a "
+              "sequence's fingerprint is the mean of its pictures' embeddings. Trained as OpenCowID trains: metric "
+              "learning around virtual class centroids (each class's mean embedding at the start, pushed apart on the "
+              "unit sphere), Adam at 1e-5, OpenCowID's augmentations - "
+              f"stages {tr.get('stages', 'synth,wr10k')}: first its synthetic Holstein coats (random blobs, "
+              f"{tr.get('synth_ids', '?')} made-up cows; no real cow: the zero-shot model, scored on its own below), then the "
+              "same WildlifeReID-10k cattle version 14 (D) trained on (the pictures, cut as the barn cuts them). Held-out "
+              "WildlifeReID-10k cows pick the epoch, the 'not sure' model and the enrolment threshold, as in D. The "
+              "association transformer, the detector, the test window and every score are version 14 (D)'s.", ""]
     if idn:
         t, prf, alw = idn["test"], idn["test_id_with_not_sure"], idn["test_id_always_answer"]
         if by_groups:
             n = len(sp["test"])
-            L += ["## 1. ID transformer on MmCows' 16 cows (a barn and cows it never saw)", "",
+            L += [f"## 1. {id_name} on MmCows' 16 cows (a barn and cows it never saw)", "",
                   f"Trained on {len(sp['train'])} WildlifeReID-10k cows; epoch, 'not sure' model and enrolment "
                   f"threshold picked on {len(sp['val'])} held-out ones; tested on MmCows' {n} cows: album from "
                   f"before 12:00, queries every sequence after 15:00 (labelled frames a minute apart). With {n} "
@@ -79,7 +99,20 @@ def main(argv=None):
               f"| ID recall ('not sure' = miss) | {pct(prf['recall'])} |",
               f"| **ID F1** | **{pct(prf['f1'])}** |", f"| answered | {pct(prf['answered_share'])} |",
               f"| ID F1, always answering | {pct(alw['f1'])} |",
-              f"| model | {idn['model']['parameters'] / 1e6:.2f} M parameters, epoch {idn['model']['epoch']} |", ""]
+              f"| model | {idn['model']['parameters'] / 1e6:.2f} M parameters, epoch {idn['model']['epoch']}"
+              + (f" of stage {idn.get('stage')}" if idn.get("stage") else "") + " |"]
+        si = (idn.get("test_single_image") or {}).get("test")
+        if si:
+            L += [f"| per picture, 1-NN (OpenCowID's own measure): top-1 / top-5 | {pct(si['top1'])} / {pct(si['top5'])} "
+                  f"({si['queries']} query pictures, {si['gallery_images']} in the gallery) |"]
+        if idn_synth:
+            ts, tp, ta = idn_synth["test"], idn_synth["test_id_with_not_sure"], idn_synth["test_id_always_answer"]
+            ss = (idn_synth.get("test_single_image") or {}).get("test") or {}
+            L += [f"| **zero-shot** (synthetic coats alone, epoch {idn_synth['model']['epoch']}): top-1 / mAP | "
+                  f"{pct(ts['top1'])} / {num(ts['mAP'])} |",
+                  f"| zero-shot: ID F1 with 'not sure' / always answering | {pct(tp['f1'])} / {pct(ta['f1'])} |",
+                  f"| zero-shot, per picture 1-NN: top-1 | {pct(ss.get('top1'))} |"]
+        L += [""]
     if asc:
         w, r = asc["test_window"], asc["baseline_plain_dinov2"]
         L += ["## 2. Association transformer on MmCows (12:00-15:00, never trained on)", "",
@@ -128,7 +161,8 @@ def main(argv=None):
             L.insert(len(L) - 1, f"| ID F1, {g.replace('_', ' ')}: cows {v['cows']} | {pct(v['with_not_sure']['f1'])} "
                                  f"(always answering {pct(v['always_answer']['f1'])}) |")
     L += ["## Notes", "",
-          "- MultiCamCows2024 (UK Non-Commercial Government Licence) and MmCows (CC BY-NC-SA 4.0): non-commercial.",
+          "- MultiCamCows2024 (UK Non-Commercial Government Licence) and MmCows (CC BY-NC-SA 4.0): non-commercial."
+          + (" OpenCowID's code: MIT; its ResNet-50 starts from torchvision's ImageNet weights." if ocid else ""),
           "- The detector was fine-tuned on MmCows' labelled frames except the hours 0, 6, 12 and 18: its numbers "
           "for 13:00-15:00 may be flattering; the setup hour is clean.",
           ("- One barn: the test cows are new to the ID transformer, but the pen, light and cameras are not; with "
@@ -137,7 +171,7 @@ def main(argv=None):
            if (by_cows or ver == "C") and not by_groups else
            "- WildlifeReID-10k: non-commercial, no re-upload of its images, every source set attributed (its "
            "citation folder). Its cattle are top-down torso crops (Bristol's sets) and side views (CowDataset); "
-           "MmCows' cameras look down at an angle on whole cows: a new kind of view for the ID transformer."
+           f"MmCows' cameras look down at an angle on whole cows: a new kind of view for the {id_name}."
            if by_groups else
            "- MultiCamCows crops are torsos from a walkway; MmCows crops are whole cows in a pen: the ID transformer "
            "meets a new kind of crop in the onboarding test, as it would on a new farm."), ""]

@@ -505,3 +505,146 @@ def test_v14e_album_merging_scoring_and_video():
                                                 fps=2.0, width=320, match_iou=0.3, out=os.path.join(d, "v.mp4"),
                                                 realtime=False, title=""))
         assert tally["right"] >= 1 and tally["wrong"] >= 1 and tally.get("guess right", 0) >= 1
+
+
+def fake_images(folder, size=32, seed=0):
+    """A tiny picture store (data_images.py combine's layout): every cow a two-tone coat of its own, noisy
+    copies of it as its pictures; 12 training cows in two source sets, 3 held-out cows (valA / valB),
+    4 MmCows-like test cows (testA / testB)."""
+    import opencowid as O
+    from PIL import Image
+    rng = np.random.default_rng(seed)
+    rows, coats = [], {}
+    os.makedirs(os.path.join(folder, "images"))
+
+    def add(day, cow, ds, seqs=1, n=3):
+        if cow not in coats:
+            coats[cow] = O.coat(rng, shape=(size, size), porosity=float(rng.uniform(0.3, 0.7)), blobiness=0.5)
+        for s in range(seqs):
+            for i in range(n):
+                a = np.clip(coats[cow].astype(int) + rng.integers(-25, 25, coats[cow].shape), 0, 255).astype(np.uint8)
+                p = f"images/{len(rows):05d}.jpg"
+                Image.fromarray(a).save(os.path.join(folder, p))
+                rows.append({"name": p, "image": p, "day": day, "cow": cow, "seq": f"{day}_{s}", "t": 4.0 * i,
+                             "cam": None, "dataset": ds})
+
+    for c in range(8):
+        add("train", f"C_{c}", "Cows2021", seqs=2)
+    for c in range(4):
+        add("train", f"O_{c}", "OpenCows2020", seqs=2)
+    for c in range(3):
+        add("valA", f"V_{c}", "Cows2021"), add("valB", f"V_{c}", "Cows2021")
+    for c in range(4):
+        add("testA", f"T_{c}", "MmCows", seqs=2), add("testB", f"T_{c}", "MmCows", seqs=2)
+    with open(os.path.join(folder, "crops.jsonl"), "w") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+    json.dump({"crop": size, "margin": 0.1, "source": "made up"}, open(os.path.join(folder, "meta.json"), "w"))
+    return rows
+
+
+def test_v14f_opencowid_coats_training_eval_and_encoder():
+    import opencowid as O
+    import idnet as I
+    import system
+    from cbvd_bursts import encode
+    rng = np.random.default_rng(0)
+    c = O.coat(rng)
+    assert c.shape == (107, 224, 3) and c.dtype == np.uint8
+    light = (c.mean(-1) > 128).mean()
+    assert 0.25 < light < 0.75                                     # a Holstein: part white, part dark
+    assert not np.array_equal(c, O.coat(np.random.default_rng(1)))
+    with tempfile.TemporaryDirectory() as d:
+        store, out = os.path.join(d, "iddi"), os.path.join(d, "ocid")
+        fake_images(store)
+        O.main(["train", "--images", store, "--out", out, "--backbone", "resnet18", "--pretrained", "0", "--size", "32",
+                "--stages", "synth,wr10k", "--synth-ids", "6", "--synth-views", "4", "--synth-epochs", "1", "--epochs", "2",
+                "--patience", "2", "--P", "4", "--K", "2", "--centroid-views", "2", "--centroid-steps", "5", "--workers", "0",
+                "--lr", "1e-3", "--max-error", "0.05"])
+        ev = json.load(open(os.path.join(out, "eval_id.json")))
+        assert ev["split"]["by"] == "groups" and len(ev["split"]["test"]) == 4 and ev["test"]["queries"] == 8
+        assert not set(ev["split"]["test"]) & set(ev["split"]["train"])
+        assert ev["test_single_image"]["test"]["queries"] == 24 and ev["stage"] == "wr10k"
+        assert ev["test_id_with_not_sure"]["f1"] is not None and ev["training"]["stages"] == "synth,wr10k"
+        synth = json.load(open(os.path.join(out, "eval_id_synth.json")))
+        assert synth["stage"] == "synth" and os.path.exists(os.path.join(out, "idnet_synth.pt"))
+        hist = json.load(open(os.path.join(out, "history.json")))
+        assert hist[0]["stage"] == "synth" and hist[-1]["stage"] == "wr10k" and 2 <= len(hist) <= 3
+        # the model as the system loads it: idnet.load gives the sequence pooler, frame_encoder its own ResNet
+        m, ck = I.load(os.path.join(out, "idnet.pt"), "cpu")
+        assert ck["arch"] == "opencowid" and "nan" in ck and "enrol_threshold" in ck
+        assert ck["feats"]["encoder"] == "opencowid" and ck["feats"]["crop"] == 32
+        enc = I.frame_encoder(ck, torch.device("cpu"))
+        crops = np.random.default_rng(2).integers(0, 255, (3, 32, 32, 3), dtype=np.uint8)
+        f = encode(enc, crops).astype(np.float32)
+        assert f.shape == (3, 128) and np.allclose(np.linalg.norm(f, axis=1), 1, atol=1e-2)
+        fp, qmax, qmean = I.embed(m, [(f, np.array([0.0, 2.0, 4.0], np.float32)), (f[:1], np.array([0.0], np.float32))],
+                                  torch.device("cpu"))
+        assert fp.shape == (2, 128) and np.allclose(np.linalg.norm(fp, axis=1), 1, atol=1e-4)
+        assert np.allclose(fp[1], f[0], atol=1e-2) and qmax[1] == pytest.approx(1.0, abs=1e-2)   # one frame: itself
+        # a track carries the ID model's own vectors next to the association transformer's: the fingerprints use them
+        tr = system.Tracks(20)
+        tid = tr.new()
+        for k in range(6):
+            tr.add(tid, 100.0 + 2 * k, "cam_1", [0.1, 0.1, 0.3, 0.3], np.zeros(8, np.float32), 0.9, f[k % 3])
+        recs = system.fingerprints(m, tr, 100.0, 160.0, 0, torch.device("cpu"), 5)
+        assert len(recs) == 1 and recs[0][2].shape == (128,)
+        old = system.Tracks(20)                                     # without them (v14 A-E): the one vector serves both
+        v = f[0]
+        old.add(old.new(), 100.0, "cam_1", [0.1, 0.1, 0.3, 0.3], v, 0.9)
+        assert old.rows[1]["sightings"][0][6] is v
+        # the same scores on some cows only, the model untouched (test_like_a.sh)
+        before = os.path.getmtime(os.path.join(out, "idnet.pt"))
+        O.main(["eval", "--images", store, "--out", out, "--only-cows", "T_0,T_1", "--eval-name", "some.json", "--keep-model",
+                "--workers", "0"])
+        ev2 = json.load(open(os.path.join(out, "some.json")))
+        assert ev2["test_cows_only"] == ["T_0", "T_1"] and ev2["test"]["queries"] == 4
+        assert ev2["test_single_image"]["test"]["queries"] == 12
+        assert os.path.getmtime(os.path.join(out, "idnet.pt")) == before
+        # the zero-shot model scored by name
+        O.main(["eval", "--images", store, "--out", out, "--model-name", "idnet_synth.pt", "--eval-name", "zs.json", "--workers", "0"])
+        assert json.load(open(os.path.join(out, "zs.json")))["stage"] == "synth"
+        assert not os.path.exists(os.path.join(out, "_eval_idnet_synth"))
+
+
+def test_v14f_pictures_of_mmcows_boxes_and_combine():
+    import data_images as DI
+    import data_mmcows as M
+    from PIL import Image
+    t0 = 1690304400.0                                               # 12:00 local; 11:00 = t0 - 3600
+    frames = []
+    for k, dt in enumerate((-7200, -7140, -7080, -6000, -5940, 3600 * 4, 3600 * 4 + 60)):
+        frames.append({"cam": "cam_1", "ts": t0 + dt, "split": "train", "boxes": [[3, [0.1, 0.1, 0.4, 0.5]], [5, [0.5, 0.5, 0.9, 0.9]]]})
+    frames.append({"cam": "cam_1", "ts": t0 + 60, "split": "window", "boxes": [[3, [0.1, 0.1, 0.4, 0.5]]]})
+    items = [(fi, cow, b) for fi, f in enumerate(frames) for cow, b in f["boxes"]]
+    rows, idx = M.id_sequences(frames, items, 12.0, 60.0, 12)
+    assert len(rows) == 14 and len(idx) == 14                        # the window frame left out
+    seqs = collections.Counter((r["day"], r["cow"], r["seq"]) for r in rows)
+    assert sum(1 for k in seqs if k[0] == "A") == 4 and sum(1 for k in seqs if k[0] == "B") == 2   # a gap of 1080 s cuts a sequence
+    assert [r["t"] for r in rows if r["cow"] == 3 and r["day"] == "A"][:3] == [0.0, 60.0, 120.0]
+    with tempfile.TemporaryDirectory() as d:
+        mm, out, wr, comb = (os.path.join(d, x) for x in ("mm", "mm_img", "wr", "iddi"))
+        os.makedirs(os.path.join(mm, "frames", "cam_1"))
+        for f in frames:
+            f["path"] = os.path.join(mm, "frames", "cam_1", f"{f['ts']:.1f}.jpg")
+            Image.fromarray(np.random.default_rng(1).integers(0, 255, (100, 160, 3), dtype=np.uint8)).save(f["path"])
+        with open(os.path.join(mm, "frames.jsonl"), "w") as fh:
+            for f in frames:
+                fh.write(json.dumps(f) + "\n")
+        DI.main(["mmcows", "--mm", mm, "--out", out, "--crop", "48"])
+        got = [json.loads(l) for l in open(os.path.join(out, "crops.jsonl"))]
+        assert len(got) == 14 and all(os.path.exists(os.path.join(out, r["image"])) for r in got)
+        assert Image.open(os.path.join(out, got[0]["image"])).size == (48, 48)
+        os.makedirs(os.path.join(wr, "images"))
+        Image.fromarray(np.zeros((48, 48, 3), np.uint8)).save(os.path.join(wr, "images", "0.jpg"))
+        with open(os.path.join(wr, "crops.jsonl"), "w") as fh:
+            fh.write(json.dumps({"name": "x", "image": "images/0.jpg", "day": "train", "cow": "c", "seq": "train_0", "t": 0.0,
+                                 "cam": None, "dataset": "Cows2021"}) + "\n")
+        json.dump({"crop": 48, "margin": 0.0}, open(os.path.join(wr, "meta.json"), "w"))
+        DI.main(["combine", "--wr", wr, "--mm", out, "--out", comb])
+        rows = [json.loads(l) for l in open(os.path.join(comb, "crops.jsonl"))]
+        assert collections.Counter(r["day"] for r in rows) == {"train": 1, "testA": 10, "testB": 4}
+        assert all(os.path.isabs(r["image"]) and os.path.exists(r["image"]) for r in rows)
+        import opencowid as O
+        st = O.ImageStore(comb)
+        assert st.days() == ["testA", "testB", "train"] and st.image(1, 32).size == (32, 32)

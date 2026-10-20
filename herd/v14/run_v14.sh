@@ -24,6 +24,9 @@
 #        tested on all of MmCows' cows; ASSOC_PRETRAINED=<link to a *_MODELS.tgz>: its assoc.pt is used
 #        (scored on the test window) instead of training one; NAME=<V14D ..>: after step 6, video_v14.sh
 #        makes <NAME>_RESULTS.tar, <NAME>_MODELS.tgz, <NAME>_VIDEO.tar instead of steps 7-8
+#        ID_DATA=ocid: v14 (F) - OpenCowID's model (ResNet-50 + 128 numbers, centroid metric learning) as the ID
+#        model, trained on its synthetic coats then on WildlifeReID-10k's cattle (ID_STAGES=synth,wr10k; the
+#        pictures, not DINOv2 vectors), tested on all of MmCows' cows; the rest as v14 (D)
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,6 +53,7 @@ MCC_ZIP="${MCC_ZIP:-}"
 MCC_URL="${MCC_URL:-https://data.bris.ac.uk/datasets/tar/2inu67jru7a6821kkgehxg3cv2.zip}"
 PRETRAINED="${PRETRAINED:-}"
 ASSOC_PRETRAINED="${ASSOC_PRETRAINED:-}"
+ID_STAGES="${ID_STAGES:-synth,wr10k}"
 VIDEO_END="${VIDEO_END:-13.5}"
 MODE="${MODE:-}"; CENTER="${CENTER:-}"; NAME="${NAME:-}"; REALTIME="${REALTIME:-}"; CLIPS="${CLIPS:-}"; FPS="${FPS:-}"; TITLE="${TITLE:-}"
 export HF_HOME="$WORK/hf-cache"
@@ -59,7 +63,7 @@ case "${1:-}" in
     stop) tmux kill-session -t "=$SESSION" 2>/dev/null && echo "stopped $SESSION" || echo "$SESSION not running"
           # the run ignores hang-ups (to survive a closed terminal): end it and what it started for real
           for p in $(pgrep -f '^bash .*run_v14\.sh' || true); do [ "$p" != "$$" ] && kill "$p" 2>/dev/null; done
-          pkill -f 'python.* (data_mcc|data_mmcows|idnet|assoc|system|summarize)\.py' 2>/dev/null || true
+          pkill -f 'python.* (data_mcc|data_mmcows|data_wr10k|data_images|idnet|opencowid|assoc|system|system_e|summarize)\.py' 2>/dev/null || true
           pkill -f 'curl .*MultiCamCows2024\.zip' 2>/dev/null || true
           exit 0 ;;
     "") ;;
@@ -71,7 +75,7 @@ if [ -z "${V14_IN_TMUX:-}" ]; then
     if tmux has-session -t "=$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     mkdir -p "$V"
     knobs=""
-    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP ID_DATA PRETRAINED ASSOC_PRETRAINED VIDEO_END CENTER NAME REALTIME CLIPS FPS TITLE MODE; do
+    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP ID_DATA ID_STAGES PRETRAINED ASSOC_PRETRAINED VIDEO_END CENTER NAME REALTIME CLIPS FPS TITLE MODE TAG; do
         knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env V14_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/run_v14.sh"); echo; echo '[run_v14.sh finished]'; exec bash"
@@ -168,9 +172,16 @@ elif [ "$ID_DATA" = wr10k ]; then
     step "4/8  WildlifeReID-10k's cattle (Kaggle, read in place) -> DINOv2; + MmCows' boxes as the test"
     again "$PY" data_wr10k.py fetch --out "$V/wr10k"
     "$PY" data_wr10k.py combine --wr "$V/wr10k" --mm "$V/mmcows/idcrops" --out "$V/idd"
+elif [ "$ID_DATA" = ocid ]; then
+    step "4/8  v14 (F): the pictures - WildlifeReID-10k's cattle (Kaggle, read in place) + MmCows' boxes as the test"
+    again "$PY" data_images.py wr10k --out "$V/wr10k_img"
+    "$PY" data_images.py mmcows --mm "$V/mmcows" --out "$V/mmcows_img" --start "$START" --end "$END" --train-every "$TRAIN_EVERY"
+    "$PY" data_images.py combine --wr "$V/wr10k_img" --mm "$V/mmcows_img" --out "$V/iddi"
+    "$PY" opencowid.py coats --out "$V/coats.png"
 else echo "skipped: the ID transformer trains on MmCows cows (ID_DATA=mmcows)"; fi
 
 IDN="$V/idnet"
+ID_CMD=(idnet.py train)
 if [ "$ID_DATA" = mcc ]; then
     step "5/8  ID transformer (from scratch): MultiCamCows days 1-5 -> day 6 picks -> day 7 tests"
     ID_ARGS=(--feats "$V/mcc" --split days)
@@ -178,12 +189,17 @@ elif [ "$ID_DATA" = wr10k ]; then
     step "5/8  ID transformer (from scratch): WildlifeReID-10k cows train, held-out ones pick, MmCows' 16 test it"
     IDN="$V/idnet_wr10k"
     ID_ARGS=(--feats "$V/idd" --split groups --time-aug 0.25 --time-aug-max 15 --P 32)
+elif [ "$ID_DATA" = ocid ]; then
+    step "5/8  OpenCowID's model (ResNet-50, ImageNet start): stages $ID_STAGES; held-out WildlifeReID-10k cows pick the epoch, MmCows' 16 test it"
+    IDN="$V/idnet_ocid"
+    ID_CMD=(opencowid.py train)
+    ID_ARGS=(--images "$V/iddi" --stages "$ID_STAGES")
 else
     step "5/8  ID transformer (from scratch): MmCows, 8 cows train, 3 pick the epoch, 5 never seen test it"
     ID_ARGS=(--feats "$V/mmcows/idcrops" --split cows --val-cows 3 --test-cows 5 --time-aug 0.02 --P 8)
 fi
 if [ -f "$IDN/idnet.pt" ] && [ -f "$IDN/eval_id.json" ]; then echo "trained already"; else
-    "$PY" idnet.py train "${ID_ARGS[@]}" --out "$IDN" --epochs "$ID_EPOCHS"; fi
+    "$PY" "${ID_CMD[@]}" "${ID_ARGS[@]}" --out "$IDN" --epochs "$ID_EPOCHS"; fi
 
 if [ "$MODE" = e ]; then
     step "6/8  Association transformer: not used by version 14 (E)"

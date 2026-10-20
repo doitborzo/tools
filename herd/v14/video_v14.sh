@@ -33,6 +33,7 @@ REALTIME="${REALTIME:-0}"
 TITLE="${TITLE:-}"
 IDNET="${IDNET:-$V/idnet/idnet.pt}"
 MODE="${MODE:-}"
+ID_DATA="${ID_DATA:-}"
 [ "$MODE" = e ] && [ "$TAG" = assoc ] && TAG=e_confirmed
 export HF_HOME="$WORK/hf-cache"
 
@@ -52,7 +53,7 @@ if [ -z "${V14V_IN_TMUX:-}" ]; then
     [ "$TAG" = iou_per_camera ] || [ "$MODE" = e ] || [ -f "$V/assoc/assoc.pt" ] || { echo "missing $V/assoc/assoc.pt"; exit 1; }
     if tmux has-session -t "=$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     knobs=""
-    for v in WORK TAG SYS_END FPS CLIPS DET_NAME CENTER NAME REALTIME TITLE IDNET MODE; do knobs+="$v=$(printf '%q' "${!v}") "; done
+    for v in WORK TAG SYS_END FPS CLIPS DET_NAME CENTER NAME REALTIME TITLE IDNET MODE ID_DATA; do knobs+="$v=$(printf '%q' "${!v}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env V14V_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/video_v14.sh"); echo; echo '[video_v14.sh finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log"
@@ -102,8 +103,12 @@ rm -rf "$R"; mkdir -p "$R/work/system"
 cp "$SYSJ" "$R/work/system/$(basename "$SYSJ")"
 [ "$MODE" = e ] && cp "$S/RESULTS_E.md" "$R/RESULTS.md"
 ID_DIR="$(dirname "$IDNET")"
-for f in eval_id.json history.json; do [ -f "$ID_DIR/$f" ] && mkdir -p "$R/work/idnet" && cp "$ID_DIR/$f" "$R/work/idnet/"; done
+for f in eval_id.json eval_id_synth.json history.json; do [ -f "$ID_DIR/$f" ] && mkdir -p "$R/work/idnet" && cp "$ID_DIR/$f" "$R/work/idnet/"; done
 for f in eval_assoc.json history.json; do [ -f "$V/assoc/$f" ] && mkdir -p "$R/work/assoc" && cp "$V/assoc/$f" "$R/work/assoc/"; done
+if [ "$ID_DATA" = ocid ]; then          # v14 F: the synthetic coats and the real pictures it trained on, to look at
+    [ -f "$V/coats.png" ] && cp "$V/coats.png" "$R/"
+    [ -f "$V/wr10k_img/samples.png" ] && cp "$V/wr10k_img/samples.png" "$R/wr10k_samples.png"
+fi
 VER="${NAME#V14}"; [ "$VER" = A ] && VER=""
 [ "$MODE" = e ] || "$PY" summarize.py --work "$R/work" --out "$R" ${VER:+--version "$VER"} > /dev/null
 for d in system idnet assoc; do [ -d "$R/work/$d" ] && mv "$R/work/$d" "$R/$d"; done; rm -rf "$R/work"
@@ -115,9 +120,14 @@ pack -cf "$WORK/${NAME}_RESULTS.tar" -C "$WORK" "${NAME}_RESULTS"
 M="$WORK/${NAME}_MODELS"
 rm -rf "$M"; mkdir -p "$M"
 cp "$IDNET" "$M/idnet.pt"; [ "$MODE" = e ] || { [ -f "$V/assoc/assoc.pt" ] && cp "$V/assoc/assoc.pt" "$M/"; }
+[ -f "$ID_DIR/idnet_synth.pt" ] && cp "$ID_DIR/idnet_synth.pt" "$M/"
 {
     echo "$NAME models, $(date '+%F %T')"
-    echo "idnet.pt   ID transformer: crop sequence -> fingerprint"
+    if [ "$ID_DATA" = ocid ]; then
+        echo "idnet.pt   OpenCowID's model (ResNet-50 + 128 numbers, herd/v14/opencowid.py): crop -> embedding; a sequence = the mean"
+        [ -f "$M/idnet_synth.pt" ] && echo "idnet_synth.pt   the same after the synthetic coats alone (zero-shot, no real cow)"
+    else
+    echo "idnet.pt   ID transformer: crop sequence -> fingerprint"; fi
     echo "assoc.pt   association transformer: detections of all cameras -> one cow"
     echo "detector   version 10's: herd/$DET_NAME/best (in the version 10 archive)"
     if [ "$MODE" = e ]; then echo "Run:       python herd/v14/system_e.py --data <mmcows> --detector <best/> --idnet idnet.pt --out <dir>"; else

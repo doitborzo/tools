@@ -165,7 +165,6 @@ def run(args):
     from cbvd_bursts import encode
     from common import crop, device
     from detector import Live
-    from model import FrameEncoder
 
     dev = device()
     live = read_jsonl(os.path.join(args.data, "live.jsonl"))
@@ -187,7 +186,7 @@ def run(args):
     idm.to(dev)
     nan = idck.get("nan")
     meta = idck.get("feats") or {}
-    enc = FrameEncoder(meta.get("encoder", "facebook/dinov2-small"), meta.get("grid", 2)).to(dev).eval()
+    enc = I.frame_encoder(idck, dev)                # DINOv2-S (v14 A-E) or OpenCowID's own ResNet (v14 F)
 
     chains = S.Tracks(args.max_gap)
     det_log = []                                     # (t, cam, box, chain, conf)

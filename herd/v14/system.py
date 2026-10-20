@@ -51,9 +51,11 @@ class Tracks:
         self.rows[tid] = {"sightings": [], "last": None}
         return tid
 
-    def add(self, tid, t, cam, box, feat, conf):
+    def add(self, tid, t, cam, box, feat, conf, idfeat=None):
+        """feat: the association transformer's vector (DINOv2); idfeat: the ID model's, when it has its own
+        encoder (v14 F) - else the same vector."""
         area = (box[2] - box[0]) * (box[3] - box[1])
-        self.rows[tid]["sightings"].append((t, cam, box, feat, area, conf))
+        self.rows[tid]["sightings"].append((t, cam, box, feat, area, conf, feat if idfeat is None else idfeat))
         self.rows[tid]["last"] = t
 
     def active(self, t):
@@ -113,7 +115,9 @@ def run(args):
     idm.to(dev)
     nan, enrol_thr = idck.get("nan"), float(idck.get("enrol_threshold") or 0.6)
     meta = idck.get("feats") or {}
-    enc = FrameEncoder(meta.get("encoder", "facebook/dinov2-small"), meta.get("grid", 2)).to(dev).eval()
+    enc_meta = meta if meta.get("encoder") not in (None, "opencowid") else {}
+    enc = FrameEncoder(enc_meta.get("encoder", args.encoder), enc_meta.get("grid", args.grid)).to(dev).eval()   # DINOv2: association, scene
+    id_enc = I.frame_encoder(idck, dev, enc)        # the ID model's own encoder (v14 F: OpenCowID's ResNet), else the same
     am = ack = None
     if args.assoc != "none":
         am, ack = A.load(args.assoc, dev)
@@ -141,8 +145,10 @@ def run(args):
                 cur.append({"cam": c, "box": d["bbox"], "conf": float(d["det_score"])})
                 crops.append(crop(a, d["bbox"], meta.get("crop", 224), 0.1))
         feats = encode(enc, np.stack(crops)).astype(np.float32) if crops else np.zeros((0, enc.out_dim), np.float32)
-        for d, f in zip(cur, feats):
-            d["feat"] = f
+        id_feats = feats if id_enc is enc else (encode(id_enc, np.stack(crops)).astype(np.float32) if crops
+                                                else np.zeros((0, id_enc.out_dim), np.float32))
+        for d, f, g in zip(cur, feats, id_feats):
+            d["feat"], d["idfeat"] = f, g
         if am is not None and t - scene_t >= args.scene_every:
             g = scene.scene_grid(enc, [masked[c] for c in rows])
             scenes = {c: scene.sub_grid(gi) for c, gi in zip(rows, g)}
@@ -158,7 +164,7 @@ def run(args):
                 tid = tracks.new()
                 assign[i] = tid
             d = cur[i]
-            tracks.add(tid, t, d["cam"], d["box"], d["feat"], d["conf"])
+            tracks.add(tid, t, d["cam"], d["box"], d["feat"], d["conf"], d["idfeat"])
             det_log.append((t, d["cam"], d["box"], tid, d["conf"]))
         # --- once a minute: a fingerprint per track seen in the last minute
         minute = int((t - t_start) // 60)
@@ -315,7 +321,8 @@ def fingerprints(idm, tracks, t0, t1, minute, dev, min_frames):
             if x[0] not in best or x[4] > best[x[0]][4]:
                 best[x[0]] = x
         xs = [best[k] for k in sorted(best)]
-        seqs.append((np.stack([x[3] for x in xs]).astype(np.float32), np.array([x[0] - xs[0][0] for x in xs], np.float32)))
+        seqs.append((np.stack([x[6] if len(x) > 6 else x[3] for x in xs]).astype(np.float32),
+                     np.array([x[0] - xs[0][0] for x in xs], np.float32)))
         meta.append((tid, float(np.mean([x[4] for x in xs]))))
     if not seqs:
         return []
@@ -550,6 +557,8 @@ def main(argv=None):
     p.add_argument("--min-minutes", type=int, default=5, help="setup fingerprints for an album cow")
     p.add_argument("--ema", type=float, default=0.5, help="weight of the newest minute on the scoreboard")
     p.add_argument("--match-iou", type=float, default=0.3, help="detection to labelled box, for scoring")
+    p.add_argument("--encoder", default="facebook/dinov2-small", help="the association transformer's frame encoder")
+    p.add_argument("--grid", type=int, default=2)
     p.add_argument("--center", choices=("on", "off"), default="on",
                    help="v14 (C): take the barn's average cow out of the fingerprints before the album "
                         "(on), or not (off = v14 A); the other way is scored too, as other_way")

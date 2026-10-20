@@ -80,9 +80,26 @@ def build(in_dim, d=256, layers=3, heads=4, dropout=0.1):
 def load(path, device=None):
     import torch
     ck = torch.load(path, map_location=device or "cpu", weights_only=False)
+    if ck.get("arch") == "opencowid":            # v14 (F): OpenCowID embeddings, a sequence = their mean
+        import opencowid
+        return opencowid.seq_mean().eval(), ck
     m = build(**ck["kw"])
     m.load_state_dict(ck["state"])
     return m.eval(), ck
+
+
+def frame_encoder(ck, device, default=None):
+    """The encoder whose vectors the ID model reads: DINOv2-S for v14 A-E (`default` if given - the one
+    already built for the association transformer - else built from the checkpoint's settings), OpenCowID's
+    own ResNet for v14 F. Takes uint8 crops (B, H, W, 3), has .out_dim."""
+    if ck.get("arch") == "opencowid":
+        import opencowid
+        return opencowid.from_checkpoint(ck).to(device).eval()
+    if default is not None:
+        return default
+    from model import FrameEncoder
+    meta = ck.get("feats") or {}
+    return FrameEncoder(meta.get("encoder", "facebook/dinov2-small"), meta.get("grid", 2)).to(device).eval()
 
 
 def embed(model, seqs, device, max_len=32, batch=64):
