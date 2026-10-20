@@ -404,7 +404,10 @@ track page): select a box, `I`, her ear tag, `Enter` (the next box without an id
 copies the ids of this camera's frame before for boxes in the same place. The same cow from two
 cameras at once gets the same tag on both. `herd.py boxes ids --data /srv/herd/boxes --labels labels.json`
 writes `herd_barn_ids_<date>.tgz` (each named box cut as the barn cuts a cow, a sixth of the cows held
-out); `reid_pod.sh` takes it in as the set `barn_ids`.
+out); `reid_pod.sh` takes it in as the set `barn_ids`. `F` on the page carries every typed id through
+the camera's frames while the cow's box clearly continues (blue: filled in, check them); `boxes ids
+--fill 2 --config barn.toml --videos <recordings>` adds a crop every 2 s from the video between two
+frames where the cow stayed in place.
 
 A camera's zone changed after its frames were cut: `herd.py boxes frames ... --cameras cam2 --again` cuts
 that camera's frames again (same moments, the new grey zone), the detector looks again, and the page asks to

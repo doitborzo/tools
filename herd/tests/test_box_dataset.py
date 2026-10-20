@@ -349,11 +349,11 @@ def test_boxes_named_by_cow_go_to_the_identity_model():
             a, b = tags[k % 6], tags[(k + 1) % 6]
             labels[f["file"]] = {"status": "done", "boxes": [[0.1, 0.4, 0.3, 0.8, a], [0.5, 0.4, 0.7, 0.8, b],
                                                              [0.75, 0.5, 0.9, 0.7]]}
-        labels[fr[0]["file"]]["status"] = ""                                             # not done: not taken
+        labels[fr[0]["file"]]["status"] = ""                                             # not done: only --done-only drops it
         lp = os.path.join(d, "labels.json")
         json.dump({"frames": labels}, open(lp, "w"))
         tgz = os.path.join(d, "ids.tgz")
-        box_dataset.main(["ids", "--data", out, "--labels", lp, "--out", tgz, "--min-crops", "2"])
+        box_dataset.main(["ids", "--data", out, "--labels", lp, "--out", tgz, "--min-crops", "2", "--done-only"])
         work = os.path.join(d, "work")
         with tarfile.open(tgz) as t:
             t.extractall(work)
@@ -383,3 +383,30 @@ def test_boxes_named_by_cow_go_to_the_identity_model():
         bursts = [json.loads(x) for x in open(os.path.join(R, "feat", "barn_ids", "bursts.jsonl"))]
         assert bursts and {b["identity"].split(":")[0] for b in bursts} == {"barn_ids"}
         assert {b["cow"] for b in bursts if b["split"] == "val"} == val
+
+
+def test_ids_filled_in_between_frames_from_the_video():
+    import box_dataset
+    with tempfile.TemporaryDirectory() as d:
+        cfg, rec = _setup(d)
+        out = os.path.join(d, "boxes")
+        box_dataset.main(["frames", "--config", cfg, "--videos", rec, "--out", out, "--every", "10", "--detector", "none",
+                          "--cameras", "cam2"])
+        fr = sorted(json.load(open(os.path.join(out, "frames.json")))["frames"], key=lambda f: f["ts"])
+        assert len(fr) == 6
+        # cow UA01 lies still (the same box), cow UA02 moved far between frames 2 and 3
+        labels = {f["file"]: {"status": "", "boxes": [[0.1, 0.4, 0.3, 0.8, "UA01"],
+                                                      [0.5 + (0.3 if k >= 3 else 0), 0.1, 0.6 + (0.3 if k >= 3 else 0), 0.3, "UA02"]]}
+                  for k, f in enumerate(fr)}
+        lp = os.path.join(d, "labels.json")
+        json.dump({"frames": labels}, open(lp, "w"))
+        tgz = os.path.join(d, "ids.tgz")
+        box_dataset.main(["ids", "--data", out, "--labels", lp, "--out", tgz, "--min-crops", "2", "--fill", "2",
+                          "--config", cfg, "--videos", rec])
+        with tarfile.open(tgz) as t:
+            t.extractall(os.path.join(d, "w"))
+        rows = [json.loads(x) for x in open(os.path.join(d, "w", "reid", "raw", "barn_ids", "index.jsonl"))]
+        fill = collections.Counter(r["cow"] for r in rows if r["by"] == "fill")
+        # 5 gaps of 10 s, a crop every 2 s inside each: 4 a gap; UA02 not across the gap where she moved
+        assert fill["UA01"] == 5 * 4 and fill["UA02"] == 4 * 4
+        assert len({r["order"] for r in rows if r["cow"] == "UA01"}) == 6 + 20

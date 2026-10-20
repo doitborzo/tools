@@ -183,8 +183,22 @@ model needs most. Save labels.json, then:
 docker compose run --rm herd boxes ids --data /data/boxes --labels /data/labels.json
 ```
 
+Faster: type each cow's tag once, on one frame of a camera, and press `F`. The tag is carried through
+all of that camera's frames, forwards and backwards, while her box clearly continues: the most similar
+box on the next frame, and she the most similar to it, not across more than 5 minutes. Filled-in ids
+are blue; check them. A typed id is never overwritten; fix a wrong blue one by typing it, and press `F`
+again. "only frames I edited" limits it to frames you have opened.
+
+More crops between the cut frames, from the video itself (`--fill 2`: a crop every 2 s between two
+frames 10 s apart, where the cow's two boxes overlap, i.e. she stayed in place; her box moved
+linearly):
+
+```bash
+docker compose run --rm herd boxes ids --data /data/boxes --labels /data/labels.json --fill 2 --config /data/barn.toml --videos /data/rec_fixed
+```
+
 It writes `docker/data/herd_barn_ids_<date>.tgz`: each named box cut as the barn cuts a cow, a sixth of
-the cows held out. Put it in the pod's `/workspace`; `reid_pod.sh` adds the set `barn_ids` to training.
+the cows held out. Every frame with named boxes counts, done or not (`--done-only`: only done ones). Put it in the pod's `/workspace`; `reid_pod.sh` adds the set `barn_ids` to training.
 The same labels.json also makes the detector's set (`boxes export`).
 
 **One camera's zone changed** (`zones page` → `zones apply` again). Redo only that camera:

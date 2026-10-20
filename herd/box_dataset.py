@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime as dt
+import itertools
 import json
 import os
 import random
@@ -343,24 +344,91 @@ def cmd_export(args):
           f"({os.path.getsize(out) / 2 ** 20:.0f} MB)")
 
 
+def box_iou(a, b):
+    w = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    h = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    u = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - w * h
+    return w * h / u if u > 0 else 0.0
+
+
+def in_between(items, frames, every, min_iou=0.5, max_gap=30.0):
+    """More crops of a named cow from the video between two cut frames: where she has a box on two
+    neighbouring frames of a camera (at most max_gap s apart) that overlap (IoU >= min_iou: she stayed about
+    where she was), a box every `every` s between them, moved linearly -> [(cow, cam, ts, box)]."""
+    order = {}
+    for cam in {f["cam"] for f in frames}:
+        fs = sorted((f for f in frames if f["cam"] == cam), key=lambda f: f["ts"])
+        order.update({f["file"]: (cam, k) for k, f in enumerate(fs)})
+    by = collections.defaultdict(dict)
+    for cow, f, box in items:
+        cam, k = order[f["file"]]
+        by[(cow, cam)][k] = (f["ts"], box)
+    out = []
+    for (cow, cam), ks in by.items():
+        for k in sorted(ks):
+            if k + 1 not in ks:
+                continue
+            (t1, b1), (t2, b2) = ks[k], ks[k + 1]
+            if t2 - t1 > max_gap or box_iou(b1, b2) < min_iou:
+                continue
+            t = t1 + every
+            while t < t2 - every / 2:
+                a = (t - t1) / (t2 - t1)
+                out.append((cow, cam, t, [b1[i] + (b2[i] - b1[i]) * a for i in range(4)]))
+                t += every
+    return out
+
+
+def video_frames(recs, wanted, width):
+    """{(cam, ts): rgb frame} for the wanted moments, read through each recording once (no seeking)."""
+    import cv2
+    got = {}
+    for cam, items in itertools.groupby(sorted(wanted), key=lambda x: x[0]):
+        tss = [ts for _, ts in items]
+        for path, start, fps, n in recs.get(cam, []):
+            need = sorted({int(round((ts - start) * fps)): ts for ts in tss if start <= ts <= start + n / fps}.items())
+            if not need:
+                continue
+            cap = cv2.VideoCapture(path)
+            i, k = 0, 0
+            while k < len(need):
+                if not cap.grab():
+                    break
+                if i == need[k][0]:
+                    ok, f = cap.retrieve()
+                    if ok:
+                        img = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+                        h, w = img.shape[:2]
+                        if w > width:
+                            img = cv2.resize(img, (width, int(h * width / w)), interpolation=cv2.INTER_AREA)
+                        got[(cam, need[k][1])] = img
+                    k += 1
+                    while k < len(need) and need[k][0] <= i:
+                        k += 1
+                i += 1
+            cap.release()
+    return got
+
+
 def cmd_ids(args):
-    """Boxes named with a cow's id -> the identity model's set "barn_ids" (reid.py): each such box of a done
-    frame cut as the barn cuts a cow (square, with the model's margin), its cow's id, camera and time; a
-    sixth of the cows held out whole (never trained on: they score the model and set its thresholds).
-    reid_pod.sh takes herd_barn_ids_<date>.tgz in and runs DINOv2 on the crops there."""
+    """Boxes named with a cow's id -> the identity model's set "barn_ids" (reid.py): each such box cut as the
+    barn cuts a cow (square, with the model's margin), its cow's id, camera and time; with --fill, more of
+    her from the video between two cut frames where she stayed about in place; a sixth of the cows held out
+    whole (never trained on: they score the model and set its thresholds). reid_pod.sh takes
+    herd_barn_ids_<date>.tgz in and runs DINOv2 on the crops there."""
     import random
     import shutil
     import tarfile
     import tempfile
     from PIL import Image
-    from common import crop, square_crop_box
+    from common import crop, load_config, recordings, square_crop_box
     src = os.path.abspath(args.data)
     index = json.load(open(os.path.join(src, "frames.json"), encoding="utf-8"))
     labels = read_labels(args.labels)
     items, stale = [], 0
     for f in index["frames"]:
         lab = labels.get(f["file"])
-        if not lab or lab.get("status") != "done":
+        if not lab or (args.done_only and lab.get("status") != "done") or lab.get("status") == "skip":
             continue
         if f.get("cut") and lab.get("cut") != f["cut"]:
             stale += 1
@@ -368,32 +436,53 @@ def cmd_ids(args):
         for b in lab.get("boxes", []):
             if len(b) > 4 and str(b[4]).strip() and not in_grey(b, f.get("exclude")):
                 items.append((str(b[4]).strip(), f, b[:4]))
+    extra = []
+    if args.fill:
+        if not (args.config and args.videos):
+            sys.exit("--fill needs --config and --videos (the recordings the frames were cut from)")
+        cfg = load_config(args.config)
+        recs, _ = recordings(args.videos, [c["id"] for c in cfg["cameras"]], cfg["farm"]["timezone_offset_hours"])
+        by_cam = collections.defaultdict(list)
+        for cam, path, ts in recs:
+            info = video_info(path)
+            if info:
+                by_cam[cam].append((path, ts) + info)
+        extra = in_between(items, index["frames"], args.fill, args.fill_iou, args.fill_gap)
+        print(f"[ids] {len(extra)} more boxes between the cut frames (every {args.fill:g} s, where the cow stayed "
+              f"in place); reading them from the recordings", flush=True)
+        pics = video_frames(by_cam, {(cam, ts) for _, cam, ts, _ in extra}, cfg["sampling"]["frame_width"])
+        tz = dt.timezone(dt.timedelta(hours=cfg["farm"]["timezone_offset_hours"]))
+        extra = [(cow, {"cam": cam, "ts": ts, "pic": pics[(cam, ts)],
+                        "time": dt.datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M:%S")}, box)
+                 for cow, cam, ts, box in extra if (cam, ts) in pics]
     count = collections.Counter(cow for cow, _, _ in items)
     few = sorted(c for c, n in count.items() if n < args.min_crops)
-    items = [it for it in items if count[it[0]] >= args.min_crops]
+    items = [it for it in items + extra if count[it[0]] >= args.min_crops]
     cows = sorted({cow for cow, _, _ in items})
     if len(cows) < 2:
-        sys.exit(f"{len(cows)} cow(s) with {args.min_crops}+ named boxes in done frames: name more boxes "
+        sys.exit(f"{len(cows)} cow(s) with {args.min_crops}+ named boxes: name more boxes "
                  f"(select a box, I, her tag, Enter; Save labels.json)")
     k = max(1, round(len(cows) * args.val_share)) if args.val_share > 0 else 0
     val = set(random.Random(args.seed).sample(cows, min(k, len(cows) - 1)))
     tmp = tempfile.mkdtemp()
     raw = os.path.join(tmp, "reid", "raw", "barn_ids")
     rows, images = [], {}
-    for cow, f, box in sorted(items, key=lambda it: (it[0], it[1]["ts"])):
-        if f["file"] not in images:
-            images = {f["file"]: Image.open(os.path.join(src, f["file"])).convert("RGB")}
-        img = images[f["file"]]
-        x1, _, x2, _ = square_crop_box(box, img.width, img.height, args.margin)
+    for cow, f, box in sorted(items, key=lambda it: (it[0], it[1]["cam"], it[1]["ts"])):
+        if "pic" in f:
+            img = f["pic"]
+        else:
+            if f["file"] not in images:
+                images = {f["file"]: np.asarray(Image.open(os.path.join(src, f["file"])).convert("RGB"))}
+            img = images[f["file"]]
+        x1, _, x2, _ = square_crop_box(box, img.shape[1], img.shape[0], args.margin)
         safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in cow)
-        name = f"{safe}/{f['cam']}_{int(f['ts'])}_{len(rows)}.jpg"
+        name = f"{safe}/{f['cam']}_{int(f['ts'] * 10)}_{len(rows)}.jpg"
         os.makedirs(os.path.join(raw, safe), exist_ok=True)
         # as the barn cuts a cow: square, the margin round her, grey past the frame's edge
-        sq = crop(np.asarray(img), box, max(32, min(448, x2 - x1)), args.margin)
-        Image.fromarray(sq).save(os.path.join(raw, name), quality=92)
-        day = f["time"][:10].replace("-", "")
-        rows.append({"file": name, "cow": cow, "day": day, "cam": f["cam"], "order": int(f["ts"]), "ready": True,
-                     "split": "val" if cow in val else "train", "by": "box"})
+        Image.fromarray(crop(img, box, max(32, min(448, x2 - x1)), args.margin)).save(os.path.join(raw, name), quality=92)
+        rows.append({"file": name, "cow": cow, "day": f["time"][:10].replace("-", ""), "cam": f["cam"],
+                     "order": int(f["ts"] * 10), "ready": True, "split": "val" if cow in val else "train",
+                     "by": "fill" if "pic" in f else "box"})
     with open(os.path.join(raw, "index.jsonl"), "w", encoding="utf-8") as fh:
         fh.writelines(json.dumps(r) + "\n" for r in rows)
     with open(os.path.join(raw, "complete.json"), "w", encoding="utf-8") as fh:
@@ -404,8 +493,9 @@ def cmd_ids(args):
     shutil.rmtree(tmp)
     cams = collections.Counter(r["cam"] for r in rows)
     multi = sum(1 for c in cows if len({r["cam"] for r in rows if r["cow"] == c}) > 1)
-    print(f"[ids] {len(rows)} named boxes of {len(cows)} cows ({', '.join(f'{c} {n}' for c, n in sorted(cams.items()))}); "
-          f"{multi} cows seen by 2+ cameras; held out: {', '.join(sorted(val))} -> {out}")
+    print(f"[ids] {len(rows)} crops ({sum(1 for r in rows if r['by'] == 'fill')} from between the frames) of "
+          f"{len(cows)} cows ({', '.join(f'{c} {n}' for c, n in sorted(cams.items()))}); {multi} cows seen by 2+ "
+          f"cameras; held out: {', '.join(sorted(val))} -> {out}")
     if few:
         print(f"[ids] fewer than {args.min_crops} named boxes, left out: {', '.join(few)}")
     if stale:
@@ -437,7 +527,9 @@ to resize; <kbd>Del</kbd> removes it. Dashed boxes are cows the detector was uns
 frame done and opens the next; only frames marked done are exported. <kbd>S</kbd> skips a frame (spoilt, or unsure);
 <kbd>&larr;</kbd> <kbd>&rarr;</kbd> move without marking; <kbd>Ctrl+Z</kbd> undoes. <b>Which cow</b> (for the identity
 model): select a box, <kbd>I</kbd>, her ear tag, <kbd>Enter</kbd> - the next box without an id is selected; <kbd>P</kbd> takes
-the ids of this camera's frame before for boxes in the same place (check them).</p>
+the ids of this camera's frame before for boxes in the same place; <kbd>F</kbd> carries every id typed by hand through all of
+this camera's frames, forwards and backwards, as long as the cow's box clearly continues (blue ids: filled in - check them;
+a typed id is never overwritten, and fixing a blue one makes it typed).</p>
 <div class="bar">
 <button id="prev">&larr;</button><span id="pos"></span><button id="next">&rarr;</button>
 <select id="cam"></select><label><input type="checkbox" id="todo"> only not done</label>
@@ -447,6 +539,8 @@ the ids of this camera's frame before for boxes in the same place (check them).<
 </div>
 <div class="bar"><label>cow id <input id="cid" list="ids" size="12" placeholder="ear tag" disabled></label>
 <button id="lastid" title="the id typed last">= last</button><button id="previd" title="ids from this camera's frame before (P)">ids from previous (P)</button>
+<button id="fillid" title="the ids typed by hand carried through all of this camera's frames, by where the cows are (F)">fill ids through the recording (F)</button>
+<label title="fill only the frames you have opened and edited"><input type="checkbox" id="onlyedited"> only frames I edited</label>
 <span class="mute">select a box, <kbd>I</kbd> - type her tag - <kbd>Enter</kbd> (the next box without an id is selected)</span></div>
 <datalist id="ids"></datalist>
 <div class="bar"><span id="info"></span><span id="status"></span><span class="mute" id="stat"></span></div>
@@ -529,7 +623,7 @@ function draw() {
       const t = b[4] || "?";
       ctx.font = "bold 14px sans-serif";
       const w = ctx.measureText(t).width + 8;
-      ctx.fillStyle = b[4] ? "rgba(20,20,20,0.75)" : "rgba(160,40,40,0.8)";
+      ctx.fillStyle = b[5] ? "rgba(30,90,180,0.85)" : b[4] ? "rgba(20,20,20,0.75)" : "rgba(160,40,40,0.8)";
       ctx.fillRect(X(b[0]), Y(b[1]) - 19, w, 19);
       ctx.fillStyle = "#fff"; ctx.fillText(t, X(b[0]) + 4, Y(b[1]) - 5);
     }
@@ -539,7 +633,8 @@ function draw() {
 }
 const corners = b => [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]];
 // a box is [x1, y1, x2, y2] or [x1, y1, x2, y2, "cow id"]
-const withId = (xy, b) => b && b[4] ? xy.concat([b[4]]) : xy;
+// [.., "cow id", 1]: an id filled in from a hand-set one on another frame (F), not typed
+const withId = (xy, b) => b && b[4] ? xy.concat(b.slice(4)) : xy;
 const rnd = b => withId(b.slice(0, 4).map(v => Math.round(v * 1e4) / 1e4), b);
 function knownIds() {
   const n = {};
@@ -559,6 +654,41 @@ function nextUnnamed() {          // left to right: the next box with no id, or 
   const order = boxes.map((b, i) => [i, b]).sort((p, q) => p[1][0] - q[1][0]);
   const k = order.find(([i, b]) => !b[4] && i !== sel);
   return k ? k[0] : -1;
+}
+function fillIds() {              // the ids typed by hand carried along this camera's frames, both ways, while
+  const f = frame(); if (!f) return;  // the cow's box on the next frame is the one most like hers (and she its)
+  const only = $("onlyedited").checked;
+  const frs = DATA.frames.filter(g => g.cam === f.cam && (!only || labels[g.file])).sort((a, b) => a.ts - b.ts);
+  const B = frs.map(g => (labels[g.file] ? labels[g.file].boxes : detBoxes(g)[0]).map(b => b[5] ? b.slice(0, 4) : b.slice()));
+  const dist = B.map(bs => bs.map(b => b[4] ? 0 : Infinity));
+  const best = (b, bs) => { let k = -1, v = 0; bs.forEach((q, j) => { const u = iou(b, q); if (u > v) { v = u; k = j; } }); return [k, v]; };
+  B.forEach((bs, k0) => bs.forEach((b0, j0) => {
+    if (!b0[4] || b0[5]) return;
+    for (const dir of [1, -1]) {
+      let k = k0, j = j0, d = 0;
+      for (;;) {
+        const k2 = k + dir;
+        if (k2 < 0 || k2 >= B.length || Math.abs(frs[k2].ts - frs[k].ts) > 300) break;   // not across another recording
+        const [j2, v] = best(B[k][j], B[k2]);
+        if (j2 < 0 || v < 0.5 || best(B[k2][j2], B[k])[0] !== j) break;     // not clearly the same cow
+        const t = B[k2][j2]; d++;
+        if (t[4] && !t[5]) break;                                           // a hand-set id: hers to carry on
+        if (B[k2].some((q, i) => i !== j2 && q[4] === b0[4] && !q[5])) break;  // she is elsewhere on that frame
+        if (dist[k2][j2] <= d) break;                                       // a nearer hand-set id holds it
+        B[k2][j2] = t.slice(0, 4).concat([b0[4], 1]); dist[k2][j2] = d;
+        k = k2; j = j2;
+      }
+    }
+  }));
+  let n = 0, frames_ = 0;
+  frs.forEach((g, k) => {
+    const was = labels[g.file], auto = B[k].filter(b => b[5]).length;
+    if (!was && !auto) return;
+    labels[g.file] = {status: was ? was.status || "" : "", cut: was ? was.cut : g.cut, boxes: B[k].map(rnd)};
+    n += auto; frames_ += auto ? 1 : 0;
+  });
+  store(); open(); idList();
+  $("info").textContent += ` - ${n} ids filled in on ${frames_} frames of ${f.cam} (blue): check them`;
 }
 function idsFromPrevious() {      // each box without an id takes the id of the box most like it on this camera's
   const f = frame(), i = DATA.frames.indexOf(f);   // frame before (a lying cow keeps her place)
@@ -657,6 +787,7 @@ $("cid").addEventListener("keydown", e => {
 $("cid").addEventListener("change", () => { if (sel >= 0 && $("cid").value.trim() !== (boxes[sel][4] || "")) setId($("cid").value); });
 $("lastid").onclick = () => { if (sel >= 0 && lastId) setId(lastId); };
 $("previd").onclick = () => idsFromPrevious();
+$("fillid").onclick = () => fillIds();
 const ZOOMS = [1, 1.5, 2, 3, 4];
 function setZoom(d) { zoom = ZOOMS[Math.min(ZOOMS.length - 1, Math.max(0, ZOOMS.indexOf(zoom) + d))]; if (img.naturalWidth) { fit(); draw(); } }
 $("zin").onclick = () => setZoom(1); $("zout").onclick = () => setZoom(-1);
@@ -676,6 +807,7 @@ document.addEventListener("keydown", e => {
   else if (e.key === "Escape") { sel = -1; draw(); }
   else if ((e.key === "i" || e.key === "I") && sel >= 0) { $("cid").focus(); $("cid").select(); e.preventDefault(); }
   else if (e.key === "p" || e.key === "P") idsFromPrevious();
+  else if (e.key === "f" || e.key === "F") fillIds();
   else if (e.key === "+" || e.key === "=") setZoom(1);
   else if (e.key === "-") setZoom(-1);
 });
@@ -728,6 +860,14 @@ def main(argv=None):
     n.add_argument("--val-share", type=float, default=1 / 6, help="cows held out (never trained on)")
     n.add_argument("--margin", type=float, default=0.1, help="context round the box (the herd model's margin)")
     n.add_argument("--seed", type=int, default=0)
+    n.add_argument("--done-only", action="store_true", help="only frames marked done (default: every frame with "
+                   "named boxes - ids filled in on the page included)")
+    n.add_argument("--fill", type=float, default=0.0, help="seconds: more crops of each named cow from the video "
+                   "between two cut frames where she stayed in place, one every this many s (needs --config, --videos)")
+    n.add_argument("--fill-iou", type=float, default=0.5, help="her two boxes must overlap this much to fill between")
+    n.add_argument("--fill-gap", type=float, default=30.0, help="at most this many s between the two frames")
+    n.add_argument("--config", default=None)
+    n.add_argument("--videos", default=None)
     args = p.parse_args(argv)
     if args.cmd == "frames" and not (args.videos or args.video):
         p.error("frames: --videos DIR or --video cam=file")
