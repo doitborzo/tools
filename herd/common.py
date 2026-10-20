@@ -201,11 +201,20 @@ def in_zone(box, cam, w, h, tracking=False):
 def homography(src, dst):
     """3x3 H with dst ~ H @ src from >= 4 point pairs (DLT)."""
     import numpy as np
-    A = []
-    for (x, y), (u, v) in zip(src, dst):
-        A.append([-x, -y, -1, 0, 0, 0, u * x, u * y, u])
-        A.append([0, 0, 0, -x, -y, -1, v * x, v * y, v])
-    H = np.linalg.svd(np.asarray(A, float))[2][-1].reshape(3, 3)
+    src, dst = np.asarray(src, float), np.asarray(dst, float)
+
+    def norm(p):                       # Hartley: centred, mean distance sqrt(2) - many points, cm and 0-1 alike
+        c = p.mean(0)
+        s = np.sqrt(2) / max(np.mean(np.hypot(*(p - c).T)), 1e-12)
+        return np.array([[s, 0, -s * c[0]], [0, s, -s * c[1]], [0, 0, 1.0]])
+    Ts, Td = norm(src), norm(dst)
+    a = np.c_[src, np.ones(len(src))] @ Ts.T
+    b = np.c_[dst, np.ones(len(dst))] @ Td.T
+    x, y, u, v = a[:, 0], a[:, 1], b[:, 0], b[:, 1]
+    z, o = np.zeros(len(x)), np.ones(len(x))
+    A = np.r_[np.c_[-x, -y, -o, z, z, z, u * x, u * y, u], np.c_[z, z, z, -x, -y, -o, v * x, v * y, v]]
+    Hn = np.linalg.eigh(A.T @ A)[1][:, 0].reshape(3, 3)           # the null vector; 9 x 9 whatever the points
+    H = np.linalg.inv(Td) @ Hn @ Ts
     return H / H[2, 2]
 
 
@@ -231,13 +240,24 @@ def floor_mapper(cam, mct):
         return f
     pts = cam.get("floor_points")
     if pts and len(pts) >= 4:
-        Hinv = homography([(u, v) for u, v, _, _ in pts], [(x, y) for _, _, x, y in pts])
+        k, ar = cam.get("distortion") or 0.0, cam.get("aspect") or 16 / 9      # herd.py autocalib writes both
+        und = (lambda u, v: undistort(u, v, k, ar)) if k else (lambda u, v: (u, v))
+        Hinv = homography([und(u, v) for u, v, _, _ in pts], [(x, y) for _, _, x, y in pts])
 
         def g(box, p_lying=0.5):
-            q = Hinv @ np.array([(box[0] + box[2]) / 2, box[3], 1.0])
+            q = Hinv @ np.array([*und((box[0] + box[2]) / 2, box[3]), 1.0])
             return (float(q[0] / q[2]), float(q[1] / q[2]))
         return g
     return None
+
+
+def undistort(u, v, k, aspect=16 / 9):
+    """A point of a frame (0-1) as a lens without barrel distortion would show it: the one-parameter
+    division model about the centre, r normalised to 1 at the corners (k < 0 straightens a wide lens's
+    barrel). Works on numbers and on numpy arrays."""
+    x, y = (u - 0.5) * aspect, v - 0.5
+    s = 1.0 / (1.0 + k * (x * x + y * y) / (0.25 * aspect * aspect + 0.25))
+    return 0.5 + x * s / aspect, 0.5 + y * s
 
 
 _BLANK_CACHE = {}

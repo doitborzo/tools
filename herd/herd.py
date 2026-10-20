@@ -34,6 +34,8 @@ Recordings for them:
     herd.py fix-videos --videos DIR --out DIR2             damaged recordings -> clean .mp4 the tools read
 A dress rehearsal on recordings (two passes: the gallery fills, then who is who, drawn per camera):
     herd.py trial --config barn.toml --videos DIR --out D
+Cameras sharing floor calibrated by the cows moving in both (nothing measured; then [mct] link):
+    herd.py autocalib --config barn.toml --store D/pass2/herd.sqlite --videos DIR --out C [--apply]
 The models on the barn's own labels (nothing trained on them):
     herd.py check --config barn.toml [--det herd_det_barn_X.tgz] [--ids herd_barn_ids_X.tgz]
 Cow boxes on the barn's cameras (detector training):
@@ -125,6 +127,9 @@ def main():
     if cmd == "zones":
         import zone_page
         return zone_page.main(argv)
+    if cmd == "autocalib":
+        import autocalib
+        return autocalib.main(argv)
     if cmd == "trial":
         import trial
         return trial.main(argv)

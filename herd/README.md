@@ -165,6 +165,8 @@ time on tracks no cow could be given.
 | `degrade.py` | bursts spoilt on purpose (occlusion, mud, blur, dark): what the quality heads learn on |
 | `barn_dataset.py` | the barn's own bursts (training cache, live or from recordings: `barn video`): the labelling page, `merges.csv`, the export to the identity model (`barn` in `reid.py`) and to `train.py --extra-train` |
 | `zone_page.py` | the cameras' masks and excluded zones drawn on their pictures -> `[[cameras]]` |
+| `autocalib.py` | cameras sharing floor calibrated by the cows that move in both: floor mapping, lens bend, clock lag |
+| `trial.py` | a dress rehearsal on recordings: two passes (the gallery fills, then who is who), drawn per camera |
 | `check.py` | the detector and the identity models scored on the barn's own labels (boxes export / ids) |
 | `fix_videos.py` | damaged recordings encoded again into clean .mp4 the tools read |
 | `record.py` | every camera recorded at once, files named as the dataset tools read them |
