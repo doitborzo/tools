@@ -758,3 +758,31 @@ def test_split_zip_and_live_frames_from_two_windows():
         X.SplitRemoteZip = real
         import importlib
         importlib.reload(M)
+
+
+def test_v14g_results_page_and_comparison_with_the_control():
+    import system_e as E
+
+    def run(start, setup_min, f1s):
+        prf = lambda f: {"f1": f, "precision": f, "recall": f, "answered_share": 1.0}
+        return {"settings": {"start": start, "setup_min": setup_min, "end": 13.0},
+                "identification": {w: {"with_not_sure": prf(f / 2), "always_answer": prf(f)} for w, f in f1s.items()},
+                "album": {"built": {"album_cows": 30, "true_cows": 16, "purity": 0.9, "coverage": 1.0},
+                          "confirmed_cows": 16, "oracle_cows": 16, "threshold": 0.7, "self_calibration": {}},
+                "detector": {"recall": 0.95, "precision": 0.96}, "chains": 900}
+
+    g = run(9.0, 180, {"built": 0.2, "confirmed": 0.45, "oracle": 0.5})
+    c = run(11.0, 60, {"built": 0.1, "confirmed": 0.3, "oracle": 0.3})
+    assert E.window_text(g["settings"]) == "onboarding 09:00-12:00 (180 min), scored 12:00-13:00"
+    with tempfile.TemporaryDirectory() as d:
+        page = os.path.join(d, "RESULTS.md")
+        E.report_e(g, page, "G")
+        text = open(page).read()
+        assert text.startswith("# Version 14 (G):") and "onboarding 09:00-12:00 (180 min), scored 12:00-13:00" in text
+        for name, obj in (("g.json", g), ("c.json", c)):
+            json.dump(obj, open(os.path.join(d, name), "w"))
+        E.compare_main(["--main", os.path.join(d, "g.json"), "--control", os.path.join(d, "c.json"), "--append", page])
+        text = open(page).read()
+        assert "control: onboarding 11:00-12:00 (60 min), scored 12:00-13:00" in text
+        assert "| confirmed | **45.0%** | 30.0% | 22.5% | 15.0% |" in text
+        assert "| oracle | **50.0%** | 30.0% |" in text

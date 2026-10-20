@@ -80,7 +80,7 @@ if [ -z "${V14_IN_TMUX:-}" ]; then
     if tmux has-session -t "=$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     mkdir -p "$V"
     knobs=""
-    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP ID_DATA ID_STAGES SYS_START SYS_END PRETRAINED ASSOC_PRETRAINED VIDEO_END CENTER NAME REALTIME CLIPS FPS TITLE MODE TAG; do
+    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP ID_DATA ID_STAGES SYS_START SYS_END CONTROL_START CONTROL_MIN PRETRAINED ASSOC_PRETRAINED VIDEO_END CENTER NAME REALTIME CLIPS FPS TITLE MODE TAG; do
         knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env V14_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/run_v14.sh"); echo; echo '[run_v14.sh finished]'; exec bash"
@@ -230,7 +230,8 @@ fi
 if [ -n "$NAME" ]; then
     echo "models ready - now $NAME's onboarding test, videos, results and weights (log: $V/video_log.txt)"
     V14V_IN_TMUX=1 WORK="$WORK" DET_NAME="$DET_NAME" SYS_START="$SYS_START" SETUP_MIN="$SETUP_MIN" SYS_END="$SYS_END" \
-        IDNET="$IDN/idnet.pt" MODE="$MODE" exec bash "$HERE/video_v14.sh"
+        CONTROL_START="${CONTROL_START:-}" CONTROL_MIN="${CONTROL_MIN:-}" IDNET="$IDN/idnet.pt" MODE="$MODE" \
+        exec bash "$HERE/video_v14.sh"
 fi
 
 step "7/8  Onboarding test on MmCows (inference only): setup $SETUP_MIN min, then identification"
