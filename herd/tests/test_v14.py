@@ -436,3 +436,72 @@ def test_rescore_a_saved_run_on_chosen_cows_and_eval_on_some_cows():
         ev = json.load(open(os.path.join(d, "idnet", "some.json")))
         assert ev["test"]["queries"] == 2 * 3 and ev["test_cows_only"] == ["1", "2"]
         assert os.path.getmtime(os.path.join(d, "idnet", "idnet.pt")) == before
+
+
+def test_v14e_album_merging_scoring_and_video():
+    import system_e as E
+    rng = np.random.default_rng(11)
+    t0 = 1690304400.0
+    cows, dim = 6, 32
+    common = rng.normal(size=dim)
+    common /= np.linalg.norm(common)
+    own = rng.normal(size=(cows, dim)) * 0.15
+    # 12 chains in the setup hour: cow c has chains c and c+6 (its track broke at minute 5),
+    # chains of different cows are seen together on cam_1 at every moment
+    det_log, recs = [], []
+    for m in range(10):
+        for c in range(cows):
+            cid = c if m < 5 else c + 6
+            fp = common * 3 + own[c] + rng.normal(scale=0.03, size=dim)
+            recs.append((m, cid, (fp / np.linalg.norm(fp)).astype(np.float32), 1.0, 0.5, 0.1))
+            for k in range(0, 60, 2):
+                det_log.append((t0 + 60 * m + k, "cam_1", [0.1 * c, 0.1, 0.1 * c + 0.08, 0.2], cid, 0.9))
+    pairs = E.seen_together(det_log)
+    assert (0, 1) in pairs and (0, 6) not in pairs              # cows 0 and 1 share moments; 0 and its later self never
+    cen, P, ids, chain_album, thr, calib = E.build_album(recs, det_log, min_minutes=3)
+    assert len(set(ids.tolist())) == cows                         # one album cow per cow ...
+    assert all(chain_album[c] == chain_album[c + 6] for c in range(cows))   # ... with both chains of a cow in it
+    assert len({chain_album[c] for c in range(cows)}) == cows      # and never two cows seen together merged
+    # the setup labels: chain c is cow c+1 (ear tags 1..6), every 15 s
+    labels = [{"cam": "cam_1", "ts": t0 + 60 * m + s, "boxes": [[c + 1, [0.1 * c, 0.1, 0.1 * c + 0.08, 0.2]] for c in range(cows)]}
+              for m in range(10) for s in (0, 15, 30, 45)]
+    truth = E.labelled_chains(det_log, labels, t0 + 600, 0.3)
+    assert truth[(0, int(t0 // 60))].most_common(1)[0][0] == 1 and truth[(7, int(t0 // 60) + 6)].most_common(1)[0][0] == 2
+    # scoring after setup: chain 0 named right every step, chain 1 never, chain 2 "not sure" (right guess)
+    a = argparse.Namespace(step=2, match_iou=0.3)
+    after = [{"cam": "cam_1", "ts": t0 + 600 + s, "boxes": [[1, [0.0, 0.1, 0.08, 0.2]], [2, [0.1, 0.1, 0.18, 0.2]], [3, [0.2, 0.1, 0.28, 0.2]]]}
+             for s in (0, 15, 30)]
+    log2 = [(t0 + 600 + k, "cam_1", [0.1 * c, 0.1, 0.1 * c + 0.08, 0.2], c, 0.9) for k in range(0, 32, 2) for c in range(3)]
+    said = {}
+    for k in range(300, 316):
+        said[(0, k)] = ("cow1", "cow1")
+        said[(1, k)] = ("cow3", "cow3")
+        said[(2, k)] = (None, "cow3")
+    import metrics
+    r = E.score_e(a, log2, after, said, {"cow1": 1, "cow2": 2, "cow3": 3}, t0, t0 + 600, metrics)
+    assert r["with_not_sure"]["right"] == 3 and r["with_not_sure"]["answered"] == 6
+    assert r["always_answer"]["right"] == 6                      # chain 2's guess was right too
+    # a per-step names file plays in video.py
+    import cv2
+    import video
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "live"))
+        live = []
+        for k in range(300, 310):
+            p = os.path.join(d, "live", f"{k}.jpg")
+            cv2.imwrite(p, np.full((100, 160, 3), 80, np.uint8))
+            live.append({"cam": "cam_1", "ts": t0 + 2 * k, "path": p})
+        for name, rows in (("live.jsonl", live), ("labels.jsonl", after)):
+            with open(os.path.join(d, name), "w") as fh:
+                for r_ in rows:
+                    fh.write(json.dumps(r_) + "\n")
+        with open(os.path.join(d, "tracks_e_confirmed.jsonl"), "w") as fh:
+            for t, cam, box, cid, conf in log2:
+                fh.write(json.dumps({"t": t, "cam": cam, "box": box, "track": cid, "conf": conf}) + "\n")
+        json.dump({"t_start": t0, "t_setup": t0 + 600, "step": 2, "setup_min": 10, "per_step": True,
+                   "track_album": {}, "names": [[c, k, n, al] for (c, k), (n, al) in said.items()],
+                   "album_to_cow": {"cow1": 1, "cow2": 2, "cow3": 3}}, open(os.path.join(d, "names_e_confirmed.json"), "w"))
+        tally = video.render(argparse.Namespace(data=d, system=d, tag="e_confirmed", time_from="12:10", time_to="12:10:20",
+                                                fps=2.0, width=320, match_iou=0.3, out=os.path.join(d, "v.mp4"),
+                                                realtime=False, title=""))
+        assert tally["right"] >= 1 and tally["wrong"] >= 1 and tally.get("guess right", 0) >= 1

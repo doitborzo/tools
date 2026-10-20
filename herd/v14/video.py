@@ -113,6 +113,7 @@ def render(args):
     if not frames:
         sys.exit(f"no live frames between {args.time_from} and {args.time_to}")
     t_start, t_setup, step = names["t_start"], names["t_setup"], names["step"]
+    per_step = bool(names.get("per_step"))              # system_e.py names every step, system.py every minute
     track_album = {int(k): v for k, v in names["track_album"].items()}
     to_cow = {k: v for k, v in names["album_to_cow"].items()}
     cams = sorted({c for f in frames.values() for c in f})
@@ -134,7 +135,7 @@ def render(args):
     tally = collections.Counter()
     for n, k in enumerate(sorted(frames)):
         t = t_start + k * step
-        minute = int((t - t_start) // 60)
+        minute = k if per_step else int((t - t_start) // 60)
         setup = t < t_setup
         canvas = np.zeros((size[1], size[0], 3), np.uint8)
         for ci, cam in enumerate(cams):
@@ -212,7 +213,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data", required=True, help="data_mmcows.py's folder (live.jsonl, labels.jsonl, masks.npz)")
     p.add_argument("--system", required=True, help="system.py's --out (tracks_<tag>.jsonl, names_<tag>.json)")
-    p.add_argument("--tag", default="assoc", choices=("assoc", "iou_per_camera"))
+    p.add_argument("--tag", default="assoc", help="assoc, iou_per_camera, e_built, e_confirmed, e_oracle")
     p.add_argument("--from", dest="time_from", default="13:00", help="local time, HH:MM or HH:MM:SS")
     p.add_argument("--to", dest="time_to", default="13:10")
     p.add_argument("--fps", type=float, default=5.0, help="video frames per second (one per 2-s step: 5 = 10x speed)")

@@ -51,7 +51,7 @@ MCC_URL="${MCC_URL:-https://data.bris.ac.uk/datasets/tar/2inu67jru7a6821kkgehxg3
 PRETRAINED="${PRETRAINED:-}"
 ASSOC_PRETRAINED="${ASSOC_PRETRAINED:-}"
 VIDEO_END="${VIDEO_END:-13.5}"
-CENTER="${CENTER:-}"; NAME="${NAME:-}"; REALTIME="${REALTIME:-}"; CLIPS="${CLIPS:-}"; FPS="${FPS:-}"; TITLE="${TITLE:-}"
+MODE="${MODE:-}"; CENTER="${CENTER:-}"; NAME="${NAME:-}"; REALTIME="${REALTIME:-}"; CLIPS="${CLIPS:-}"; FPS="${FPS:-}"; TITLE="${TITLE:-}"
 export HF_HOME="$WORK/hf-cache"
 
 case "${1:-}" in
@@ -71,7 +71,7 @@ if [ -z "${V14_IN_TMUX:-}" ]; then
     if tmux has-session -t "=$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     mkdir -p "$V"
     knobs=""
-    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP ID_DATA PRETRAINED ASSOC_PRETRAINED VIDEO_END CENTER NAME REALTIME CLIPS FPS TITLE; do
+    for v in WORK MODELS_URL DET_NAME LIVE_STEP TRAIN_EVERY WINDOW_EVERY SETUP_MIN START END ID_EPOCHS ASSOC_EPOCHS MCC_WAIT_H MCC_ZIP ID_DATA PRETRAINED ASSOC_PRETRAINED VIDEO_END CENTER NAME REALTIME CLIPS FPS TITLE MODE; do
         knobs+="$v=$(printf '%q' "${!v:-}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env V14_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/run_v14.sh"); echo; echo '[run_v14.sh finished]'; exec bash"
@@ -185,7 +185,9 @@ fi
 if [ -f "$IDN/idnet.pt" ] && [ -f "$IDN/eval_id.json" ]; then echo "trained already"; else
     "$PY" idnet.py train "${ID_ARGS[@]}" --out "$IDN" --epochs "$ID_EPOCHS"; fi
 
-if [ -n "$ASSOC_PRETRAINED" ]; then
+if [ "$MODE" = e ]; then
+    step "6/8  Association transformer: not used by version 14 (E)"
+elif [ -n "$ASSOC_PRETRAINED" ]; then
     step "6/8  Association transformer: the trained one from $ASSOC_PRETRAINED, scored on the test window"
     if [ ! -f "$V/assoc/eval_assoc.json" ] || [ ! -f "$V/assoc/.from_pretrained" ]; then
         fetch_models "$ASSOC_PRETRAINED"
@@ -202,7 +204,7 @@ fi
 
 if [ -n "$NAME" ]; then
     echo "models ready - now $NAME's onboarding test, videos, results and weights (log: $V/video_log.txt)"
-    V14V_IN_TMUX=1 WORK="$WORK" DET_NAME="$DET_NAME" SYS_END="$END" IDNET="$IDN/idnet.pt" exec bash "$HERE/video_v14.sh"
+    V14V_IN_TMUX=1 WORK="$WORK" DET_NAME="$DET_NAME" SYS_END="$END" IDNET="$IDN/idnet.pt" MODE="$MODE" exec bash "$HERE/video_v14.sh"
 fi
 
 step "7/8  Onboarding test on MmCows (inference only): setup $SETUP_MIN min, then identification"
