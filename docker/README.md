@@ -201,6 +201,25 @@ It writes `docker/data/herd_barn_ids_<date>.tgz`: each named box cut as the barn
 the cows held out. Every frame with named boxes counts, done or not (`--done-only`: only done ones). Put it in the pod's `/workspace`; `reid_pod.sh` adds the set `barn_ids` to training.
 The same labels.json also makes the detector's set (`boxes export`).
 
+**Check the models on your labels** (before training anything on them - none of these frames was
+ever seen by the models):
+
+```bash
+docker compose run --rm herd check --config /data/barn.toml
+```
+
+It takes the newest `herd_det_barn_*.tgz` and `herd_barn_ids_*.tgz` in `docker/data/` (or `--det`,
+`--ids`):
+
+- **the detector** on every labelled frame: the share of the cows it finds and of its boxes that are
+  right, at the config's threshold and at the best one for this barn (put that one in
+  `[detector] threshold`);
+- **the identity model** (and the herd model's own fingerprint, to compare) on the named cows: a cow
+  from another camera, is the nearest of all the cows her - from a group of crops and from one crop.
+
+`docker/data/check/check.json` keeps the numbers. After training on the pod, put the new models in
+`docker/models/`, build again and run `check` again: the same frames, before and after.
+
 **One camera's zone changed** (`zones page` → `zones apply` again). Redo only that camera:
 
 ```bash

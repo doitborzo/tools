@@ -410,3 +410,42 @@ def test_ids_filled_in_between_frames_from_the_video():
         # 5 gaps of 10 s, a crop every 2 s inside each: 4 a gap; UA02 not across the gap where she moved
         assert fill["UA01"] == 5 * 4 and fill["UA02"] == 4 * 4
         assert len({r["order"] for r in rows if r["cow"] == "UA01"}) == 6 + 20
+
+
+def test_check_the_models_on_the_barns_labels():
+    import box_dataset
+    import check
+    import detector as det_mod
+    import model as mdl
+    import reid
+    with tempfile.TemporaryDirectory() as d:
+        cfg, rec = _setup(d)
+        out = os.path.join(d, "boxes")
+        box_dataset.main(["frames", "--config", cfg, "--videos", rec, "--out", out, "--every", "10", "--detector", "none"])
+        fr = json.load(open(os.path.join(out, "frames.json")))["frames"]
+        tags = ["UA01", "UA02", "UA03"]
+        labels = {f["file"]: {"status": "done", "boxes": [[0.1, 0.4, 0.3, 0.8, tags[k % 3]], [0.5, 0.4, 0.7, 0.8, tags[(k + 1) % 3]]]}
+                  for k, f in enumerate(fr)}
+        lp = os.path.join(d, "labels.json")
+        json.dump({"frames": labels}, open(lp, "w"))
+        box_dataset.main(["export", "--data", out, "--labels", lp, "--out", os.path.join(d, "herd_det_barn_1.tgz"),
+                          "--block-min", "1"])
+        box_dataset.main(["ids", "--data", out, "--labels", lp, "--out", os.path.join(d, "herd_barn_ids_1.tgz"),
+                          "--min-crops", "2"])
+        mp = os.path.join(d, "model.pt")
+        mdl.HerdModel(16, d=32, layers=1, heads=2).save(mp, {"features": {"encoder": "x", "grid": 2, "crop": 224, "margin": 0.1},
+                                                             "crop_s": 3.5, "dev_clips": []})
+        text = open(cfg).read()
+        open(cfg, "w").write(text.replace("[detector]", f'[model]\ncheckpoint = "{mp}"\n\n[detector]'))
+        real_live, real_enc = det_mod.Live, reid.encode_all
+        det_mod.Live = _StubLive
+        reid.encode_all = lambda paths, meta, batch=256, ready=None: np.random.default_rng(0).normal(size=(len(paths), 16)).astype(np.float16)
+        try:
+            check.main(["--config", cfg])
+        finally:
+            det_mod.Live, reid.encode_all = real_live, real_enc
+        rep = json.load(open(os.path.join(d, "check", "check.json")))
+        r = rep["detector"]["det"]
+        assert r["at_own"]["recall"] == 0.5 and r["at_best"]["precision"] > 0              # stub: 1 of the 2 cows
+        ident = rep["identity"]["herd model (no identity model)"]
+        assert "other_camera_top1" in ident["metrics"] and "thresholds" in ident

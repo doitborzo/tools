@@ -81,6 +81,8 @@ docker/data on your computer is /data here: the config, the recordings, everythi
   barn export --cache /data/barn_video/training_cache --merges /data/merges.csv
   boxes frames --config /data/barn.toml --videos /data/rec --out /data/boxes
   boxes export --data /data/boxes --labels /data/labels.json
+  check --config /data/barn.toml   the models on your labels: the detector on herd_det_barn_*.tgz, the
+                                 identity model on herd_barn_ids_*.tgz (the newest in /data)
   run --config /data/barn.toml   the barn live (better: docker compose --profile live up -d barn)
   show-ids, report, gallery, stress, eval-det ...   as herd.py (docker compose run --rm herd herd-help)
   bash                           a shell in the container

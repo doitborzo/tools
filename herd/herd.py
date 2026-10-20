@@ -32,6 +32,8 @@ Cameras' zones, drawn on their pictures:
 Recordings for them:
     herd.py record --config barn.toml --out DIR --minutes 60   every camera at once -> DIR/<cam>_<time>.mp4
     herd.py fix-videos --videos DIR --out DIR2             damaged recordings -> clean .mp4 the tools read
+The models on the barn's own labels (nothing trained on them):
+    herd.py check --config barn.toml [--det herd_det_barn_X.tgz] [--ids herd_barn_ids_X.tgz]
 Cow boxes on the barn's cameras (detector training):
     herd.py boxes frames --config barn.toml --videos DIR --out D   frames + the detector's guess + D/boxes.html
     herd.py boxes export --data D --labels labels.json            -> herd_det_barn_*.tgz (run_pod.sh detector)
@@ -121,6 +123,9 @@ def main():
     if cmd == "zones":
         import zone_page
         return zone_page.main(argv)
+    if cmd == "check":
+        import check
+        return check.main(argv)
     if cmd == "fix-videos":
         import fix_videos
         return fix_videos.main(argv)
