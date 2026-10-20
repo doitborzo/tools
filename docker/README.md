@@ -249,7 +249,31 @@ docker compose run --rm herd boxes frames --config /data/barn.toml --videos /dat
   grey. The page marks each of them "cut again - check it": look, press Enter, Save labels.json. Until
   then, `boxes export` leaves them out.
 
-## 6. The barn, live
+## 6. A dress rehearsal on the recordings
+
+Before the barn goes live: the whole system with `barn.toml` - zones, masks, detector, tracker, posture,
+the gallery - played on the recordings:
+
+```bash
+docker compose run --rm herd trial --config /data/barn.toml --videos /data/rec_fixed --out /data/trial
+```
+
+A gallery fills over a barn's first hours; a quarter of an hour of recordings would end with every
+cow NaN. So the files are played twice. The first pass (a burst every 20 s) is followed by the night's
+maintenance, which enrols every cow seen in 6 or more bursts. The second pass then runs with those
+cows: who is who. It writes:
+
+- `docker/data/trial/show_<cam>/index.html` and `ids.mp4`: every camera's first 10 minutes with each
+  box's cow, track, posture and activity (one colour per cow, the same on every camera; grey = NaN).
+  Check:
+  - every cow has a box (missed ones: the detector, its threshold, `min_box_pct`);
+  - no box sits on the neighbouring pen (`exclude`);
+  - a cow in the cam1/cam2 overlap is counted by one camera only;
+  - a cow keeps her colour while she lies.
+- `docker/data/trial/trial.json`, and a line a camera in the log: the cow-seconds counted, the tracks,
+  the share given a cow, posture and activity.
+
+## 7. The barn, live
 
 ```bash
 docker compose --profile live up -d barn            # starts, and starts again with Docker Desktop
@@ -268,7 +292,7 @@ docker compose run --rm herd gallery --config /data/barn.toml
 `herd/SETUP.md` sections 8–9 say what they mean. In Docker Desktop → Settings → General, turn on
 "Start Docker Desktop when you sign in": the barn then comes back by itself after a restart.
 
-## 7. Other commands
+## 8. Other commands
 
 `docker compose run --rm herd help` lists them. Anything `herd.py` takes runs as
 `docker compose run --rm herd <command> ...`; `bash` opens a shell in the container.

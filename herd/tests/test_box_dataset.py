@@ -68,6 +68,57 @@ class _StubLive:
                 for _ in imgs]
 
 
+def test_trial_two_passes_and_a_night_between():
+    import gallery as gallery_mod
+    import pipeline
+    import show_ids
+    import trial
+    from store import Store
+    with tempfile.TemporaryDirectory() as d:
+        cfg, rec = _setup(d)
+        passes, drawn = [], []
+
+        class _M:
+            id_abstain, id_thresholds = None, {}
+
+            def __init__(self, c):
+                pass
+
+        def _run(c, start, models=None, status=None):
+            store = Store(c["store"]["path"])
+            folder = os.path.join(os.path.dirname(c["store"]["path"]), "gallery")
+            g = gallery_mod.Gallery(folder, c)
+            first = not g.cows
+            passes.append((c["sampling"]["burst_every_s"], [x["id"] for x in c["cameras"]], first))
+            for x in c["cameras"]:
+                tr = f"{x['id']}-1"
+                store.seconds([(x["id"], tr, start + s, 0.1, 0.4, 0.3, 0.8, "lying", "none", 0.9) for s in range(10)])
+                if first:            # the first pass: her bursts wait in the pool
+                    v = np.zeros(8, np.float32)
+                    v[0] = 1
+                    g.pool += [{"ts": start + s, "track": tr, "fp": v} for s in range(8)]
+                else:                # the second: she is known
+                    cow = next(iter(g.cows))
+                    for s in range(3):
+                        store.burst((x["id"], tr, start + s, "confirmed", cow, 0.99, 0.3, 0.9))
+            g.save()
+            return {}
+        old = pipeline.Models, pipeline.run, show_ids.main
+        pipeline.Models, pipeline.run = _M, _run
+        show_ids.main = lambda argv: drawn.append(argv[argv.index("--cam") + 1])
+        try:
+            out = os.path.join(d, "trial")
+            trial.main(["--config", cfg, "--videos", rec, "--out", out, "--min-bursts", "6"])
+        finally:
+            pipeline.Models, pipeline.run, show_ids.main = old
+        assert [p[0] for p in passes] == [20.0, 20.0, 60, 60]          # 2 sessions a pass; the second as configured
+        assert [p[2] for p in passes] == [True, True, False, False]
+        rep = json.load(open(os.path.join(out, "trial.json")))
+        assert len(rep["cows_enrolled"]) == 1 and rep["cows_in_gallery"] == 1
+        assert rep["cameras"]["cam1"]["with_a_cow"] == 1.0 and rep["cameras"]["cam1"]["posture"] == {"lying": 20}
+        assert sorted(drawn) == ["cam1", "cam2"]
+
+
 def test_recordings_found_by_camera_and_time():
     import common
     with tempfile.TemporaryDirectory() as d:

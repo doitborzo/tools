@@ -81,6 +81,9 @@ docker/data on your computer is /data here: the config, the recordings, everythi
   barn export --cache /data/barn_video/training_cache --merges /data/merges.csv
   boxes frames --config /data/barn.toml --videos /data/rec --out /data/boxes
   boxes export --data /data/boxes --labels /data/labels.json
+  trial --config /data/barn.toml --videos /data/rec_fixed --out /data/trial
+                                 a dress rehearsal on the recordings: the gallery fills, then who is who
+                                 drawn per camera (trial/show_<cam>/index.html)
   check --config /data/barn.toml   the models on your labels: the detector on herd_det_barn_*.tgz, the
                                  identity model on herd_barn_ids_*.tgz (the newest in /data)
   run --config /data/barn.toml   the barn live (better: docker compose --profile live up -d barn)

@@ -130,7 +130,7 @@ def cmd_barn(args):
     from common import load_config
     from store import Store
     cfg = load_config(args.config)
-    store = Store(cfg["store"]["path"])
+    store = Store(args.store or cfg["store"]["path"])
     start = dt.datetime.fromisoformat(args.start).timestamp()
     t0 = start + args.from_min * 60
     t1 = t0 + args.minutes * 60
@@ -192,6 +192,7 @@ def main(argv=None):
     p.add_argument("--fps", type=float, default=4, help="video frames a second (one per second of the barn)")
     p.add_argument("--still-every", type=int, default=30, help="a still in index.html every N seconds")
     p.add_argument("--width", type=int, default=1920)
+    p.add_argument("--store", default=None, help="another herd.sqlite than the config's (herd.py trial's)")
     cmd_barn(p.parse_args(argv))
 
 
