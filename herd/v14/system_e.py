@@ -338,7 +338,7 @@ def run(args):
                            {str(c): f"cow{named[a]}" for c, a in chain_album.items() if a in named},
             "names": [[cid, k, n, always] for (cid, k), (n, always) in said.items()],
             "album_to_cow": to_cow})
-    report_e(out, os.path.join(args.out, "RESULTS_E.md"))
+    report_e(out, os.path.join(args.out, "RESULTS_E.md"), args.version)
     return out
 
 
@@ -385,10 +385,22 @@ def score_e(args, det_log, labels, said, to_cow, t_start, t_setup, metrics):
     return {"with_not_sure": metrics.id_prf(pred, truth), "always_answer": metrics.id_prf(pred_always, truth)}
 
 
-def report_e(out, path):
+def hm(h):
+    """Local hour (float) -> HH:MM."""
+    m = int(round(h * 60))
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def window_text(st):
+    return (f"onboarding {hm(st['start'])}-{hm(st['start'] + st['setup_min'] / 60)} ({st['setup_min']} min), "
+            f"scored {hm(st['start'] + st['setup_min'] / 60)}-{hm(st['end'])}")
+
+
+def report_e(out, path, version="E"):
     p = lambda v: "-" if v is None else f"{v:.1%}"
     idn, al = out["identification"], out["album"]
-    L = ["# Version 14 (E): naming every box on its own, no tracking model", "",
+    L = [f"# Version 14 ({version}): naming every box on its own, no tracking model", "",
+         f"MmCows, 25 July: {window_text(out['settings'])}.", "",
          "Version 14 (D)'s ID transformer and version 10's detector, nothing trained. Boxes are chained per camera "
          "by overlap over a few seconds only; every box is named from its chain's last crops against the album, "
          "smoothed by the chain's scoreboard; one cow at most once per camera per moment. The album from the setup "
@@ -434,9 +446,44 @@ def main(argv=None):
     p.add_argument("--min-minutes", type=int, default=3)
     p.add_argument("--ema", type=float, default=0.3, help="weight of the newest step on a chain's scoreboard")
     p.add_argument("--match-iou", type=float, default=0.3)
+    p.add_argument("--version", default="E", help="the name on the results page (G: v14 G's longer onboarding)")
     args = p.parse_args(argv)
     run(args)
 
 
+def compare_onboarding(main, control):
+    """Two system_e.json scored on the same hour after onboardings of different length -> markdown lines."""
+    p = lambda v: "-" if v is None else f"{v:.1%}"
+    sm, sc = main["settings"], control["settings"]
+    L = ["## Longer onboarding against the control, the same scored hour", "",
+         f"- this run: {window_text(sm)}", f"- control: {window_text(sc)}", "",
+         "| album | ID F1 always answering: this run | control | ID F1 with 'not sure': this run | control |",
+         "|---|---|---|---|---|"]
+    for way in ("built", "confirmed", "oracle"):
+        a, b = main["identification"].get(way), control["identification"].get(way)
+        if a and b:
+            L.append(f"| {way} | **{p(a['always_answer']['f1'])}** | {p(b['always_answer']['f1'])} | "
+                     f"{p(a['with_not_sure']['f1'])} | {p(b['with_not_sure']['f1'])} |")
+    am, ac = main["album"]["built"], control["album"]["built"]
+    L += [f"| built album: entries / purity / coverage | {am['album_cows']} / {p(am['purity'])} / {p(am['coverage'])} | "
+          f"{ac['album_cows']} / {p(ac['purity'])} / {p(ac['coverage'])} | | |", "",
+          "Reading it: the oracle row is the album's pictures alone - a gap there is what the extra onboarding hours "
+          "showed the ID transformer (more poses and places per cow); the confirmed row adds the farmer's naming; the "
+          "built row is fully automatic. Close rows mean the length of the onboarding is not what limits it.", ""]
+    return L
+
+
+def compare_main(argv):
+    p = argparse.ArgumentParser(description="compare two system_e.json scored on the same hour")
+    p.add_argument("--main", required=True)
+    p.add_argument("--control", required=True)
+    p.add_argument("--append", required=True, help="the results page to add the comparison to")
+    a = p.parse_args(argv)
+    L = compare_onboarding(json.load(open(a.main, encoding="utf-8")), json.load(open(a.control, encoding="utf-8")))
+    with open(a.append, "a", encoding="utf-8") as fh:
+        fh.write("\n" + "\n".join(L))
+    print("\n".join(L), flush=True)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(compare_main(sys.argv[2:]) if sys.argv[1:2] == ["compare"] else main())

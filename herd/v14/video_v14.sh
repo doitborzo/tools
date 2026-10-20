@@ -14,6 +14,9 @@
 #        CENTER=off (on: v14 C - the barn's average cow taken out of the fingerprints)  NAME=V14A
 #        MODE=e: v14 E (system_e.py: no tracking model, every box named on its own); TAG then picks the
 #        album the video shows: e_built, e_confirmed (default) or e_oracle
+#        CONTROL_START + CONTROL_MIN (MODE=e): the same scored hours again after an onboarding from
+#        CONTROL_START of CONTROL_MIN minutes - its scores in <NAME>_RESULTS/control/, the two side by side
+#        at the end of RESULTS.md (v14 G: three hours of onboarding against one)
 # -> /workspace/<NAME>_VIDEO.tar (the clips), <NAME>_RESULTS.tar (RESULTS.md + scores), <NAME>_MODELS.tgz
 
 set -euo pipefail
@@ -27,8 +30,17 @@ TAG="${TAG:-assoc}"
 SYS_END="${SYS_END:-13.5}"
 SYS_START="${SYS_START:-12}"
 SETUP_MIN="${SETUP_MIN:-60}"
+CONTROL_START="${CONTROL_START:-}"
+CONTROL_MIN="${CONTROL_MIN:-}"
 FPS="${FPS:-5}"
+if [ -z "${CLIPS:-}" ] && { [ "$SYS_START" != 12 ] || [ "$SETUP_MIN" != 60 ]; }; then
+    # clips in the scored part: its first 3:20, 10:00-16:40 into it, 50:00-53:20 into it
+    e=$(awk -v s="$SYS_START" -v m="$SETUP_MIN" 'BEGIN { printf "%d", s * 60 + m }')
+    hm() { printf '%02d:%02d:%02d' $(( ($1 + $2 / 60) / 60 )) $(( ($1 + $2 / 60) % 60 )) $(( $2 % 60 )); }
+    CLIPS="$(hm "$e" 0)-$(hm "$e" 200) $(hm "$e" 600)-$(hm "$e" 1000) $(hm "$e" 3000)-$(hm "$e" 3200)"
+fi
 CLIPS="${CLIPS:-12:00-12:10 13:00-13:10 13:10-13:30}"
+VER="${NAME#V14}"; [ "${#VER}" = 1 ] || VER=E          # the version's letter on the results page
 DET_NAME="${DET_NAME:-detector_rfdetr_large_zenodo_mmcows_opencows_ft}"
 CENTER="${CENTER:-off}"
 NAME="${NAME:-V14A}"
@@ -55,7 +67,7 @@ if [ -z "${V14V_IN_TMUX:-}" ]; then
     [ "$TAG" = iou_per_camera ] || [ "$MODE" = e ] || [ -f "$V/assoc/assoc.pt" ] || { echo "missing $V/assoc/assoc.pt"; exit 1; }
     if tmux has-session -t "=$SESSION" 2>/dev/null; then echo "already running: bash $0 log"; exit 1; fi
     knobs=""
-    for v in WORK TAG SYS_START SETUP_MIN SYS_END FPS CLIPS DET_NAME CENTER NAME REALTIME TITLE IDNET MODE; do knobs+="$v=$(printf '%q' "${!v}") "; done
+    for v in WORK TAG SYS_START SETUP_MIN SYS_END CONTROL_START CONTROL_MIN FPS CLIPS DET_NAME CENTER NAME REALTIME TITLE IDNET MODE; do knobs+="$v=$(printf '%q' "${!v}") "; done
     env -u TMUX tmux new-session -d -s "$SESSION" -x 200 -y 50 \
         "env V14V_IN_TMUX=1 $knobs bash $(printf '%q' "$HERE/video_v14.sh"); echo; echo '[video_v14.sh finished]'; exec bash"
     echo "Started in tmux session '$SESSION'.  log: bash $0 log"
@@ -76,11 +88,19 @@ S="$V/system_video"; [ "$NAME" = V14A ] || S="$V/system_$NAME"
 if [ -f "$S/names_$TAG.json" ]; then echo "done already: $S/names_$TAG.json"
 elif [ "$MODE" = e ]; then
     "$PY" system_e.py --data "$V/mmcows" --detector "$WORK/herd/$DET_NAME/best" --idnet "$IDNET" \
-        --out "$S" --start "$SYS_START" --end "$SYS_END" --setup-min "$SETUP_MIN" --step 2
+        --out "$S" --start "$SYS_START" --end "$SYS_END" --setup-min "$SETUP_MIN" --step 2 --version "$VER"
 else
     ASSOC="$V/assoc/assoc.pt"; [ "$TAG" = iou_per_camera ] && ASSOC=none
     "$PY" system.py --data "$V/mmcows" --detector "$WORK/herd/$DET_NAME/best" --idnet "$IDNET" \
         --assoc "$ASSOC" --out "$S" --start "$SYS_START" --end "$SYS_END" --setup-min "$SETUP_MIN" --step 2 --center "$CENTER"
+fi
+
+if [ "$MODE" = e ] && [ -n "$CONTROL_START" ]; then
+    step "2b/3  the control: the same scored hours after $CONTROL_MIN min of onboarding from $CONTROL_START h"
+    if [ -f "$S/control/system_e.json" ]; then echo "done already: $S/control/system_e.json"; else
+        "$PY" system_e.py --data "$V/mmcows" --detector "$WORK/herd/$DET_NAME/best" --idnet "$IDNET" --out "$S/control" \
+            --start "$CONTROL_START" --end "$SYS_END" --setup-min "$CONTROL_MIN" --step 2 --version "$VER, control"
+    fi
 fi
 
 step "3/3  videos, results and weights: $CLIPS"
@@ -104,11 +124,15 @@ R="$WORK/${NAME}_RESULTS"
 rm -rf "$R"; mkdir -p "$R/work/system"
 cp "$SYSJ" "$R/work/system/$(basename "$SYSJ")"
 [ "$MODE" = e ] && cp "$S/RESULTS_E.md" "$R/RESULTS.md"
+if [ "$MODE" = e ] && [ -f "$S/control/system_e.json" ]; then
+    mkdir -p "$R/control" && cp "$S/control/system_e.json" "$S/control/RESULTS_E.md" "$R/control/"
+    "$PY" system_e.py compare --main "$S/system_e.json" --control "$S/control/system_e.json" --append "$R/RESULTS.md" > /dev/null
+fi
 ID_DIR="$(dirname "$IDNET")"
 for f in eval_id.json history.json; do [ -f "$ID_DIR/$f" ] && mkdir -p "$R/work/idnet" && cp "$ID_DIR/$f" "$R/work/idnet/"; done
 for f in eval_assoc.json history.json; do [ -f "$V/assoc/$f" ] && mkdir -p "$R/work/assoc" && cp "$V/assoc/$f" "$R/work/assoc/"; done
-VER="${NAME#V14}"; [ "$VER" = A ] && VER=""
-[ "$MODE" = e ] || "$PY" summarize.py --work "$R/work" --out "$R" ${VER:+--version "$VER"} > /dev/null
+SVER="$VER"; [ "$SVER" = A ] && SVER=""
+[ "$MODE" = e ] || "$PY" summarize.py --work "$R/work" --out "$R" ${SVER:+--version "$SVER"} > /dev/null
 for d in system idnet assoc; do [ -d "$R/work/$d" ] && mv "$R/work/$d" "$R/$d"; done; rm -rf "$R/work"
 cp "$S/names_$TAG.json" "$R/system/"
 cp "$LOG" "$R/" 2>/dev/null || true
