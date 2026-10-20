@@ -648,3 +648,43 @@ def test_v14f_pictures_of_mmcows_boxes_and_combine():
         import opencowid as O
         st = O.ImageStore(comb)
         assert st.days() == ["testA", "testB", "train"] and st.image(1, 32).size == (32, 32)
+
+
+def test_freshness_finds_a_drifting_look():
+    """Made-up day: every cow's look drifts slowly, so an album fits the minutes around it best."""
+    import freshness as Fr
+    import idnet
+    rng = np.random.default_rng(5)
+    cows, dim, t0 = 8, 32, 1690275600.0                          # 05:00 local
+    base = rng.normal(size=(cows, dim))
+    walk = np.cumsum(rng.normal(scale=0.12, size=(600, cows, dim)), 0)   # the look drifts minute by minute
+    frames, rows, feats = [], [], []
+    for m in range(0, 600, 1):
+        boxes = []
+        for c in range(cows):
+            x = 0.1 + 0.1 * c + (0.2 if m > 300 else 0.0) * (c % 2)     # odd cows move to another spot at minute 300
+            b = [min(x, 0.9), 0.4, min(x + 0.08, 0.98), 0.5]
+            boxes.append([c, b])
+            rows.append({"frame": len(frames), "cow": c, "box": b})
+            feats.append(base[c] + walk[m, c] + rng.normal(scale=0.3, size=dim))
+        frames.append({"cam": "cam_1", "ts": t0 + 60 * m + 1, "split": "train", "boxes": boxes})
+    with tempfile.TemporaryDirectory() as d:
+        np.savez(os.path.join(d, "assoc.npz"), box_feats=np.array(feats, np.float16))
+        for name, data in (("frames.jsonl", frames), ("assoc_rows.jsonl", rows)):
+            with open(os.path.join(d, name), "w") as fh:
+                for r in data:
+                    fh.write(json.dumps(r) + "\n")
+        Fr.main(["--data", d, "--model", "none", "--out", os.path.join(d, "fr"), "--min-cows", "8", "--every-min", "60"])
+        out = json.load(open(os.path.join(d, "fr", "freshness.json")))
+        g = out["by_gap"]
+        assert g["+0..+5"]["top1"] > 0.9 and g[">= +180"]["top1"] < g["+0..+5"]["top1"] - 0.3
+        assert g["-5..+0"]["top1"] > g["-180..-120"]["top1"]          # stale in both directions
+        assert all(out["by_window_near"][h]["top1"] > out["by_window_far"][h]["top1"] for h in out["by_window_far"])
+        assert out["chance"] == pytest.approx(1 / 8)
+        assert any("| moved" in k for k in out["by_gap_and_place"]) and any("| same spot" in k for k in out["by_gap_and_place"])
+        # with an ID model (untrained here): runs on one-frame sequences
+        m = idnet.build(dim, d=16, layers=1, heads=2)
+        torch.save({"kw": m.kw, "state": m.state_dict(), "epoch": 0, "split": {}, "feats": {}}, os.path.join(d, "idnet.pt"))
+        Fr.main(["--data", d, "--idnet", os.path.join(d, "idnet.pt"), "--out", os.path.join(d, "fr2"), "--min-cows", "8",
+                 "--every-min", "120"])
+        assert os.path.exists(os.path.join(d, "fr2", "FRESHNESS.md"))
