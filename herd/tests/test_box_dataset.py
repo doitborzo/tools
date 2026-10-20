@@ -1,5 +1,6 @@
 """Datasets from the barn's recordings: frames + boxes for the detector, the cache for identity."""
 import _paths  # noqa: F401
+import collections
 import json
 import os
 import sys
@@ -246,3 +247,89 @@ def test_fix_videos_command():
     assert enc[-1] == "out.mp4" and "libx264" in enc
     cp = fix_videos.command("in.mkv", "out.mp4", 25.0, copy=True)
     assert "copy" in cp and "libx264" not in cp
+
+
+def test_one_camera_cut_again_after_its_zone_changed():
+    import box_dataset
+    with tempfile.TemporaryDirectory() as d:
+        cfg, rec = _setup(d)
+        out = os.path.join(d, "boxes")
+        box_dataset.main(["frames", "--config", cfg, "--videos", rec, "--out", out, "--every", "10", "--detector", "none"])
+        fr = json.load(open(os.path.join(out, "frames.json")))["frames"]
+        lp = os.path.join(d, "labels.json")
+        # labelled: one box in the top band, one below it
+        json.dump({"frames": {f["file"]: {"status": "done", "boxes": [[0.1, 0.4, 0.3, 0.8], [0.4, 0.3, 0.5, 0.36]]}
+                              for f in fr}}, open(lp, "w"))
+        # cam1's exclude zone grows to y 0.4: its frames cut again, the detector looks again
+        text = open(cfg).read()
+        open(cfg, "w").write(text.replace("[1.0, 0.2], [0.0, 0.2]", "[1.0, 0.4], [0.0, 0.4]"))
+        sys.modules["detector"] = types.SimpleNamespace(Live=_StubLive)
+        try:
+            box_dataset.main(["frames", "--config", cfg, "--videos", rec, "--out", out, "--every", "10",
+                              "--cameras", "cam1", "--again"])
+        finally:
+            del sys.modules["detector"]
+        fr2 = json.load(open(os.path.join(out, "frames.json")))["frames"]
+        c1 = [f for f in fr2 if f["cam"] == "cam1"]
+        assert len(fr2) == len(fr) and all(f.get("cut") and f["exclude"][2] == [1.0, 0.4] and f["boxes"] for f in c1)
+        assert not any(f.get("cut") for f in fr2 if f["cam"] == "cam2")
+        from PIL import Image
+        im = np.asarray(Image.open(os.path.join(out, c1[0]["file"])))
+        assert abs(int(im[int(0.3 * im.shape[0]), 160, 0]) - 114) < 8                # the new grey
+        # export: cam1's labels are from before the new cut - left out until checked; cam2's go
+        tgz = os.path.join(d, "x.tgz")
+        box_dataset.main(["export", "--data", out, "--labels", lp, "--out", tgz, "--block-min", "1"])
+        with tarfile.open(tgz) as t:
+            names = [m.name for m in t.getmembers() if m.name.endswith(".jpg")]
+        assert names and all("cam2_" in n for n in names)
+        # checked on the page (the label carries the cut): back in, the box now in the grey left out
+        labels = json.load(open(lp))["frames"]
+        for f in c1:
+            labels[f["file"]]["cut"] = f["cut"]
+        json.dump({"frames": labels}, open(lp, "w"))
+        box_dataset.main(["export", "--data", out, "--labels", lp, "--out", tgz, "--block-min", "1"])
+        work = os.path.join(d, "w")
+        with tarfile.open(tgz) as t:
+            t.extractall(work)
+        coco = [json.load(open(os.path.join(work, "extra_det", "barn", s, "_annotations.coco.json"))) for s in ("train", "valid")]
+        per = collections.Counter(a["image_id"] for c in coco for a in c["annotations"])
+        ims = {(s, im["id"]): im["file_name"] for s, c in zip(("t", "v"), coco) for im in c["images"]}
+        assert any(n.startswith("cam1_") for n in ims.values())
+        cam1_boxes = [len([a for a in c["annotations"] if a["image_id"] == im["id"]]) for c in coco for im in c["images"]
+                      if im["file_name"].startswith("cam1_")]
+        assert cam1_boxes and set(cam1_boxes) == {1}                                 # the one in the grey dropped
+        cam2_boxes = [len([a for a in c["annotations"] if a["image_id"] == im["id"]]) for c in coco for im in c["images"]
+                      if im["file_name"].startswith("cam2_")]
+        assert set(cam2_boxes) == {2}
+
+
+def test_barn_video_one_camera_again():
+    import barn_dataset
+    import pipeline
+    with tempfile.TemporaryDirectory() as d:
+        cfg, rec = _setup(d)
+        out = os.path.join(d, "vid")
+        played = []
+
+        def _run(c, start, models=None, status=None):
+            played.append([x["id"] for x in c["cameras"]])
+            return {}
+        old = pipeline.Models, pipeline.run
+        pipeline.Models, pipeline.run = (lambda c: object()), _run
+        try:
+            barn_dataset.main(["video", "--config", cfg, "--videos", rec, "--out", out])
+            # an earlier burst of each camera in the cache
+            day = os.path.join(out, "training_cache", "2026-10-20")
+            for cam in ("cam1", "cam2"):
+                os.makedirs(os.path.join(day, cam), exist_ok=True)
+                open(os.path.join(day, cam, "x.npz"), "w").close()
+            with open(os.path.join(day, "index.jsonl"), "w") as fh:
+                for cam in ("cam1", "cam2"):
+                    fh.write(json.dumps({"file": f"2026-10-20/{cam}/x.npz", "cam": cam, "track": cam + "-1", "day": "2026-10-20"}) + "\n")
+            played.clear()
+            barn_dataset.main(["video", "--config", cfg, "--videos", rec, "--out", out, "--cameras", "cam1"])
+            assert played == [["cam1"], ["cam1"]]                 # both cam1 recordings, cam2 not
+            rows = barn_dataset.read_cache(os.path.join(out, "training_cache"))
+            assert [r["cam"] for r in rows] == ["cam2"] and not os.path.exists(os.path.join(day, "cam1"))
+        finally:
+            pipeline.Models, pipeline.run = old

@@ -173,6 +173,21 @@ the pod's `/workspace`. Training writes new archives
 (`herd_reid_*.tgz`, a detector in `herd_models_*.tgz`). Put those in `docker/models/` (move the old
 ones out) and build again.
 
+**One camera's zone changed** (`zones page` → `zones apply` again). Redo only that camera:
+
+```bash
+docker compose run --rm herd barn video --config /data/barn.toml --videos /data/rec_fixed --out /data/barn_video --cameras cam2
+docker compose run --rm herd barn sheet --cache /data/barn_video/training_cache --out /data/barn_video/tracks.html
+docker compose run --rm herd boxes frames --config /data/barn.toml --videos /data/rec_fixed --out /data/boxes --every 10 --cameras cam2 --again
+```
+
+- `barn video --cameras`: that camera's earlier bursts are removed and its recordings played again;
+  the other cameras' bursts and names stay. Its tracks get new names on the page, so name them again.
+- `boxes frames --cameras ... --again`: that camera's frames are cut again at the same moments with
+  the new grey zone, and the detector looks again. Your boxes on them stay, minus those now in the
+  grey. The page marks each of them "cut again - check it": look, press Enter, Save labels.json. Until
+  then, `boxes export` leaves them out.
+
 ## 6. The barn, live
 
 ```bash

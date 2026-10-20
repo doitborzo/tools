@@ -74,6 +74,54 @@ def changed(a, b, min_change):
     return b is None or float(np.abs(a.astype(np.int16) - b.astype(np.int16)).mean()) >= min_change
 
 
+def cut_frame(cap, i, c, width):
+    """Frame i of an open recording as the detector sees it in the barn (frame_width, the exclude zone grey)."""
+    import cv2
+    cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+    ok, f = cap.read()
+    if not ok:
+        return None
+    img = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+    h, w = img.shape[:2]
+    if w > width:                                        # as Camera.push
+        img = cv2.resize(img, (width, int(h * width / w)), interpolation=cv2.INTER_AREA)
+    if c.get("blank_excluded", True):                   # as Camera.blank
+        img = blank_excluded(img, c.get("exclude"))
+    return img
+
+
+def recut(index, out, by_cam, cams, width, again):
+    """The frames already cut of these cameras, cut again from their recordings at the same moments with
+    the camera's zone as the config has it now (an exclude zone changed); the detector looks again, and
+    the page asks to check each of them again (a label made before keeps its boxes, minus those now in
+    the grey)."""
+    import cv2
+    from PIL import Image
+    n, missing = collections.Counter(), collections.Counter()
+    stamp = int(dt.datetime.now().timestamp())
+    for f in index["frames"]:
+        if f["cam"] not in again:
+            continue
+        src = [r for r in by_cam.get(f["cam"], []) if r[1] - 1 <= f["ts"] <= r[1] + r[3] / r[2] + 1]
+        if not src:
+            missing[f["cam"]] += 1
+            continue
+        path, start, fps, _ = src[0]
+        cap = cv2.VideoCapture(path)
+        img = cut_frame(cap, f.get("frame", int(round((f["ts"] - start) * fps))), cams[f["cam"]], width)
+        cap.release()
+        if img is None:
+            missing[f["cam"]] += 1
+            continue
+        Image.fromarray(img).save(os.path.join(out, f["file"]), quality=92)
+        f.update(w=int(img.shape[1]), h=int(img.shape[0]), cut=stamp, exclude=cams[f["cam"]].get("exclude") or [])
+        f.pop("boxes", None)
+        n[f["cam"]] += 1
+    for cam in sorted(again):
+        print(f"[boxes] {cam}: {n[cam]} frames cut again with its zone as now"
+              + (f"; {missing[cam]} not found in the recordings (left as they were)" if missing[cam] else ""), flush=True)
+
+
 def cmd_frames(args):
     import cv2
     from PIL import Image
@@ -97,7 +145,12 @@ def cmd_frames(args):
             print(f"[boxes] {len(bad)} files without a camera id or a time in their name - skipped, e.g. {bad[0]}")
         if not recs:
             sys.exit(f"no recordings under {args.videos} named <camera>..<YYYY-MM-DD_HH-MM-SS>")
-    out = os.path.abspath(args.out)
+    if args.cameras:
+        unknown = sorted(set(args.cameras) - set(cams))
+        if unknown:
+            sys.exit(f"--cameras {' '.join(unknown)}: not in {args.config} ({', '.join(cams)})")
+        recs = [r for r in recs if r[0] in args.cameras]
+    out = os.path.abspath(args.out.rstrip("\\"))
     index_path = os.path.join(out, "frames.json")
     index = json.load(open(index_path, encoding="utf-8")) if os.path.exists(index_path) else {"frames": []}
     have = {f["file"] for f in index["frames"]}
@@ -109,6 +162,8 @@ def cmd_frames(args):
             print(f"[boxes] cannot open {path} - skipped")
             continue
         by_cam[cam].append((path, ts) + info)
+    if args.cameras and args.again:
+        recut(index, out, by_cam, cams, width, set(args.cameras))
     for cam, rs in sorted(by_cam.items()):
         c = cams[cam]
         plan = plan_times(rs, args.every, args.max)
@@ -125,23 +180,17 @@ def cmd_frames(args):
                 if cap is not None:
                     cap.release()
                 cap, cap_path = cv2.VideoCapture(path), path
-            cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-            ok, f = cap.read()
-            if not ok:
+            img = cut_frame(cap, i, c, width)
+            if img is None:
                 continue
-            img = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
-            h, w = img.shape[:2]
-            if w > width:                                        # as Camera.push
-                img = cv2.resize(img, (width, int(h * width / w)), interpolation=cv2.INTER_AREA)
-            if c.get("blank_excluded", True):                   # as Camera.blank: what the detector sees
-                img = blank_excluded(img, c.get("exclude"))
             small = cv2.resize(cv2.cvtColor(img, cv2.COLOR_RGB2GRAY), (64, 36), interpolation=cv2.INTER_AREA)
             if not changed(small, last, args.min_change):
                 continue
             last = small
             Image.fromarray(img).save(os.path.join(out, rel), quality=92)
             index["frames"].append({"file": rel, "cam": cam, "ts": ts, "w": img.shape[1], "h": img.shape[0],
-                                    "time": dt.datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M:%S")})
+                                    "time": dt.datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M:%S"),
+                                    "frame": i, "exclude": c.get("exclude") or []})
             have.add(rel)
             kept += 1
         if cap is not None:
@@ -176,6 +225,13 @@ def detect(index, out, weights, cfg):
             f["boxes"] = [[round(v, 4) for v in d["bbox"]] + [round(float(d["det_score"]), 3)] for d in found]
         print(f"\r  {min(k + 4, len(todo))}/{len(todo)}", end="", flush=True)
     print(flush=True)
+
+
+def in_grey(box, exclude):
+    """A box whose centre lies in one of the exclude polygons (greyed for the detector)."""
+    from common import _polys, in_polygon
+    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    return any(in_polygon(cx, cy, p) for p in _polys(exclude))
 
 
 def read_labels(path):
@@ -248,12 +304,22 @@ def cmd_export(args):
     src = os.path.abspath(args.data)
     index = json.load(open(os.path.join(src, "frames.json"), encoding="utf-8"))
     labels = read_labels(args.labels)
-    done = []
+    done, stale, grey = [], 0, 0
     for f in index["frames"]:
         lab = labels.get(f["file"])
         if lab and lab.get("status") == "done":
+            if f.get("cut") and lab.get("cut") != f["cut"]:    # cut again (its zone changed) since it was labelled
+                stale += 1
+                continue
             boxes = [b[:4] for b in lab.get("boxes", []) if b[2] - b[0] > 0.002 and b[3] - b[1] > 0.002]
-            done.append(dict(f, labelled=boxes))
+            keep = [b for b in boxes if not in_grey(b, f.get("exclude"))]
+            grey += len(boxes) - len(keep)
+            done.append(dict(f, labelled=keep))
+    if stale:
+        print(f"[boxes] {stale} frames were cut again after they were labelled - left out until checked on the page "
+              f"(boxes page, then Enter on each; Save labels.json)")
+    if grey:
+        print(f"[boxes] {grey} boxes in a camera's excluded (grey) zone left out")
     if len(done) < 2:
         sys.exit(f"{len(done)} frames marked done in {args.labels}: label more (Enter on the page marks a frame done)")
     tr, va = split_blocks(done, args.val_share, args.block_min * 60, args.seed)
@@ -289,7 +355,7 @@ button,select{font:inherit;color:inherit;background:var(--card);border:1px solid
 button.main{background:var(--accent);color:var(--bg);border-color:var(--accent)}
 .mute{color:var(--mute)}.help{color:var(--mute);font-size:13px;margin:2px 0}
 main{padding:8px 16px 30px}#wrap{position:relative;overflow:auto;max-height:82vh}canvas{display:block;max-width:100%;touch-action:none;cursor:crosshair;border-radius:6px;background:#000}
-#status.done{color:var(--done);font-weight:600}#status.skip{color:var(--skip);font-weight:600}
+#status.done{color:var(--done);font-weight:600}#status.skip,#status.stale{color:var(--skip);font-weight:600}
 kbd{border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:12px}
 </style></head><body>
 <header>
@@ -330,15 +396,22 @@ $("cam").innerHTML = '<option value="">all cameras</option>' + cams.map(c => `<o
 function filter(keep) {
   const c = $("cam").value, todo = $("todo").checked;
   order = DATA.frames.map((f, i) => i).filter(i => (!c || DATA.frames[i].cam === c) &&
-    (!todo || !labels[DATA.frames[i].file] || !labels[DATA.frames[i].file].status || i === keep));
+    (!todo || !labels[DATA.frames[i].file] || !labels[DATA.frames[i].file].status || stale(DATA.frames[i]) || i === keep));
   at = Math.max(0, order.indexOf(keep));
 }
 function frame() { return DATA.frames[order[at]]; }
+function inPoly(x, y, p) { let ins = false; for (let i = 0, j = p.length - 1; i < p.length; j = i++) {
+  const [x1, y1] = p[i], [x2, y2] = p[j]; if ((y1 > y) !== (y2 > y) && x < (x2 - x1) * (y - y1) / (y2 - y1 + 1e-12) + x1) ins = !ins; } return ins; }
+function polys(m) { return !m || !m.length ? [] : (Array.isArray(m[0][0]) ? m : [m]); }
+const grey = (f, b) => polys(f.exclude).some(p => inPoly((b[0] + b[2]) / 2, (b[1] + b[3]) / 2, p));
+// a label made before the frame was cut again (its camera's zone changed) is to be checked again
+const stale = f => f && f.cut && labels[f.file] && labels[f.file].cut !== f.cut;
+const isDone = f => labels[f.file] && labels[f.file].status === "done" && !stale(f);
 function open() {
   const f = frame();
   if (!f) { ctx.clearRect(0, 0, cv.width, cv.height); $("pos").textContent = "0 / 0"; $("info").textContent = "no frames here"; return; }
   const lab = labels[f.file], [det, low] = detBoxes(f);
-  boxes = lab ? lab.boxes.map(b => b.slice()) : det;
+  boxes = lab ? lab.boxes.map(b => b.slice()).filter(b => !grey(f, b)) : det;
   cands = low.filter(c => !boxes.some(b => iou(b, c) > 0.5));
   sel = -1; undo = [];
   img = new Image();
@@ -357,11 +430,11 @@ function fit() {
   cv.width = Math.round(img.naturalWidth * scale); cv.height = Math.round(img.naturalHeight * scale);
 }
 function status() {
-  const f = frame(), s = f && labels[f.file] ? labels[f.file].status || "" : "";
-  $("status").textContent = s === "done" ? "done" : s === "skip" ? "skipped" : "not done";
+  const f = frame(), s = f && labels[f.file] ? (stale(f) ? "stale" : labels[f.file].status || "") : "";
+  $("status").textContent = s === "done" ? "done" : s === "skip" ? "skipped" : s === "stale" ? "cut again - check it, Enter" : "not done";
   $("status").className = s;
-  const all = Object.values(labels), d = all.filter(l => l.status === "done");
-  $("stat").textContent = `${d.length} of ${DATA.frames.length} frames done, ${d.reduce((n, l) => n + l.boxes.length, 0)} cows, ${all.filter(l => l.status === "skip").length} skipped`;
+  const all = DATA.frames.filter(isDone).map(f => labels[f.file]), d = all;
+  $("stat").textContent = `${d.length} of ${DATA.frames.length} frames done, ${d.reduce((n, l) => n + l.boxes.length, 0)} cows, ${DATA.frames.filter(f => labels[f.file] && labels[f.file].status === "skip" && !stale(f)).length} skipped${DATA.frames.some(stale) ? `, ${DATA.frames.filter(stale).length} cut again - to check` : ""}`;
 }
 function draw() {
   ctx.drawImage(img, 0, 0, cv.width, cv.height);
@@ -379,7 +452,8 @@ function draw() {
 const corners = b => [[b[0], b[1]], [b[2], b[1]], [b[2], b[3]], [b[0], b[3]]];
 function edited() {
   const f = frame();
-  labels[f.file] = {status: labels[f.file] ? labels[f.file].status || "" : "", boxes: boxes.map(b => b.map(v => Math.round(v * 1e4) / 1e4))};
+  const was = labels[f.file] || {};
+  labels[f.file] = {status: was.status || "", cut: was.cut, boxes: boxes.map(b => b.map(v => Math.round(v * 1e4) / 1e4))};
   store(); status(); draw();
 }
 function push() { undo.push(JSON.stringify([boxes, cands])); if (undo.length > 50) undo.shift(); }
@@ -439,7 +513,7 @@ cv.addEventListener("pointerup", () => {
 });
 function mark(s) {
   const f = frame(); if (!f) return;
-  labels[f.file] = {status: s, boxes: boxes.map(b => b.map(v => Math.round(v * 1e4) / 1e4))};
+  labels[f.file] = {status: s, cut: f.cut, boxes: boxes.map(b => b.map(v => Math.round(v * 1e4) / 1e4))};
   store(); status();
   if (at + 1 < order.length) { at++; open(); } else draw();
 }
@@ -491,6 +565,9 @@ def main(argv=None):
     f.add_argument("--max", type=int, default=300, help="frames a camera at most, spread over all its recordings")
     f.add_argument("--min-change", type=float, default=3.0, help="a frame this little changed (0-255) is skipped")
     f.add_argument("--detector", default=None, help="a best/ folder (default: the config's); none: no first guess")
+    f.add_argument("--cameras", nargs="*", default=None, help="only these cameras")
+    f.add_argument("--again", action="store_true", help="with --cameras: their frames already cut are cut again "
+                   "with the zone as the config has it now (an exclude zone changed) and looked at again")
     g = sub.add_parser("page", help="the labelling page again (after a code update, or with a labels.json)")
     g.add_argument("--data", required=True)
     g.add_argument("--labels", default=None)

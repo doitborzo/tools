@@ -486,6 +486,25 @@ def cmd_export(args):
               f"from the others - name the same cows on more days")
 
 
+def drop_cameras(folder, cams):
+    """These cameras' bursts out of a training cache (index lines and files) -> how many."""
+    import shutil
+    n = 0
+    for day in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+        p = os.path.join(folder, day, "index.jsonl")
+        if not os.path.exists(p):
+            continue
+        with open(p, encoding="utf-8") as fh:
+            lines = [line for line in fh if line.strip()]
+        keep = [line for line in lines if json.loads(line)["cam"] not in cams]
+        n += len(lines) - len(keep)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.writelines(keep)
+        for cam in cams:
+            shutil.rmtree(os.path.join(folder, day, cam), ignore_errors=True)
+    return n
+
+
 def cmd_video(args):
     """Recordings of the barn's cameras -> the training cache, as the live barn would fill it - but every
     burst kept, a burst every --burst-every s, into a store of its own (the barn's database untouched).
@@ -521,6 +540,19 @@ def cmd_video(args):
     os.makedirs(out, exist_ok=True)
     done_path = os.path.join(out, "videos_done.txt")
     done = set(open(done_path, encoding="utf-8").read().split("\n")) if os.path.exists(done_path) else set()
+    if args.cameras:                         # these cameras again (their zone changed): their bursts made anew
+        unknown = sorted(set(args.cameras) - set(ids))
+        if unknown:
+            sys.exit(f"--cameras {' '.join(unknown)}: not in {args.config} ({', '.join(ids)})")
+        groups = [[r for r in g if r[0] in args.cameras] for g in groups]
+        groups = [g for g in groups if g]
+        again = {p for g in groups for _, p, _ in g}
+        done -= again
+        with open(done_path, "w", encoding="utf-8") as fh:
+            fh.writelines(p + "\n" for p in sorted(done) if p)
+        n = drop_cameras(os.path.join(out, "training_cache"), args.cameras)
+        print(f"[video] {', '.join(args.cameras)} again: {n} of their earlier bursts removed; their tracks get new "
+              f"names on the page (merges.csv lines of their old tracks no longer match)", flush=True)
     if args.gallery and not os.path.exists(os.path.join(out, "gallery")):
         shutil.copytree(args.gallery, os.path.join(out, "gallery"))      # its guesses help naming the cows
         print(f"[video] the gallery copied from {args.gallery}", flush=True)
@@ -583,6 +615,8 @@ def main(argv=None):
     v.add_argument("--out", required=True, help="its store, gallery and training_cache/")
     v.add_argument("--burst-every", type=float, default=20.0, help="a burst every this many s a camera")
     v.add_argument("--gap", type=float, default=300.0, help="recordings starting within this many s play together")
+    v.add_argument("--cameras", nargs="*", default=None, help="only these cameras, played again (e.g. after "
+                   "their zone changed): their earlier bursts are removed first")
     v.add_argument("--gallery", default=None, help="the barn's gallery/ copied in first: its guesses on the page")
     x = sub.add_parser("export", help="named tracks -> herd_barn_feat_*.tgz for the identity model (reid_pod.sh)")
     x.add_argument("--cache", required=True)
