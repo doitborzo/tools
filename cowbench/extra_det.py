@@ -119,6 +119,37 @@ class RemoteZip:
         return read_member(self.get, self.zip.getinfo(name))
 
 
+class SplitRemoteZip(RemoteZip):
+    """One zip published as consecutive pieces (`split` output: <zip>.part.aa, .ab, ...), read as one through
+    HTTP Range requests on the pieces - MmCows' full-day 1-second zips come this way."""
+
+    def __init__(self, urls, tries=6):
+        self.url, self.tries = urls[0], tries
+        self.parts = []
+        for u in urls:
+            part = object.__new__(RemoteZip)
+            part.url, part.tries = u, tries
+            part._resolve()
+            self.parts.append(part)
+        self.starts = [0]
+        for part in self.parts:
+            self.starts.append(self.starts[-1] + part.size)
+        self.size = self.starts[-1]
+        self.zip = zipfile.ZipFile(io.BufferedReader(_RangeFile(self), buffer_size=1 << 20))
+
+    def _resolve(self):
+        pass
+
+    def get(self, start, end):
+        out = []
+        for part, a in zip(self.parts, self.starts):
+            b = a + part.size - 1
+            if end < a or start > b:
+                continue
+            out.append(part.get(max(start, a) - a, min(end, b) - a))
+        return b"".join(out)
+
+
 class LocalZip:
     """The same two calls on a zip downloaded whole."""
 
