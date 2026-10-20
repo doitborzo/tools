@@ -564,7 +564,11 @@ button.main{background:var(--accent);color:var(--bg);border-color:var(--accent)}
 .row{display:grid;grid-template-columns:200px 1fr;gap:8px;padding:4px 0;border-top:1px solid var(--line)}
 .row:first-of-type{border-top:0}.thumbs{display:flex;flex-wrap:wrap;gap:3px}.thumbs img{height:96px;border-radius:4px}
 .mute{color:var(--mute)}.row input{width:100%;margin-top:4px}
-@media (max-width:640px){header{position:static}.row{grid-template-columns:1fr}.thumbs img{height:72px}}
+.match{display:grid;grid-template-columns:1fr 1fr;gap:12px}.match .ref{position:sticky;top:120px;max-height:80vh;overflow:auto}
+.cand{border:1px solid var(--line);border-radius:8px;background:var(--card);padding:4px 6px;margin:4px 0;cursor:pointer}
+.cand:hover{border-color:var(--accent)}.cand img{height:64px;border-radius:3px;margin-right:2px}
+.row.cur{outline:2px solid var(--accent);border-radius:6px}.row.donep{opacity:.55}.warn{color:var(--warn)}
+@media (max-width:640px){header{position:static}.row{grid-template-columns:1fr}.thumbs img{height:72px}.match{grid-template-columns:1fr}}
 </style></head><body>
 <header><h1>Cow ids by camera: one id, one cow?</h1>
 <p class="help">Each group is one id; each row in it, that id on one camera, with her crops spread over the recording. If the rows
@@ -573,7 +577,11 @@ tag): rows with the same name become one cow on every camera. <b>x</b> removes t
 labels with the new ids - then <code>boxes ids</code> again (and on the box page: Load labels.json).</p>
 <div class="bar"><select id="cam"><option value="">all cameras</option></select>
 <label><input type="checkbox" id="single"> only ids on one camera</label><input id="find" placeholder="find an id" size="10">
-<button class="main" id="save">Save labels.json</button><span class="mute" id="stat"></span></div></header>
+<button class="main" id="save">Save labels.json</button><span class="mute" id="stat"></span></div>
+<div class="bar"><b>match cameras:</b> name the cows of <select id="ma"></select> by those of <select id="mb"></select>
+<button id="mgo">start</button><button id="mstop">back to the list</button>
+<span class="mute">click a cow on the right: the selected row on the left becomes her; "new cow" keeps it apart</span></div>
+<div class="bar warn" id="dups"></div></header>
 <main id="list"></main>
 <script>
 const DATA = __DATA__;
@@ -601,19 +609,73 @@ function render() {
       row.innerHTML = `<div><b>${esc(r.cam)}</b> <span class="mute">id ${esc(r.id)}, ${r.n} boxes${r.auto ? ` (${r.auto} filled in)` : ""}</span>
         <input placeholder="the cow it is" value="${esc(rename[k(r)] || "")}"></div>
         <div class="thumbs">${r.thumbs.map(t => `<img loading="lazy" src="${esc(t.src)}" title="${esc(t.time)}">`).join("")}</div>`;
-      row.querySelector("input").addEventListener("change", e => {
-        const v = e.target.value.trim();
-        if (v && v !== r.id) rename[k(r)] = v; else delete rename[k(r)];
-        try { localStorage.setItem(KEY, JSON.stringify(rename)); } catch (e2) {}
-        render();
-      });
+      row.querySelector("input").addEventListener("change", e => { setName(r, e.target.value); render(); });
       div.appendChild(row);
     });
     list.appendChild(div);
   });
+  stat(); dups();
+}
+let mode = null, curRow = 0;
+[...new Set(DATA.rows.map(r => r.cam))].sort().forEach((c, i) => {
+  $("ma").insertAdjacentHTML("beforeend", `<option ${i === 1 ? "selected" : ""}>${esc(c)}</option>`);
+  $("mb").insertAdjacentHTML("beforeend", `<option>${esc(c)}</option>`);
+});
+function setName(r, v) {
+  v = (v || "").trim();
+  if (v && v !== r.id) rename[k(r)] = v; else delete rename[k(r)];
+  try { localStorage.setItem(KEY, JSON.stringify(rename)); } catch (e) {}
+}
+function dups() {                    // one camera, two rows named the same cow: two cows on one frame under one id
+  const out = [];
+  [...new Set(DATA.rows.map(r => r.cam))].forEach(c => {
+    const n = {};
+    DATA.rows.filter(r => r.cam === c).forEach(r => (n[name(r)] = n[name(r)] || []).push(r.id));
+    Object.entries(n).filter(([, v]) => v.length > 1).forEach(([g, v]) => out.push(`${c}: ${v.join(" + ")} are all "${g}"`));
+  });
+  $("dups").textContent = out.length ? "One cow twice on one camera - check: " + out.join("; ") : "";
+}
+function renderMatch() {
+  const A = mode.a, B = mode.b, rowsA = DATA.rows.filter(r => r.cam === A), list = $("list");
+  const refs = {};
+  DATA.rows.filter(r => r.cam === B).forEach(r => (refs[name(r)] = refs[name(r)] || []).push(r));
+  list.innerHTML = `<div class="match"><div id="left"></div><div class="ref" id="right"></div></div>`;
+  rowsA.forEach((r, i) => {
+    const row = document.createElement("div");
+    const linked = name(r) in refs;
+    row.className = "row" + (i === curRow ? " cur" : "") + (linked ? " donep" : "");
+    row.innerHTML = `<div><b>${esc(r.cam)} ${esc(r.id)}</b><br><span class="mute">now: ${esc(name(r))}${linked ? " (= " + esc(B) + ")" : ""}</span></div>
+      <div class="thumbs">${r.thumbs.map(t => `<img loading="lazy" src="${esc(t.src)}" title="${esc(t.time)}">`).join("")}</div>`;
+    row.onclick = () => { curRow = i; renderMatch(); };
+    $("left").appendChild(row);
+  });
+  Object.keys(refs).sort((a, b) => a.localeCompare(b, undefined, {numeric: true})).forEach(g => {
+    const c = document.createElement("div"); c.className = "cand";
+    const thumbs = refs[g].flatMap(r => r.thumbs).slice(0, 5);
+    const taken = rowsA.some((r, i) => i !== curRow && name(r) === g);
+    c.innerHTML = `<b>${esc(g)}</b>${taken ? ' <span class="warn">(given to another row)</span>' : ""}<br>${thumbs.map(t => `<img loading="lazy" src="${esc(t.src)}">`).join("")}`;
+    c.onclick = () => { setName(rowsA[curRow], g); curRow = Math.min(rowsA.length - 1, curRow + 1); renderMatch(); stat(); };
+    $("right").appendChild(c);
+  });
+  const nc = document.createElement("div"); nc.className = "cand";
+  nc.innerHTML = `<b>new cow</b> <span class="mute">- not on ${esc(B)}: keep her own id</span>`;
+  nc.onclick = () => { setName(rowsA[curRow], ""); curRow = Math.min(rowsA.length - 1, curRow + 1); renderMatch(); stat(); };
+  $("right").prepend(nc);
+  const cur = $("left").querySelector(".cur"); if (cur) cur.scrollIntoView({block: "nearest"});
+  dups();
+}
+function stat() {
   const ids = new Set(DATA.rows.map(name)), multi = [...ids].filter(g => new Set(DATA.rows.filter(r => name(r) === g).map(r => r.cam)).size > 1);
   $("stat").textContent = `${ids.size} cows, ${multi.length} of them on 2+ cameras; ${Object.keys(rename).length} rows renamed`;
 }
+$("mgo").onclick = () => { if ($("ma").value === $("mb").value) { alert("two different cameras"); return; } mode = {a: $("ma").value, b: $("mb").value}; curRow = 0; renderMatch(); };
+$("mstop").onclick = () => { mode = null; render(); };
+document.addEventListener("keydown", e => {
+  if (!mode || e.target.tagName === "INPUT") return;
+  const n = DATA.rows.filter(r => r.cam === mode.a).length;
+  if (e.key === "ArrowDown" || e.key === "j") { curRow = Math.min(n - 1, curRow + 1); renderMatch(); e.preventDefault(); }
+  if (e.key === "ArrowUp" || e.key === "k") { curRow = Math.max(0, curRow - 1); renderMatch(); e.preventDefault(); }
+});
 ["cam", "single"].forEach(id => $(id).onchange = render); $("find").oninput = render;
 $("save").onclick = () => {
   const cam = {};

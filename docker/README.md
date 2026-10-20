@@ -209,7 +209,9 @@ docker compose run --rm herd boxes gallery --data /data/boxes --labels /data/lab
 ```
 
 Open `docker/data/boxes/ids.html`: each id is a group, each row in it that id on one camera with her
-crops. Type in a row the cow it really is (rows with the same name become one cow on every camera;
+crops. **match cameras** (e.g. name the cows of cam3 by those of cam1): the left column is the first
+camera's cows, the right the second's; click the cow on the right that the selected left one is, or
+"new cow". A camera with the same cow under two ids is flagged. Or type in a row the cow it really is (rows with the same name become one cow on every camera;
 `x` removes the id), **Save labels.json**, move it to `docker/data/`, then `boxes ids` again (and on
 the box page, Load labels.json).
 
