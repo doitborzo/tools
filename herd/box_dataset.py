@@ -33,6 +33,7 @@ import itertools
 import json
 import os
 import random
+import shutil
 import sys
 
 import numpy as np
@@ -502,6 +503,141 @@ def cmd_ids(args):
         print(f"[ids] {stale} frames cut again after they were labelled - left out until checked on the page")
 
 
+def cmd_gallery(args):
+    """Every cow id of every camera as a row of her crops, side by side - to see that one id is one cow on
+    every camera (and fix it: each row gets the cow it really is; Save labels.json writes the new ids)."""
+    from PIL import Image
+    src = os.path.abspath(args.data)
+    index = json.load(open(os.path.join(src, "frames.json"), encoding="utf-8"))
+    labels = read_labels(args.labels)
+    by = collections.defaultdict(list)
+    for f in index["frames"]:
+        for b in (labels.get(f["file"]) or {}).get("boxes", []):
+            if len(b) > 4 and str(b[4]).strip():
+                by[(f["cam"], str(b[4]).strip())].append((f, b))
+    folder = os.path.join(src, "gallery")
+    shutil.rmtree(folder, ignore_errors=True)
+    rows = []
+    for (cam, cow), items in sorted(by.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+        items.sort(key=lambda it: it[0]["ts"])
+        pick = sorted({int(round(i)) for i in np.linspace(0, len(items) - 1, min(args.thumbs, len(items)))})
+        thumbs = []
+        for k in pick:
+            f, b = items[k]
+            with Image.open(os.path.join(src, f["file"])) as im:
+                w, h = im.size
+                pad = 0.08
+                c = im.crop((int(max(0, (b[0] - pad * (b[2] - b[0])) * w)), int(max(0, (b[1] - pad * (b[3] - b[1])) * h)),
+                             int(min(w, (b[2] + pad * (b[2] - b[0])) * w)), int(min(h, (b[3] + pad * (b[3] - b[1])) * h))))
+                c.thumbnail((160, 160))
+                safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in cow)
+                rel = f"gallery/{cam}/{safe}_{k}.jpg"
+                os.makedirs(os.path.join(src, "gallery", cam), exist_ok=True)
+                c.convert("RGB").save(os.path.join(src, rel), quality=85)
+                thumbs.append({"src": rel, "time": f["time"][11:]})
+        rows.append({"cam": cam, "id": cow, "n": len(items), "auto": sum(1 for _, b in items if len(b) > 5 and b[5]),
+                     "thumbs": thumbs})
+    data = {"key": src, "rows": rows, "labels": labels}
+    out = os.path.join(src, "ids.html")
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write(GALLERY.replace("__DATA__", json.dumps(data).replace("</", "<\\/")))
+    cams = collections.defaultdict(set)
+    for r in rows:
+        cams[r["id"]].add(r["cam"])
+    print(f"[ids] {len(rows)} rows (an id on a camera) of {len(cams)} ids; {sum(1 for v in cams.values() if len(v) > 1)} "
+          f"ids on 2+ cameras -> {out} (open it in a browser)")
+
+
+GALLERY = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cow ids by camera</title>
+<style>
+:root{--bg:#fafaf7;--card:#fff;--fg:#1d1d1b;--mute:#6b6b66;--line:#e2e1da;--accent:#2f6f4f;--warn:#a33}
+@media (prefers-color-scheme: dark){:root{--bg:#171816;--card:#20221f;--fg:#ecebe6;--mute:#9a9a93;--line:#34362f;--accent:#7fc29c;--warn:#e88}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,sans-serif}
+header{position:sticky;top:0;z-index:2;background:var(--bg);border-bottom:1px solid var(--line);padding:10px 16px}
+h1{font-size:17px;margin:0 0 6px}.help{color:var(--mute);font-size:13px;margin:2px 0}.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+button,select,input{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:4px 8px}
+button.main{background:var(--accent);color:var(--bg);border-color:var(--accent)}main{padding:8px 16px 40px}
+.group{border:1px solid var(--line);border-radius:8px;background:var(--card);margin:8px 0;padding:6px 8px}
+.group h2{font-size:14px;margin:2px 0 6px}.one{color:var(--warn)}
+.row{display:grid;grid-template-columns:200px 1fr;gap:8px;padding:4px 0;border-top:1px solid var(--line)}
+.row:first-of-type{border-top:0}.thumbs{display:flex;flex-wrap:wrap;gap:3px}.thumbs img{height:96px;border-radius:4px}
+.mute{color:var(--mute)}.row input{width:100%;margin-top:4px}
+@media (max-width:640px){header{position:static}.row{grid-template-columns:1fr}.thumbs img{height:72px}}
+</style></head><body>
+<header><h1>Cow ids by camera: one id, one cow?</h1>
+<p class="help">Each group is one id; each row in it, that id on one camera, with her crops spread over the recording. If the rows
+of a group are not the same cow, or a cow has a different id on another camera, type in each row the cow it really is (her ear
+tag): rows with the same name become one cow on every camera. <b>x</b> removes the id. <b>Save labels.json</b> writes the
+labels with the new ids - then <code>boxes ids</code> again (and on the box page: Load labels.json).</p>
+<div class="bar"><select id="cam"><option value="">all cameras</option></select>
+<label><input type="checkbox" id="single"> only ids on one camera</label><input id="find" placeholder="find an id" size="10">
+<button class="main" id="save">Save labels.json</button><span class="mute" id="stat"></span></div></header>
+<main id="list"></main>
+<script>
+const DATA = __DATA__;
+const KEY = "herd-ids-rename:" + DATA.key;
+let rename = {};
+try { rename = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) {}
+const $ = id => document.getElementById(id), k = r => r.cam + "\u0001" + r.id;
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+[...new Set(DATA.rows.map(r => r.cam))].sort().forEach(c => $("cam").insertAdjacentHTML("beforeend", `<option>${esc(c)}</option>`));
+const name = r => (rename[k(r)] || r.id).trim();
+function render() {
+  const c = $("cam").value, single = $("single").checked, f = $("find").value.trim().toLowerCase();
+  const groups = {};
+  DATA.rows.forEach(r => (groups[name(r)] = groups[name(r)] || []).push(r));
+  const list = $("list"); list.innerHTML = "";
+  Object.keys(groups).sort((a, b) => a.localeCompare(b, undefined, {numeric: true})).forEach(g => {
+    const rs = groups[g], cams = new Set(rs.map(r => r.cam));
+    if (c && !cams.has(c)) return;
+    if (single && cams.size > 1) return;
+    if (f && !g.toLowerCase().includes(f)) return;
+    const div = document.createElement("div"); div.className = "group";
+    div.innerHTML = `<h2>${esc(g)} <span class="${cams.size > 1 ? "mute" : "one"}">- ${cams.size} camera${cams.size > 1 ? "s" : ""}</span></h2>`;
+    rs.sort((a, b) => a.cam.localeCompare(b.cam)).forEach(r => {
+      const row = document.createElement("div"); row.className = "row";
+      row.innerHTML = `<div><b>${esc(r.cam)}</b> <span class="mute">id ${esc(r.id)}, ${r.n} boxes${r.auto ? ` (${r.auto} filled in)` : ""}</span>
+        <input placeholder="the cow it is" value="${esc(rename[k(r)] || "")}"></div>
+        <div class="thumbs">${r.thumbs.map(t => `<img loading="lazy" src="${esc(t.src)}" title="${esc(t.time)}">`).join("")}</div>`;
+      row.querySelector("input").addEventListener("change", e => {
+        const v = e.target.value.trim();
+        if (v && v !== r.id) rename[k(r)] = v; else delete rename[k(r)];
+        try { localStorage.setItem(KEY, JSON.stringify(rename)); } catch (e2) {}
+        render();
+      });
+      div.appendChild(row);
+    });
+    list.appendChild(div);
+  });
+  const ids = new Set(DATA.rows.map(name)), multi = [...ids].filter(g => new Set(DATA.rows.filter(r => name(r) === g).map(r => r.cam)).size > 1);
+  $("stat").textContent = `${ids.size} cows, ${multi.length} of them on 2+ cameras; ${Object.keys(rename).length} rows renamed`;
+}
+["cam", "single"].forEach(id => $(id).onchange = render); $("find").oninput = render;
+$("save").onclick = () => {
+  const cam = {};
+  DATA.rows.forEach(r => cam[k(r)] = r);
+  const out = {};
+  // frames know their camera from the file name (frames/<cam>/...)
+  Object.entries(DATA.labels).forEach(([file, lab]) => {
+    const c = file.split("/")[1];
+    out[file] = Object.assign({}, lab, {boxes: (lab.boxes || []).map(b => {
+      if (b.length < 5 || !b[4]) return b;
+      const v = rename[c + "\u0001" + String(b[4]).trim()];
+      if (!v) return b;
+      return v.toLowerCase() === "x" ? b.slice(0, 4) : b.slice(0, 4).concat([v]).concat(b.slice(5));
+    })});
+  });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify({frames: out})], {type: "application/json"}));
+  a.download = "labels.json"; a.click();
+};
+render();
+</script></body></html>
+"""
+
+
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Barn cow boxes</title>
@@ -845,6 +981,10 @@ def main(argv=None):
     g = sub.add_parser("page", help="the labelling page again (after a code update, or with a labels.json)")
     g.add_argument("--data", required=True)
     g.add_argument("--labels", default=None)
+    gl = sub.add_parser("gallery", help="every id of every camera as a row of her crops -> ids.html (check, rename)")
+    gl.add_argument("--data", required=True)
+    gl.add_argument("--labels", required=True)
+    gl.add_argument("--thumbs", type=int, default=8, help="crops a row")
     x = sub.add_parser("export", help="labels.json -> herd_det_barn_<date>.tgz (COCO, for run_pod.sh detector)")
     x.add_argument("--data", required=True)
     x.add_argument("--labels", required=True)
@@ -871,7 +1011,7 @@ def main(argv=None):
     args = p.parse_args(argv)
     if args.cmd == "frames" and not (args.videos or args.video):
         p.error("frames: --videos DIR or --video cam=file")
-    {"frames": cmd_frames, "page": cmd_page, "export": cmd_export, "ids": cmd_ids}[args.cmd](args)
+    {"frames": cmd_frames, "page": cmd_page, "export": cmd_export, "ids": cmd_ids, "gallery": cmd_gallery}[args.cmd](args)
 
 
 if __name__ == "__main__":

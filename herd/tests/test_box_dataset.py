@@ -449,3 +449,22 @@ def test_check_the_models_on_the_barns_labels():
         assert r["at_own"]["recall"] == 0.5 and r["at_best"]["precision"] > 0              # stub: 1 of the 2 cows
         ident = rep["identity"]["herd model (no identity model)"]
         assert "other_camera_top1" in ident["metrics"] and "thresholds" in ident
+
+
+def test_ids_gallery_rows_by_camera():
+    import box_dataset
+    with tempfile.TemporaryDirectory() as d:
+        cfg, rec = _setup(d)
+        out = os.path.join(d, "boxes")
+        box_dataset.main(["frames", "--config", cfg, "--videos", rec, "--out", out, "--every", "10", "--detector", "none"])
+        fr = json.load(open(os.path.join(out, "frames.json")))["frames"]
+        labels = {f["file"]: {"status": "done", "boxes": [[0.1, 0.4, 0.3, 0.8, "4"], [0.5, 0.4, 0.7, 0.8, "7", 1]]} for f in fr}
+        lp = os.path.join(d, "labels.json")
+        json.dump({"frames": labels}, open(lp, "w"))
+        box_dataset.main(["gallery", "--data", out, "--labels", lp, "--thumbs", "3"])
+        html = open(os.path.join(out, "ids.html"), encoding="utf-8").read()
+        data = json.loads(html.split("const DATA = ", 1)[1].split(";\n", 1)[0])
+        rows = {(r["cam"], r["id"]): r for r in data["rows"]}
+        assert set(rows) == {("cam1", "4"), ("cam2", "4"), ("cam1", "7"), ("cam2", "7")}
+        assert rows[("cam1", "7")]["auto"] == rows[("cam1", "7")]["n"] == 12 and len(rows[("cam1", "4")]["thumbs"]) == 3
+        assert all(os.path.exists(os.path.join(out, t["src"])) for r in data["rows"] for t in r["thumbs"])

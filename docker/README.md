@@ -201,6 +201,18 @@ It writes `docker/data/herd_barn_ids_<date>.tgz`: each named box cut as the barn
 the cows held out. Every frame with named boxes counts, done or not (`--done-only`: only done ones). Put it in the pod's `/workspace`; `reid_pod.sh` adds the set `barn_ids` to training.
 The same labels.json also makes the detector's set (`boxes export`).
 
+**One id, one cow on every camera?** Cross-camera training and checking only work when a cow has the
+same id on every camera. See it, and fix it:
+
+```bash
+docker compose run --rm herd boxes gallery --data /data/boxes --labels /data/labels.json
+```
+
+Open `docker/data/boxes/ids.html`: each id is a group, each row in it that id on one camera with her
+crops. Type in a row the cow it really is (rows with the same name become one cow on every camera;
+`x` removes the id), **Save labels.json**, move it to `docker/data/`, then `boxes ids` again (and on
+the box page, Load labels.json).
+
 **Check the models on your labels** (before training anything on them - none of these frames was
 ever seen by the models):
 
