@@ -288,20 +288,22 @@ header{padding:10px 16px;border-bottom:1px solid var(--line)}h1{font-size:17px;m
 button,select{font:inherit;color:inherit;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:4px 10px;cursor:pointer}
 button.main{background:var(--accent);color:var(--bg);border-color:var(--accent)}
 .mute{color:var(--mute)}.help{color:var(--mute);font-size:13px;margin:2px 0}
-main{padding:8px 16px 30px}#wrap{position:relative}canvas{display:block;max-width:100%;touch-action:none;cursor:crosshair;border-radius:6px;background:#000}
+main{padding:8px 16px 30px}#wrap{position:relative;overflow:auto;max-height:82vh}canvas{display:block;max-width:100%;touch-action:none;cursor:crosshair;border-radius:6px;background:#000}
 #status.done{color:var(--done);font-weight:600}#status.skip{color:var(--skip);font-weight:600}
 kbd{border:1px solid var(--line);border-radius:4px;padding:0 4px;font-size:12px}
 </style></head><body>
 <header>
 <h1>Barn cow boxes</h1>
-<p class="help">Draw a box round every cow, or the part of her you can see: drag on empty space. Drag a box to move it,
-its corners to resize; <kbd>Del</kbd> removes the selected box. Dashed boxes are cows the detector was unsure of: click to keep,
-<kbd>A</kbd> keeps all. Grey is the camera's excluded zone: no boxes there. <kbd>Enter</kbd> marks the frame done and opens
-the next; only frames marked done are exported. <kbd>S</kbd> skips a frame (spoilt, or unsure); <kbd>&larr;</kbd>
-<kbd>&rarr;</kbd> move without marking; <kbd>Ctrl+Z</kbd> undoes.</p>
+<p class="help"><b>A cow the detector missed: drag over her</b> - from one corner to the other, anywhere on the picture (also
+over other cows' boxes). Draw round the part of her you can see. A click selects a box: then drag it to move it, its corners
+to resize; <kbd>Del</kbd> removes it. Dashed boxes are cows the detector was unsure of: click to keep, <kbd>A</kbd> keeps all.
+<kbd>+</kbd> <kbd>&minus;</kbd> zoom (far cows). Grey is the camera's excluded zone: no boxes there. <kbd>Enter</kbd> marks the
+frame done and opens the next; only frames marked done are exported. <kbd>S</kbd> skips a frame (spoilt, or unsure);
+<kbd>&larr;</kbd> <kbd>&rarr;</kbd> move without marking; <kbd>Ctrl+Z</kbd> undoes.</p>
 <div class="bar">
 <button id="prev">&larr;</button><span id="pos"></span><button id="next">&rarr;</button>
 <select id="cam"></select><label><input type="checkbox" id="todo"> only not done</label>
+<button id="zout" title="zoom out (-)">&minus;</button><span id="zoomv">1x</span><button id="zin" title="zoom in (+): far cows">+</button>
 <button class="main" id="done">Done &#10003;</button><button id="skip">Skip</button><button id="reset">Detector's boxes</button>
 <button class="main" id="save">Save labels.json</button><button id="loadbtn">Load labels.json</button><input type="file" id="load" accept=".json" hidden>
 </div>
@@ -346,9 +348,12 @@ function open() {
   $("info").textContent = `${f.cam}  ${f.time}`;
   status();
 }
+let zoom = 1;
 function fit() {
   const W = $("wrap").clientWidth, H = window.innerHeight * 0.78;
-  scale = Math.min(W / img.naturalWidth, H / img.naturalHeight, 1.5);
+  scale = Math.min(W / img.naturalWidth, H / img.naturalHeight, 1.5) * zoom;
+  cv.style.maxWidth = zoom > 1 ? "none" : "100%";
+  $("zoomv").textContent = zoom + "x";
   cv.width = Math.round(img.naturalWidth * scale); cv.height = Math.round(img.naturalHeight * scale);
 }
 function status() {
@@ -381,22 +386,29 @@ function push() { undo.push(JSON.stringify([boxes, cands])); if (undo.length > 5
 function pt(e) { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height]; }
 cv.addEventListener("pointerdown", e => {
   if (!frame()) return;
-  const [x, y] = pt(e), tol = 8 / cv.getBoundingClientRect().width, toly = 8 / cv.getBoundingClientRect().height;
+  const [x, y] = pt(e), r = cv.getBoundingClientRect(), tol = 8 / r.width, toly = 8 / r.height;
   cv.setPointerCapture(e.pointerId);
-  if (sel >= 0) {
+  if (sel >= 0) {                                   // the selected box: its corners resize it, its inside moves it
     const k = corners(boxes[sel]).findIndex(([cx, cy]) => Math.abs(cx - x) < tol && Math.abs(cy - y) < toly);
     if (k >= 0) { push(); drag = {mode: "resize", k}; return; }
+    const b = boxes[sel];
+    if (!e.shiftKey && x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3]) { push(); drag = {mode: "move", x, y, b: b.slice()}; return; }
   }
+  // anywhere else: a drag draws a new box (also over other cows' boxes - a herd lying close together);
+  // a click without dragging selects the box under it, or keeps a dashed one
   const inside = boxes.map((b, i) => [i, b]).filter(([, b]) => x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3])
     .sort((p, q) => (p[1][2] - p[1][0]) * (p[1][3] - p[1][1]) - (q[1][2] - q[1][0]) * (q[1][3] - q[1][1]));
-  if (inside.length) { push(); sel = inside[0][0]; drag = {mode: "move", x, y, b: boxes[sel].slice()}; draw(); return; }
-  const c = cands.findIndex(b => x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3]);
-  if (c >= 0) { push(); boxes.push(cands[c].slice(0, 4)); cands.splice(c, 1); sel = boxes.length - 1; edited(); return; }
-  push(); boxes.push([x, y, x, y]); sel = boxes.length - 1; drag = {mode: "new", x, y};
+  drag = {mode: "press", x, y, px: e.clientX, py: e.clientY, hit: inside.length ? inside[0][0] : -1,
+          cand: cands.findIndex(b => x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3])};
 });
 cv.addEventListener("pointermove", e => {
   if (!drag) return;
-  const [x, y] = pt(e).map(v => Math.min(1, Math.max(0, v))), b = boxes[sel];
+  const [x, y] = pt(e).map(v => Math.min(1, Math.max(0, v)));
+  if (drag.mode === "press") {
+    if (Math.abs(e.clientX - drag.px) + Math.abs(e.clientY - drag.py) < 6) return;
+    push(); boxes.push([drag.x, drag.y, drag.x, drag.y]); sel = boxes.length - 1; drag = {mode: "new", x: drag.x, y: drag.y};
+  }
+  const b = boxes[sel];
   if (drag.mode === "move") {
     const dx = Math.min(1 - drag.b[2], Math.max(-drag.b[0], x - drag.x)), dy = Math.min(1 - drag.b[3], Math.max(-drag.b[1], y - drag.y));
     boxes[sel] = [drag.b[0] + dx, drag.b[1] + dy, drag.b[2] + dx, drag.b[3] + dy];
@@ -414,6 +426,12 @@ cv.addEventListener("pointermove", e => {
 });
 cv.addEventListener("pointerup", () => {
   if (!drag) return;
+  if (drag.mode === "press") {                      // a click
+    if (drag.hit >= 0) sel = drag.hit;
+    else if (drag.cand >= 0) { push(); boxes.push(cands[drag.cand].slice(0, 4)); cands.splice(drag.cand, 1); sel = boxes.length - 1; drag = null; edited(); return; }
+    else sel = -1;
+    drag = null; draw(); return;
+  }
   const b = boxes[sel];
   if (drag.mode === "new" && ((b[2] - b[0]) * cv.width < 6 || (b[3] - b[1]) * cv.height < 6)) { boxes.splice(sel, 1); sel = -1; undo.pop(); draw(); }
   else edited();
@@ -426,6 +444,9 @@ function mark(s) {
   if (at + 1 < order.length) { at++; open(); } else draw();
 }
 function go(d) { if (!order.length) return; at = Math.min(order.length - 1, Math.max(0, at + d)); open(); }
+const ZOOMS = [1, 1.5, 2, 3, 4];
+function setZoom(d) { zoom = ZOOMS[Math.min(ZOOMS.length - 1, Math.max(0, ZOOMS.indexOf(zoom) + d))]; if (img.naturalWidth) { fit(); draw(); } }
+$("zin").onclick = () => setZoom(1); $("zout").onclick = () => setZoom(-1);
 $("prev").onclick = () => go(-1); $("next").onclick = () => go(1);
 $("done").onclick = () => mark("done"); $("skip").onclick = () => mark("skip");
 $("reset").onclick = () => { const f = frame(); if (!f) return; push(); [boxes, cands] = detBoxes(f); sel = -1; edited(); };
@@ -440,6 +461,8 @@ document.addEventListener("keydown", e => {
   else if ((e.key === "Delete" || e.key === "Backspace") && sel >= 0) { push(); boxes.splice(sel, 1); sel = -1; edited(); e.preventDefault(); }
   else if (e.key === "a" || e.key === "A") { push(); boxes.push(...cands.map(c => c.slice(0, 4))); cands = []; edited(); }
   else if (e.key === "Escape") { sel = -1; draw(); }
+  else if (e.key === "+" || e.key === "=") setZoom(1);
+  else if (e.key === "-") setZoom(-1);
 });
 $("save").onclick = () => {
   const a = document.createElement("a");

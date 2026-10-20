@@ -381,8 +381,9 @@ of.
 
 - **every cow gets a box**, or the part of her that is visible (a cow behind a rail: the visible part;
   half out of the frame: the half inside);
-- drag on empty space — a new box; drag a box — move it; drag its corners — resize;
-  **Del** — remove the selected box;
+- **a cow the detector missed: drag over her** from one corner to the other — anywhere, also over
+  other cows' boxes; a click selects a box, then drag it to move it, its corners to resize;
+  **Del** — remove the selected box; **+ / −** — zoom in on far cows;
 - a click on a dashed box keeps it, **A** keeps all of them;
 - no boxes in the grey zone (the barn never shows it to the detector);
 - **Enter** — the frame is right: marked done, the next one opens. Only frames marked done are
