@@ -271,7 +271,28 @@ cows: who is who. It writes:
   - a cow in the cam1/cam2 overlap is counted by one camera only;
   - a cow keeps her colour while she lies.
 - `docker/data/trial/trial.json`, and a line a camera in the log: the cow-seconds counted, the tracks,
-  the share given a cow, posture and activity.
+  the share given a cow, posture and activity;
+- "what cannot be": one cow at the same second twice on one camera, or on two cameras that share no
+  floor - two cows given one id.
+
+**How right it is, in numbers: IDF1 against your own ids.** The frames you labelled with cow ids
+(section 5: `boxes`, the ids gallery) come from the same recordings: each of your boxes is looked up
+in the rehearsal at the same camera and second, and its cow compared with yours.
+
+```bash
+docker compose run --rm herd trial --config /data/barn.toml --videos /data/rec_fixed --out /data/trial --boxes /data/boxes --labels /data/labels.json
+docker compose run --rm herd trial --score-only --config /data/barn.toml --out /data/trial --boxes /data/boxes --labels /data/labels.json
+```
+
+The second scores a rehearsal already made. The log and `trial/score.json` give:
+
+- IDF1: the share of your boxes that got the right cow, with the system's names matched one to one to
+  yours. IDP: of the cows it gave, the right one. IDR: of your boxes, the right cow.
+- The same per camera.
+- Which of its cows took two of yours (merged), and which of yours it split.
+
+Only the boxes a camera counts (its mask) are scored. Use the labels.json with the ids as the gallery
+page saved them (the same cow one id on every camera).
 
 **Cameras that share floor, calibrated without measuring anything.** A cow seen by two cameras should
 be one cow. `[mct] link` joins her two tracks by where she stands on one floor plan. Marks measured by

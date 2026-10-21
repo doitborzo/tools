@@ -33,7 +33,7 @@ Recordings for them:
     herd.py record --config barn.toml --out DIR --minutes 60   every camera at once -> DIR/<cam>_<time>.mp4
     herd.py fix-videos --videos DIR --out DIR2             damaged recordings -> clean .mp4 the tools read
 A dress rehearsal on recordings (two passes: the gallery fills, then who is who, drawn per camera):
-    herd.py trial --config barn.toml --videos DIR --out D
+    herd.py trial --config barn.toml --videos DIR --out D [--boxes B --labels L]   (L: your ids -> IDF1)
 Cameras sharing floor calibrated by the cows moving in both (nothing measured; then [mct] link):
     herd.py autocalib --config barn.toml --store D/pass2/herd.sqlite --videos DIR --out C [--apply]
 The models on the barn's own labels (nothing trained on them):

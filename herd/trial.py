@@ -13,6 +13,14 @@ So the recordings are played twice:
      seconds counted, the tracks, the share of boxes given a cow, posture and activity; the cows made
 
     python herd/herd.py trial --config barn.toml --videos /srv/herd/rec --out /srv/herd/trial
+
+With the boxes you labelled with cow ids on frames of the same recordings (herd.py boxes: frames.json and
+the labels.json the page, or the ids gallery, saved) the second pass is scored against them - IDF1, the
+share of your boxes that got the right cow (the system's names matched one to one to yours), and IDP /
+IDR beside it; per camera too, and which of its cows took two of yours (merged) or the other way (split):
+
+    python herd/herd.py trial ... --boxes /srv/herd/boxes --labels /srv/herd/labels.json
+    python herd/herd.py trial --score-only --config barn.toml --out /srv/herd/trial --boxes ... --labels ...
 """
 
 from __future__ import annotations
@@ -27,9 +35,11 @@ import os
 import shutil
 import sys
 
+import numpy as np
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from common import load_config, recordings, sessions  # noqa: E402
+from common import iou, load_config, recordings, sessions  # noqa: E402
 
 
 def play(cfg, groups, store_path, models):
@@ -92,16 +102,131 @@ def impossible(store, tm, cfg):
             "one_cow_on_cameras_apart": apart, "cows_seen_where_they_cannot_be": dict(per_cow.most_common())}
 
 
+def idf1(co, n_true, n_pred):
+    """co Counter((your id, its cow)) over the boxes matched -> IDF1, IDP, IDR, the one-to-one mapping."""
+    from scipy.optimize import linear_sum_assignment
+    if not co:
+        return {"idf1": 0.0, "idp": 0.0, "idr": 0.0, "mapping": {}}
+    ts = sorted({t for t, _ in co})
+    ps = sorted({p for _, p in co})
+    M = np.zeros((len(ts), len(ps)))
+    for (t, p), n in co.items():
+        M[ts.index(t), ps.index(p)] = n
+    r, c = linear_sum_assignment(-M)
+    tp = float(M[r, c].sum())
+    return {"idf1": 2 * tp / max(1, n_true + n_pred), "idp": tp / max(1, n_pred), "idr": tp / max(1, n_true),
+            "mapping": {ts[i]: ps[j] for i, j in zip(r, c) if M[i, j] > 0}}
+
+
+def score(store_path, cfg, boxes_dir, labels_path, max_dt=0.6, min_iou=0.3):
+    """Your labelled boxes (status done, with an id) against the second pass at the same camera and second.
+
+    Only boxes this camera counts (its mask, zone) are scored - one in another camera's part of an overlap
+    is that camera's. Your box and its box matched by overlap (min_iou, one to one); the system's cow of a
+    box is its track's (report.track_map). A box of yours it did not find, or found without a cow, counts
+    against IDR; a cow it gave where you labelled none counts against IDP."""
+    import report
+    from box_dataset import read_labels
+    from common import in_zone
+    from scipy.optimize import linear_sum_assignment
+    from store import Store
+    store = Store(store_path)
+    tm = report.track_map(store)
+    frames = {f["file"]: f for f in json.load(open(os.path.join(boxes_dir, "frames.json"), encoding="utf-8"))["frames"]}
+    cams = {c["id"]: c for c in cfg["cameras"]}
+    co, cam_co = collections.Counter(), collections.defaultdict(collections.Counter)
+    n = collections.Counter()                      # (cam, what) -> boxes
+    for file, lab in read_labels(labels_path).items():
+        f = frames.get(file)
+        if lab.get("status") != "done" or not f or f["cam"] not in cams:
+            continue
+        cam = f["cam"]
+        truth = [(b[:4], str(b[4]).strip()) for b in lab.get("boxes", []) if len(b) >= 5 and str(b[4]).strip()
+                 and str(b[4]).strip().lower() != "x"]
+        truth = [t for t in truth if in_zone(t[0], cams[cam], f.get("w", 1920), f.get("h", 1080))]
+        rows = store.query("SELECT track, ts, x1, y1, x2, y2 FROM seconds WHERE cam = ? AND ts BETWEEN ? AND ?",
+                           (cam, f["ts"] - max_dt, f["ts"] + max_dt))
+        if not rows:
+            n[(cam, "frames_not_played")] += 1
+            continue
+        n[(cam, "frames")] += 1
+        sec = min({r[1] for r in rows}, key=lambda t: abs(t - f["ts"]))
+        pred = [(list(r[2:6]), tm.get(r[0])) for r in rows if r[1] == sec]
+        n[(cam, "your_boxes")] += len(truth)
+        n[(cam, "its_named_boxes")] += sum(1 for _, cow in pred if cow)
+        if truth and pred:
+            M = np.array([[iou(t[0], q[0]) for q in pred] for t in truth])
+            r, c = linear_sum_assignment(-M)
+            hit = [(i, j) for i, j in zip(r, c) if M[i, j] >= min_iou]
+        else:
+            hit = []
+        n[(cam, "found")] += len(hit)
+        n[(cam, "found_with_a_cow")] += sum(1 for _, j in hit if pred[j][1])
+        for i, j in hit:
+            if pred[j][1]:
+                co[(truth[i][1], pred[j][1])] += 1
+                cam_co[cam][(truth[i][1], pred[j][1])] += 1
+    allc = sorted({c for c, _ in n})
+    tot = lambda what: sum(n[(c, what)] for c in allc)
+    out = {"all": idf1(co, tot("your_boxes"), tot("its_named_boxes")), "cameras": {}}
+    out["all"].update({k: tot(k) for k in ("frames", "frames_not_played", "your_boxes", "found", "found_with_a_cow",
+                                           "its_named_boxes")})
+    for c in allc:
+        r = idf1(cam_co[c], n[(c, "your_boxes")], n[(c, "its_named_boxes")])
+        r.update({k: n[(c, k)] for k in ("frames", "frames_not_played", "your_boxes", "found", "found_with_a_cow",
+                                         "its_named_boxes")})
+        r.pop("mapping")
+        out["cameras"][c] = r
+    by_pred, by_true = collections.defaultdict(collections.Counter), collections.defaultdict(collections.Counter)
+    for (t, p), k in co.items():
+        by_pred[p][t] += k
+        by_true[t][p] += k
+    big = lambda cnt: [x for x, k in cnt.items() if k >= max(3, 0.2 * sum(cnt.values()))]
+    out["merged"] = {p: dict(cnt.most_common()) for p, cnt in by_pred.items() if len(big(cnt)) > 1}
+    out["split"] = {t: dict(cnt.most_common()) for t, cnt in by_true.items() if len(big(cnt)) > 1}
+    out["your_cows"], out["its_cows"] = len(by_true), len(by_pred)
+    return out
+
+
+def print_score(sc):
+    a = sc["all"]
+    print(f"\n[score] against your labels: {a['your_boxes']} boxes of {sc['your_cows']} cows on {a['frames']} frames"
+          + (f" ({a['frames_not_played']} frames not in this run)" if a["frames_not_played"] else ""))
+    print(f"  found {a['found'] / max(1, a['your_boxes']):.0%} of your boxes, {a['found_with_a_cow'] / max(1, a['your_boxes']):.0%}"
+          f" with a cow; IDF1 {a['idf1']:.1%} (IDP {a['idp']:.1%}: of its cows given, the right one; IDR "
+          f"{a['idr']:.1%}: of your boxes, the right cow)")
+    for c, r in sorted(sc["cameras"].items()):
+        print(f"  {c}: IDF1 {r['idf1']:.1%} (IDP {r['idp']:.1%}, IDR {r['idr']:.1%}) on {r['your_boxes']} boxes")
+    print(f"  its cows: {sc['its_cows']} for your {sc['your_cows']}; one of its cows on several of yours (merged): "
+          f"{len(sc['merged'])}; one of yours under several of its (split): {len(sc['split'])}")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", required=True)
-    p.add_argument("--videos", required=True, help="recordings named <camera>..<date and time>")
+    p.add_argument("--videos", default=None, help="recordings named <camera>..<date and time>")
     p.add_argument("--out", required=True)
     p.add_argument("--burst-every", type=float, default=20.0, help="the first pass: a burst every this many s")
     p.add_argument("--min-bursts", type=int, default=6, help="bursts a cow needs in the first pass to get an id")
     p.add_argument("--show-minutes", type=float, default=10.0, help="minutes of every camera drawn (show-ids)")
     p.add_argument("--gap", type=float, default=300.0)
+    p.add_argument("--boxes", default=None, help="your labelled frames (herd.py boxes: the folder with frames.json)")
+    p.add_argument("--labels", default=None, help="their labels.json with cow ids: the second pass scored (IDF1)")
+    p.add_argument("--score-only", action="store_true", help="score the trial already in --out, play nothing")
     args = p.parse_args(argv)
+    if args.score_only:
+        if not (args.boxes and args.labels):
+            p.error("--score-only needs --boxes and --labels")
+        cfg = load_config(args.config)
+        out = os.path.abspath(args.out.rstrip("\\"))
+        sc = score(os.path.join(out, "pass2", "herd.sqlite"), cfg, args.boxes, args.labels)
+        with open(os.path.join(out, "score.json"), "w", encoding="utf-8") as fh:
+            json.dump(sc, fh, indent=2)
+        print_score(sc)
+        print(f"-> {os.path.join(out, 'score.json')}")
+        return
+    if not args.videos:
+        p.error("--videos is needed")
     import gallery as gallery_mod
     import show_ids
     from store import Store
@@ -171,6 +296,11 @@ def main(argv=None):
         print(f"  !! [identity] max_cows = {cfg['identity'].get('max_cows')}: the gallery was full, "
               f"{res['held_back_herd_full']} more cows got no id - set it to the cows these cameras see (0: no "
               "limit)")
+    if args.boxes and args.labels:
+        sc = score(store2, cfg, args.boxes, args.labels)
+        with open(os.path.join(out, "score.json"), "w", encoding="utf-8") as fh:
+            json.dump(sc, fh, indent=2)
+        print_score(sc)
     print(f"-> {os.path.join(out, 'trial.json')}; the videos: " + ", ".join(shown.values()))
 
 

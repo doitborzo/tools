@@ -705,3 +705,36 @@ def test_trial_counts_what_cannot_be():
         assert odd["one_cow_twice_on_one_camera"] == 10 and odd["one_cow_on_cameras_apart"] == 0
         odd = trial.impossible(s, {"t1": "A", "t2": "C", "t3": "A"}, cfg)   # cam1 and cam3 at once
         assert odd["one_cow_on_cameras_apart"] == 10 and odd["cows_seen_where_they_cannot_be"] == {"A": 10}
+
+
+def test_trial_scored_against_your_ids():
+    """Two of your cows given one of its cows: IDF1 one half, the merge named; a box outside the camera's
+    mask is not scored; a frame of a moment the trial did not play is said so."""
+    import trial
+    from store import Store
+    with tempfile.TemporaryDirectory() as d:
+        st = os.path.join(d, "s.sqlite")
+        s = Store(st)
+        rows = []
+        for t in range(100, 121):
+            rows += [("cam1", "t1", float(t), 0.1, 0.4, 0.3, 0.6, "lying", "none", 0.9),
+                     ("cam1", "t2", float(t), 0.5, 0.4, 0.7, 0.6, "lying", "none", 0.9)]
+        s.seconds(rows)
+        for tr in ("t1", "t2"):
+            for k in range(3):
+                s.burst(("cam1", tr, 100.0 + k, "confirmed", "P1", 0.9, 0.2, 0.9, 0.1, "lying", "none", None, 0.5, 100))
+        boxes = os.path.join(d, "boxes")
+        os.makedirs(boxes)
+        frames = [{"file": f"cam1/{t}.jpg", "cam": "cam1", "ts": float(t), "w": 1920, "h": 1080}
+                  for t in (100, 105, 110, 115, 500)]
+        json.dump({"frames": frames}, open(os.path.join(boxes, "frames.json"), "w"))
+        lab = {"boxes": [[0.1, 0.4, 0.3, 0.6, "4"], [0.5, 0.4, 0.7, 0.6, "7"], [0.9, 0.1, 0.95, 0.2, "9"]],
+               "status": "done"}
+        labels = os.path.join(d, "labels.json")
+        json.dump({"frames": {f["file"]: lab for f in frames}}, open(labels, "w"))
+        cfg = _cfg()
+        cfg["cameras"] = [{"id": "cam1", "mask": [[0, 0.3], [0.8, 0.3], [0.8, 0.8], [0, 0.8]]}]
+        sc = trial.score(st, cfg, boxes, labels)
+        a = sc["all"]
+        assert a["frames"] == 4 and a["frames_not_played"] == 1 and a["your_boxes"] == 8 and a["found"] == 8
+        assert abs(a["idf1"] - 0.5) < 1e-9 and list(sc["merged"]) == ["P1"] and sc["your_cows"] == 2
