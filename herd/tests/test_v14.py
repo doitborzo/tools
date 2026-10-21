@@ -646,3 +646,60 @@ def test_v14g_results_page_and_comparison_with_the_control():
         assert "control: onboarding 11:00-12:00 (60 min), scored 12:00-13:00" in text
         assert "| confirmed | **45.0%** | 30.0% | 22.5% | 15.0% |" in text
         assert "| oracle | **50.0%** | 30.0% |" in text
+
+
+def _fresh_barn(folder, drift, easy_hour=None, cows=12, dim=48, seed=0):
+    """MmCows-like labelled boxes over a day, 2 cameras, a frame every 60 s (every 15 s 12:00-15:00).
+    drift: how fast each cow's look wanders (stale album); easy_hour: an hour when every cow looks
+    like her average self, whatever album is used."""
+    rng = np.random.default_rng(seed)
+    base = rng.normal(size=(cows, dim))
+    walk = np.zeros((cows, dim))
+    frames, rows, feats = [], [], []
+    t0 = 1690261200.0                                        # 00:00 local, 25 July
+    t = t0
+    while t < t0 + 24 * 3600:
+        h = C.local_hour(t)
+        walk += rng.normal(scale=drift, size=walk.shape) * (15 / 60 if 12 <= h < 15 else 1)
+        noise = 2.0 if easy_hour is not None and easy_hour <= h < easy_hour + 1 else 4.0
+        for cam in ("cam_1", "cam_2"):
+            for c in range(cows):
+                rows.append({"frame": len(frames), "cow": c, "box": [0.05 * c, 0.1, 0.05 * c + 0.04, 0.2]})
+                feats.append(base[c] + walk[c] + rng.normal(scale=noise, size=dim))
+            frames.append({"cam": cam, "ts": t, "split": "train", "boxes": [], "path": ""})
+        t += 15 if 12 <= h < 15 else 60
+    os.makedirs(folder, exist_ok=True)
+    np.savez(os.path.join(folder, "assoc.npz"), box_feats=np.array(feats, np.float16), scene=np.zeros((1, 4, 4)))
+    for name, data in (("frames.jsonl", frames), ("assoc_rows.jsonl", rows)):
+        with open(os.path.join(folder, name), "w") as fh:
+            for r in data:
+                fh.write(json.dumps(r) + "\n")
+
+
+def test_freshness_tells_a_stale_album_from_an_easy_hour():
+    import freshness
+    with tempfile.TemporaryDirectory() as d:
+        _fresh_barn(os.path.join(d, "stale"), drift=0.25)
+        freshness.main(["--data", os.path.join(d, "stale"), "--model", "none", "--out", os.path.join(d, "o1"),
+                        "--min-cows", "10"])
+        f = json.load(open(os.path.join(d, "o1", "freshness.json")))
+        near, far = f["by_window_near"], f["by_window_far"]
+        both = [h for h in near if h in far]
+        assert len(both) >= 20
+        assert sum(near[h]["top1"] > far[h]["top1"] for h in both) >= 0.9 * len(both)   # near beats far for (almost) every album
+        g = f["by_gap"]
+        assert g["+5..+15"]["top1"] > g[">= +180"]["top1"] + 0.1 and g["-15..-5"]["top1"] > g["< -180"]["top1"] + 0.1
+        assert open(os.path.join(d, "o1", "FRESHNESS.md")).read().startswith("# Is the album going stale?")
+
+        _fresh_barn(os.path.join(d, "easy"), drift=0.0, easy_hour=13)
+        freshness.main(["--data", os.path.join(d, "easy"), "--model", "none", "--out", os.path.join(d, "o2"),
+                        "--min-cows", "10"])
+        f = json.load(open(os.path.join(d, "o2", "freshness.json")))
+        near, far = f["by_window_near"], f["by_window_far"]
+        both = [h for h in near if h in far]
+        gap = [near[h]["top1"] - far[h]["top1"] for h in both]
+        assert abs(float(np.mean(gap))) < 0.05                    # no drift: near and far alike for the album windows
+        g = f["by_gap"]
+        assert abs(g["+5..+15"]["top1"] - g[">= +180"]["top1"]) < 0.1
+        easy = [h for h in near if 13 <= float(h) < 14]           # the easy hour scores high, near and far alike ...
+        assert easy and min(near[h]["top1"] for h in easy) > float(np.mean([near[h]["top1"] for h in both])) + 0.05
