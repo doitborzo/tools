@@ -290,6 +290,9 @@ The second scores a rehearsal already made. The log and `trial/score.json` give:
   yours. IDP: of the cows it gave, the right one. IDR: of your boxes, the right cow.
 - The same per camera.
 - Which of its cows took two of yours (merged), and which of yours it split.
+- `trial/same_cow.html` when one of its cows took several of your names: they are shown side by side.
+  Often it is one cow that two cameras see, named once on each - say "same cow", save labels.json,
+  score again with it (and train with it). If they are two cows, "different": the system was wrong.
 
 Only the boxes a camera counts (its mask) are scored. Use the labels.json with the ids as the gallery
 page saved them (the same cow one id on every camera).

@@ -118,7 +118,7 @@ def idf1(co, n_true, n_pred):
             "mapping": {ts[i]: ps[j] for i, j in zip(r, c) if M[i, j] > 0}}
 
 
-def score(store_path, cfg, boxes_dir, labels_path, max_dt=0.6, min_iou=0.3):
+def score(store_path, cfg, boxes_dir, labels_path, max_dt=0.6, min_iou=0.3, page_dir=None):
     """Your labelled boxes (status done, with an id) against the second pass at the same camera and second.
 
     Only boxes this camera counts (its mask, zone) are scored - one in another camera's part of an overlap
@@ -189,7 +189,156 @@ def score(store_path, cfg, boxes_dir, labels_path, max_dt=0.6, min_iou=0.3):
     out["split"] = {t: dict(cnt.most_common()) for t, cnt in by_true.items() if len(big(cnt)) > 1}
     out["your_cows"], out["its_cows"] = len(by_true), len(by_pred)
     out["clock_shift_s"] = shift
+    if page_dir and out["merged"]:
+        out["same_cow_page"] = same_cow_page(page_dir, boxes_dir, labels, frames, out["merged"])
     return out
+
+
+def same_cow_page(out, boxes_dir, labels, frames, merged, per_cam=2):
+    """OUT/same_cow.html: for each of its cows that took several of your ids, your ids side by side (crops
+    from your frames, each camera) - one click says they are one cow (or not); Save gives labels.json with
+    those ids made one (the cow a second camera sees under another of your names)."""
+    from PIL import Image
+    folder = os.path.join(out, "same_cow")
+    os.makedirs(folder, exist_ok=True)
+    want = {i for ids in merged.values() for i in ids}
+    seen = collections.defaultdict(list)                       # your id -> [(cam, file, box)]
+    for file, lab in labels.items():
+        f = frames.get(file)
+        if lab.get("status") != "done" or not f:
+            continue
+        for b in lab.get("boxes", []):
+            if len(b) >= 5 and str(b[4]).strip() in want:
+                seen[str(b[4]).strip()].append((f["cam"], file, b[:4], f["ts"]))
+    crops = {}
+    for cid, items in seen.items():
+        out_c = []
+        for cam in sorted({c for c, _, _, _ in items}):
+            mine = sorted((x for x in items if x[0] == cam), key=lambda x: x[3])
+            for k in sorted({int(round(i)) for i in np.linspace(0, len(mine) - 1, min(per_cam, len(mine)))}):
+                _, file, b, _ = mine[k]
+                with Image.open(os.path.join(boxes_dir, file)) as im:
+                    w, h = im.size
+                    pad = 0.08
+                    c = im.convert("RGB").crop((int(max(0, (b[0] - pad * (b[2] - b[0])) * w)),
+                                                int(max(0, (b[1] - pad * (b[3] - b[1])) * h)),
+                                                int(min(w, (b[2] + pad * (b[2] - b[0])) * w)),
+                                                int(min(h, (b[3] + pad * (b[3] - b[1])) * h))))
+                    c.thumbnail((200, 200))
+                    name = f"{len(crops) * 10 + len(out_c)}_{cam}.jpg"
+                    c.save(os.path.join(folder, name), quality=88)
+                out_c.append({"src": f"same_cow/{name}", "cam": cam})
+        crops[cid] = {"crops": out_c, "cams": sorted({c for c, _, _, _ in items}), "boxes": len(items)}
+    cards = [{"cow": cow, "ids": [{"id": i, "n": n, **crops.get(i, {"crops": [], "cams": [], "boxes": 0})}
+                                  for i, n in ids.items()]}
+             for cow, ids in sorted(merged.items(), key=lambda kv: -sum(kv[1].values()))]
+    data = {"cards": cards, "labels": {"frames": labels}}
+    path = os.path.join(out, "same_cow.html")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(SAME_COW.replace("__DATA__", json.dumps(data).replace("</", "<\\/")))
+    return path
+
+
+SAME_COW = r"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>One cow, two names?</title>
+<style>
+:root { --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; --line: #d9d9d4; --card: #fff; --accent: #c2410c;
+  --yes: #15803d; --no: #b91c1c; }
+@media (prefers-color-scheme: dark) { :root { --bg: #161615; --fg: #ecece8; --muted: #9a9a94; --line: #34342f;
+  --card: #1f1f1d; --accent: #fb923c; --yes: #4ade80; --no: #f87171; } }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, sans-serif; }
+header { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line);
+  padding: 10px 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+h1 { font-size: 17px; margin: 0 8px 0 0; }
+button { font: inherit; padding: 5px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--card);
+  color: var(--fg); cursor: pointer; }
+button.main { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.on.yes { background: var(--yes); border-color: var(--yes); color: #fff; }
+button.on.no { background: var(--no); border-color: var(--no); color: #fff; }
+.help { padding: 8px 16px; color: var(--muted); max-width: 1000px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; margin: 12px 16px; padding: 10px 12px; }
+.card h2 { font-size: 15px; margin: 0 0 8px; color: var(--muted); font-weight: normal; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 6px 0; border-top: 1px solid var(--line); }
+.row:first-of-type { border-top: 0; }
+.name { min-width: 120px; }
+.name b { font-size: 18px; }
+.name small { display: block; color: var(--muted); }
+.crops { display: flex; gap: 6px; flex-wrap: wrap; }
+.crops figure { margin: 0; text-align: center; font-size: 12px; color: var(--muted); }
+.crops img { height: 120px; border-radius: 4px; display: block; }
+.ask { margin-left: auto; display: flex; gap: 6px; }
+</style></head><body>
+<header><h1>One cow, two names?</h1><button class="main" id="save">Save labels.json</button>
+<span id="state" style="color: var(--muted)"></span></header>
+<div class="help">The system gave one cow to boxes you named differently. Often it is one cow that two cameras
+see, named once on each - then say <b>same cow</b> and the second name becomes the first. If they are two cows,
+say <b>different</b>: the system was wrong there. Save gives labels.json with the names made one; score again
+with it (and use it for training).</div>
+<main id="cards"></main>
+<script>
+const DATA = __DATA__;
+const KEY = "same-cow:" + DATA.cards.map(c => c.cow).join(",");
+let ans = {};
+try { ans = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) { ans = {}; }
+const keep = () => { try { localStorage.setItem(KEY, JSON.stringify(ans)); } catch (e) {} };
+function render() {
+  const main = document.getElementById("cards");
+  main.innerHTML = "";
+  let asked = 0, done = 0;
+  DATA.cards.forEach(c => {
+    const card = document.createElement("div");
+    card.className = "card";
+    card.innerHTML = `<h2>The system's ${c.cow}</h2>`;
+    const first = c.ids[0].id;
+    c.ids.forEach((x, k) => {
+      const row = document.createElement("div");
+      row.className = "row";
+      const figs = x.crops.map(p => `<figure><img src="${p.src}" alt="${x.id}"><figcaption>${p.cam}</figcaption></figure>`).join("");
+      row.innerHTML = `<div class="name"><b>${x.id}</b><small>${x.n} boxes with it here; ${(x.cams || []).join(", ")}</small></div>
+        <div class="crops">${figs}</div>`;
+      if (k > 0) {
+        asked++;
+        const key = c.cow + "|" + x.id, a = ans[key];
+        if (a) done++;
+        const ask = document.createElement("div");
+        ask.className = "ask";
+        ask.innerHTML = `<button class="yes ${a === "same" ? "on" : ""}">same cow as ${first}</button>
+          <button class="no ${a === "diff" ? "on" : ""}">different</button>`;
+        ask.querySelector(".yes").onclick = () => { ans[key] = "same"; keep(); render(); };
+        ask.querySelector(".no").onclick = () => { ans[key] = "diff"; keep(); render(); };
+        row.appendChild(ask);
+      }
+      card.appendChild(row);
+    });
+    main.appendChild(card);
+  });
+  document.getElementById("state").textContent = done + " of " + asked + " answered";
+}
+function renames() {
+  const parent = {};
+  const root = x => { while (parent[x] && parent[x] !== x) x = parent[x]; return x; };
+  DATA.cards.forEach(c => c.ids.slice(1).forEach(x => {
+    if (ans[c.cow + "|" + x.id] === "same") {
+      const a = root(c.ids[0].id), b = root(x.id);
+      if (a !== b) parent[b] = a;
+    }
+  }));
+  const out = {};
+  Object.keys(parent).forEach(k => { const r = root(k); if (r !== k) out[k] = r; });
+  return out;
+}
+document.getElementById("save").onclick = () => {
+  const ren = renames(), lab = JSON.parse(JSON.stringify(DATA.labels));
+  Object.values(lab.frames).forEach(f => (f.boxes || []).forEach(b => {
+    if (b.length >= 5 && ren[String(b[4]).trim()] !== undefined) b[4] = ren[String(b[4]).trim()];
+  }));
+  const blob = new Blob([JSON.stringify(lab)], {type: "application/json"});
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "labels.json"; a.click();
+};
+render();
+</script></body></html>
+"""
 
 
 def clock_shift(store, frames):
@@ -225,6 +374,9 @@ def print_score(sc):
         print(f"  {c}: IDF1 {r['idf1']:.1%} (IDP {r['idp']:.1%}, IDR {r['idr']:.1%}) on {r['your_boxes']} boxes")
     print(f"  its cows: {sc['its_cows']} for your {sc['your_cows']}; one of its cows on several of yours (merged): "
           f"{len(sc['merged'])}; one of yours under several of its (split): {len(sc['split'])}")
+    if sc.get("same_cow_page"):
+        print(f"  one cow two names? {sc['same_cow_page']} - your names side by side: say which are one cow, save "
+              "labels.json, score again with it")
 
 
 def main(argv=None):
@@ -245,7 +397,7 @@ def main(argv=None):
             p.error("--score-only needs --boxes and --labels")
         cfg = load_config(args.config)
         out = os.path.abspath(args.out.rstrip("\\"))
-        sc = score(os.path.join(out, "pass2", "herd.sqlite"), cfg, args.boxes, args.labels)
+        sc = score(os.path.join(out, "pass2", "herd.sqlite"), cfg, args.boxes, args.labels, page_dir=out)
         with open(os.path.join(out, "score.json"), "w", encoding="utf-8") as fh:
             json.dump(sc, fh, indent=2)
         print_score(sc)
@@ -323,7 +475,7 @@ def main(argv=None):
               f"{res['held_back_herd_full']} more cows got no id - set it to the cows these cameras see (0: no "
               "limit)")
     if args.boxes and args.labels:
-        sc = score(store2, cfg, args.boxes, args.labels)
+        sc = score(store2, cfg, args.boxes, args.labels, page_dir=out)
         with open(os.path.join(out, "score.json"), "w", encoding="utf-8") as fh:
             json.dump(sc, fh, indent=2)
         print_score(sc)

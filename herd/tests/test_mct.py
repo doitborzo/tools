@@ -734,10 +734,19 @@ def test_trial_scored_against_your_ids():
         json.dump({"frames": {f["file"]: lab for f in frames}}, open(labels, "w"))
         cfg = _cfg()
         cfg["cameras"] = [{"id": "cam1", "mask": [[0, 0.3], [0.8, 0.3], [0.8, 0.8], [0, 0.8]]}]
-        sc = trial.score(st, cfg, boxes, labels)
+        from PIL import Image
+        os.makedirs(os.path.join(boxes, "cam1"))
+        for f in frames:
+            Image.new("RGB", (320, 180), (90, 70, 50)).save(os.path.join(boxes, f["file"]))
+        sc = trial.score(st, cfg, boxes, labels, page_dir=d)
         a = sc["all"]
         assert a["frames"] == 4 and a["frames_not_played"] == 1 and a["your_boxes"] == 8 and a["found"] == 8
         assert abs(a["idf1"] - 0.5) < 1e-9 and list(sc["merged"]) == ["P1"] and sc["your_cows"] == 2
+        # the page: your two names of its one cow side by side, the labels to save back
+        html = open(sc["same_cow_page"], encoding="utf-8").read()
+        data = json.loads(html.split("const DATA = ", 1)[1].split(";\n", 1)[0])
+        assert [x["id"] for x in data["cards"][0]["ids"]] == ["4", "7"] and len(data["labels"]["frames"]) == 5
+        assert all(os.path.exists(os.path.join(d, c["src"])) for x in data["cards"][0]["ids"] for c in x["crops"])
 
 
 def test_trial_score_finds_frames_cut_with_another_time_zone():
