@@ -257,11 +257,9 @@ def test_clicked_spots_instead_of_walking_cows():
         log = io.StringIO()
         with contextlib.redirect_stdout(log):
             autocalib.main(["--config", cfg, "--store", st, "--out", out, "--points", pj, "--apply"])
-        assert "spot(s) 5 off" in log.getvalue(), log.getvalue()
-        pts.pop(4)                                                           # fixed on the page: clicked again
-        json.dump({"pairs": {"cam1:cam2": pts}}, open(pj, "w"))
-        autocalib.main(["--config", cfg, "--store", st, "--out", out, "--points", pj, "--apply"])
+        assert "spot(s) 5 left out" in log.getvalue(), log.getvalue()          # named, and the rest used
         pair = json.load(open(os.path.join(out, "calib.json")))["pairs"]["cam1:cam2"]
+        assert pair["spots_left_out"] == [5] and pair["spots_used"] == 8
         assert pair["kA"] == 0.0 and pair["kB"] in (-0.1, -0.2, -0.3) and pair["share"] > 0.8, pair
         c = load_config(cfg)
         assert c["mct"]["disjoint"] == [["cam1", "cam9"]] and c["mct"]["mode"] == "link"
@@ -306,3 +304,28 @@ def test_pick_page():
         data = json.loads(html.split("const DATA = ", 1)[1].split(";\n", 1)[0])
         assert [(x["a"], x["b"]) for x in data] == [("cam1", "cam2")]
         assert all(os.path.getsize(os.path.join(out, x[k])) > 1000 for x in data for k in ("imgA", "imgB"))
+        # the spots clicked on it, drawn on the same pictures
+        spots = [(0.1, 0.4), (0.9, 0.45), (0.85, 0.9), (0.15, 0.85), (0.5, 0.6), (0.3, 0.7)]
+        json.dump({"pairs": {"cam1:cam2": [[u, v, u * 0.9 + 0.05, v] for u, v in spots]}},
+                  open(os.path.join(out, "points.json"), "w"))
+        autocalib.main(["--config", cfg, "--out", out, "--points", os.path.join(out, "points.json")])
+        assert os.path.getsize(os.path.join(out, "cam1_cam2_spots.jpg")) > 1000
+
+
+def test_spots_along_one_fence_are_refused():
+    """Spots clicked along one fence (one line on a picture) give no floor: refused, nothing written."""
+    import autocalib
+    HA, HB = _views()
+    spots = [(100 + 130 * i, 300 + 3 * i) for i in range(7)]
+    pts = [[*_seen(HA, p, 0.0), *_seen(HB, p, 0.0)] for p in spots]
+    with tempfile.TemporaryDirectory() as d:
+        pj = os.path.join(d, "points.json")
+        json.dump({"pairs": {"cam1:cam2": pts}}, open(pj, "w"))
+        cfg = os.path.join(d, "barn.toml")
+        open(cfg, "w").write(CONFIG)
+        try:
+            autocalib.main(["--config", cfg, "--out", os.path.join(d, "c"), "--points", pj, "--apply"])
+            raise AssertionError("calibrated from spots on one line")
+        except SystemExit as e:
+            assert "no camera pair calibrated" in str(e)
+        assert "mode" not in open(cfg).read().split("[mct]")[1].split("[[cameras]]")[0].replace("# mode", "")

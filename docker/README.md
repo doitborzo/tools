@@ -326,9 +326,11 @@ docker compose run --rm herd autocalib --config /data/barn.toml --videos /data/r
 docker compose run --rm herd autocalib --config /data/barn.toml --videos /data/rec_fixed --out /data/calib --points /data/calib/points.json --apply
 ```
 
-The log says per pair how well each spot is predicted from the others (a few px is good) and names a
-spot that is off - clicked on two different places: fix it on the page (it remembers your clicks),
-save, run again. Then the check on the cows (share, and what chance alone would give) and the
+The log says per pair how well each spot is predicted from the others (a few px is good). A spot that
+disagrees with all the others (clicked on two different places) is left out and named; spots along
+one line (one fence) or spots that agree on no floor are refused and nothing is written for that pair.
+`calib/cam1_cam2_spots.jpg` shows the spots numbered as on the page: green agree, red are off (with
+the px), grey were left out. Fix them on the page (it remembers your clicks), save, run again. Then the check on the cows (share, and what chance alone would give) and the
 pictures `calib/cam1_cam2.jpg`, `calib/cam3_cam4.jpg`. With `--apply` the pairs also leave `[mct]
 disjoint`; two groups of cameras that share no floor are kept far apart on the plan.
 
