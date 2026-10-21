@@ -118,7 +118,7 @@ def idf1(co, n_true, n_pred):
             "mapping": {ts[i]: ps[j] for i, j in zip(r, c) if M[i, j] > 0}}
 
 
-def score(store_path, cfg, boxes_dir, labels_path, max_dt=0.6, min_iou=0.3, page_dir=None):
+def score(store_path, cfg, boxes_dir, labels_path, max_dt=0.6, min_iou=0.3, page_dir=None, cameras=None):
     """Your labelled boxes (status done, with an id) against the second pass at the same camera and second.
 
     Only boxes this camera counts (its mask, zone) are scored - one in another camera's part of an overlap
@@ -133,9 +133,10 @@ def score(store_path, cfg, boxes_dir, labels_path, max_dt=0.6, min_iou=0.3, page
     store = Store(store_path)
     tm = report.track_map(store)
     frames = {f["file"]: f for f in json.load(open(os.path.join(boxes_dir, "frames.json"), encoding="utf-8"))["frames"]}
-    cams = {c["id"]: c for c in cfg["cameras"]}
+    cams = {c["id"]: c for c in cfg["cameras"] if not cameras or c["id"] in cameras}
     labels = read_labels(labels_path)
-    shift = clock_shift(store, [frames[k] for k, v in labels.items() if v.get("status") == "done" and k in frames])
+    shift = clock_shift(store, [frames[k] for k, v in labels.items() if v.get("status") == "done" and k in frames
+                                and frames[k]["cam"] in cams])
     co, cam_co = collections.Counter(), collections.defaultdict(collections.Counter)
     n = collections.Counter()                      # (cam, what) -> boxes
     for file, lab in labels.items():
@@ -391,17 +392,20 @@ def main(argv=None):
     p.add_argument("--boxes", default=None, help="your labelled frames (herd.py boxes: the folder with frames.json)")
     p.add_argument("--labels", default=None, help="their labels.json with cow ids: the second pass scored (IDF1)")
     p.add_argument("--score-only", action="store_true", help="score the trial already in --out, play nothing")
+    p.add_argument("--cameras", nargs="*", default=None, help="score these cameras only (one id across them)")
     args = p.parse_args(argv)
     if args.score_only:
         if not (args.boxes and args.labels):
             p.error("--score-only needs --boxes and --labels")
         cfg = load_config(args.config)
         out = os.path.abspath(args.out.rstrip("\\"))
-        sc = score(os.path.join(out, "pass2", "herd.sqlite"), cfg, args.boxes, args.labels, page_dir=out)
-        with open(os.path.join(out, "score.json"), "w", encoding="utf-8") as fh:
+        sc = score(os.path.join(out, "pass2", "herd.sqlite"), cfg, args.boxes, args.labels, page_dir=out,
+                   cameras=args.cameras)
+        name = "score.json" if not args.cameras else f"score_{'_'.join(args.cameras)}.json"
+        with open(os.path.join(out, name), "w", encoding="utf-8") as fh:
             json.dump(sc, fh, indent=2)
         print_score(sc)
-        print(f"-> {os.path.join(out, 'score.json')}")
+        print(f"-> {os.path.join(out, name)}")
         return
     if not args.videos:
         p.error("--videos is needed")
@@ -475,7 +479,7 @@ def main(argv=None):
               f"{res['held_back_herd_full']} more cows got no id - set it to the cows these cameras see (0: no "
               "limit)")
     if args.boxes and args.labels:
-        sc = score(store2, cfg, args.boxes, args.labels, page_dir=out)
+        sc = score(store2, cfg, args.boxes, args.labels, page_dir=out, cameras=args.cameras)
         with open(os.path.join(out, "score.json"), "w", encoding="utf-8") as fh:
             json.dump(sc, fh, indent=2)
         print_score(sc)

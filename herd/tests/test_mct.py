@@ -771,3 +771,4 @@ def test_trial_score_finds_frames_cut_with_another_time_zone():
         cfg["cameras"] = [{"id": "cam1", "mask": []}]
         sc = trial.score(st, cfg, boxes, labels)
         assert sc["clock_shift_s"] == 3600 and sc["all"]["frames"] == 8 and sc["all"]["idf1"] == 1.0, sc["all"]
+        assert trial.score(st, cfg, boxes, labels, cameras=["cam2"])["all"]["frames"] == 0     # cam1 left out
