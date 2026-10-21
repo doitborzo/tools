@@ -33,6 +33,10 @@
 #                                 8th 15 s frame per camera, ~2.5k frames), EXTRA_MAX (cap per set).
 #                                 DET_INIT=<a best/ of an RF-DETR of the same size>: fine-tuned from it
 #                                 (DET_EPOCHS=12, DET_LR=5e-5 by default), DET_TAG gets _ft.
+#                                 A herd_det_barn_*.tgz in WORK (herd.py boxes export: the barn's own
+#                                 frames, boxes corrected by hand) joins training, its frames BARN_REPEAT=3
+#                                 times, and is scored with the others (barn in eval_extra.json: its best-F1
+#                                 threshold is the one for [detector] threshold); BARN_DET=0: not.
 #                                 Licences: zenodo CC BY 4.0; mmcows CC BY-NC-SA 4.0 and opencows UK
 #                                 Non-Commercial Government Licence - non-commercial use only.
 #
@@ -153,14 +157,28 @@ case "${1:-}" in
             RF_SIZE="${RF_SIZE:-large}"
             EXTRA="${EXTRA:-}"                 # zenodo,mmcows,opencows: public sets added (extra_det.py)
             DET_INIT="${DET_INIT:-}"           # a best/ trained before: fine-tuned, not trained afresh
-            DET_TAG="${DET_TAG:-rfdetr_$RF_SIZE${EXTRA:+_${EXTRA//,/_}}${DET_INIT:+_ft}}"
-            DOUT="$WORK/herd/detector_${DET_TAG}"
             XDIR="$WORK/extra_det"
+            # the barn's own boxes (herd.py boxes export): the newest herd_det_barn_*.tgz in WORK
+            BARN_SET=""
+            bt="$(ls -t "$WORK"/herd_det_barn_*.tgz 2>/dev/null | head -1 || true)"
+            if [ -n "$bt" ] && [ "${BARN_DET:-1}" = "1" ]; then
+                rm -rf "$XDIR/barn" && mkdir -p "$XDIR" && tar -xzf "$bt" -C "$WORK"
+                [ -f "$XDIR/barn/train/_annotations.coco.json" ] || { echo "!! $bt: no extra_det/barn/train in it"; exit 1; }
+                BARN_SET=barn
+                echo "the barn's own boxes from $bt (each of its training frames ${BARN_REPEAT:-3} times)"
+            fi
+            DET_TAG="${DET_TAG:-rfdetr_$RF_SIZE${EXTRA:+_${EXTRA//,/_}}${BARN_SET:+_barn}${DET_INIT:+_ft}}"
+            DOUT="$WORK/herd/detector_${DET_TAG}"
             export PATH="$HOME/.local/bin:$PATH"
             "$VENV/bin/python" -c "import rfdetr, pytorch_lightning" 2>/dev/null || \
                 uv pip install --python "$VENV/bin/python" "rfdetr[train]"
             xdirs=()
             for x in ${EXTRA//,/ }; do xdirs+=("$XDIR/$x"); done
+            extraarg=()
+            [ -z "$BARN_SET" ] || xdirs+=("$XDIR/barn")
+            [ ${#xdirs[@]} -eq 0 ] || extraarg=(--extra "${xdirs[@]}")
+            [ -z "$BARN_SET" ] || extraarg+=(--repeat "barn=${BARN_REPEAT:-3}")
+            EVAL_SETS="$EXTRA${BARN_SET:+${EXTRA:+,}barn}"
             fetch=""
             # every set downloaded on the pod itself; the new detector and the others already
             # there are then compared on each set's valid frames
@@ -175,14 +193,14 @@ case "${1:-}" in
                        --tiles "${DET_TILES:-0}" --select "${DET_SELECT:-f1}" \
                        ${DET_RES:+--resolution "$DET_RES"} ${EXTRA_MAX:+--extra-max "$EXTRA_MAX"} \
                        ${DET_INIT:+--init "$DET_INIT"} \
-                       ${EXTRA:+--extra "${xdirs[@]}"})"
-            if [ -n "$EXTRA" ]; then
+                       "${extraarg[@]}")"
+            if [ -n "$EVAL_SETS" ]; then
                 dets=(--detector "$DOUT/best")
                 for b in "$WORK"/herd/detector_*/best; do
                     [ "$b" != "$DOUT/best" ] && [ -f "$b/det_train_meta.json" ] && dets+=(--detector "$b")
                 done
                 train="$train && $(q "$VENV/bin/python" "$REPO/cowbench/extra_det.py" eval --data "$XDIR" \
-                           --sources "$EXTRA" "${dets[@]}")"
+                           --sources "$EVAL_SETS" "${dets[@]}")"
             fi
         else
             [ -z "${EXTRA:-}" ] || { echo "EXTRA= (the public sets) is for DET_ARCH=rfdetr only"; exit 1; }

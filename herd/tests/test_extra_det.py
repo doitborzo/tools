@@ -69,6 +69,11 @@ def test_extra_merged_into_rfdetr_coco():
         assert all(im["file_name"].startswith("x_zenodo_") for im in coco["images"])
         assert len(coco["annotations"]) == a and {c["image_id"] for c in coco["annotations"]} <= {1, 2}
         assert os.path.exists(os.path.join(out, coco["images"][0]["file_name"]))
+        # a small set (the barn's) repeated: its images k times, under names of their own
+        n3, a3 = rfdetr_det.write_coco(None, [], os.path.join(d, "ds", "rep"), [("zenodo", src, 0)], {"zenodo": 2})
+        assert (n3, a3) == (6, 12)
+        names = [im["file_name"] for im in json.load(open(os.path.join(d, "ds", "rep", "_annotations.coco.json")))["images"]]
+        assert len(set(names)) == 6
 
 
 def test_rfdetr_init_from_own_detector():

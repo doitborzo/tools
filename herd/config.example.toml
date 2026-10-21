@@ -20,6 +20,8 @@ frame_width = 1920              # Full HD kept as it comes (wider frames are sca
 checkpoint = "/workspace/herd/run1/model.pt"     # abstain.json next to it is picked up
 # rumination = "/workspace/rum/model/rumination.pt"  # rumination.py's model (Kaggle + CVB): decides
 #                                                  # rumination in place of the herd model's head
+# identity = "/workspace/reid/id_model/identity.pt"  # reid.py's identity model (cows with ids, other
+#                                                  # days and cameras): the fingerprint and its NaN model
 
 [detector]
 weights = "/workspace/lora-runs/detector/best"   # RT-DETRv2 (cowbench/detector.py)
@@ -48,6 +50,9 @@ new_cow_similarity = 0.55       # bursts this similar are one cow when grouping 
                                 # start from same_cow_sim_p05 in abstain.json
 new_cow_min_bursts = 20         # a group needs this many bursts to become a new cow
 retire_after_hours = 48         # after a change-over, cows not seen this long have left
+max_cows = 0                    # the herd's size (e.g. 60); at it no new ids are made, unknowns wait
+claim_s = 120                   # a confirmed cow belongs to her track this long: a track seen at the
+claim_steal_margin = 0.08       # same time cannot be her unless its burst is this much surer
 
 [lameness]
 enabled = false                 # no lameness labels yet: the head exists, its output is not used
@@ -74,6 +79,43 @@ every_n = 10                    # 60 cows, a burst a minute each: ~360 of ~3600 
 max_gb = 200                    # stop keeping when the folder reaches this
 folder = "training_cache"       # next to the store unless absolute
 
+[mct]                           # one track per cow across cameras (mct.py); a cow's frame id is the
+enabled = false                 # herd model's transformer on one frame (herd/mct_pod.sh: thresholds)
+neighbours = []                 # camera pairs with a band of shared floor: [["cam1", "cam2"], ["cam2", "cam3"]]
+disjoint = []                   # pairs that share no floor at all: cows seen by both at once are two cows
+handover_s = 2.5                # a neighbour's cow seen this recently may be passed on
+handover_min_sim = 0.5          # frame id vs the track's running average, and at least
+handover_margin = 0.05          # this much above the next candidate (else a new track)
+reacquire_s = 10.0              # a cow hidden this long is taken back near where she was ...
+reacquire_sim = 0.7             # ... if her frame id is this close
+# late_sim = 0                  # a new track, after a few seconds, against the tracks its camera lost just
+                                # before (near): by the mean of her frame ids. Off at 0 (no gain on MmCows);
+                                # thresholds.json has a calibrated value to try. An identity model sets
+                                # reacquire_sim, handover_min_sim and the gallery's new_cow_similarity /
+                                # merge_similarity from its thresholds.json wherever this file keeps the default
+still_s = 60                    # a cow lying / standing still: her box back at the same place (IoU >=
+still_iou = 0.5                 # still_iou) within still_s is her, whatever she looks like
+# Calibrated cameras (per camera floor_points, see below): cows are passed between cameras by where
+# they stand, not by how they look - from opposite sides a cow does not look the same (MmCows: the
+# look passed 0.1% of cows right, the floor place - see herd/mct_eval.py)
+handover_dist = 100             # floor distance (the floor_points' units, e.g. cm) to be the same cow
+handover_dist_margin = 50       # and the next cow at least this much further
+apart_dist = 0                  # > 0: two cameras' cows this far apart at the same second are two cows
+# mode = "link"                 # each camera tracks its cows; tracks of two cameras that stand together on
+#                               # the floor for link_min_s seconds are joined (reports follow the joins)
+# link_dist = 160               # link: the floor distance (cm) to count as together
+# mode = "fused"                # all calibrated cameras on one floor plan, one tracker on the floor
+# fuse_dist = 160               # fused: points of different cameras this close (cm) are one cow
+# floor_area = [[0, 0], [2400, 0], [2400, 1200], [0, 1200]]   # fused: the pen's floor (cm); off it = phantom
+# a blind passage between two cameras: a cow lost by `from` min_s..max_s ago may come out in `to`
+# [[mct.portals]]
+# from = "cam2"
+# to = "cam5"
+# min_s = 5
+# max_s = 60
+# exit = [[0.8, 0.0], [1.0, 0.0], [1.0, 1.0], [0.8, 1.0]]   # optional: where she leaves `from`
+# entry = [[0.0, 0.0], [0.2, 0.0], [0.2, 1.0], [0.0, 1.0]]  # optional: where she enters `to`
+
 # One block per camera. The cameras look down and partly overlap: draw each
 # mask (0-1 frame coordinates, one polygon or a list of them) over the floor
 # that camera alone owns, so every patch of floor is in exactly one mask.
@@ -81,6 +123,13 @@ folder = "training_cache"       # next to the store unless absolute
 id = "cam1"
 url = "rtsp://user:password@10.0.0.11:554/stream1"
 mask = [[0.0, 0.0], [0.55, 0.0], [0.55, 1.0], [0.0, 1.0]]
+# with [mct] enabled: where it follows cows, reaching into the neighbour's floor (default: mask);
+# cows are still counted only in mask. handover_zone (optional): where a neighbour's cow may come in
+# tracking_mask = [[0.0, 0.0], [0.75, 0.0], [0.75, 1.0], [0.0, 1.0]]
+# handover_zone = [[0.45, 0.0], [0.75, 0.0], [0.75, 1.0], [0.45, 1.0]]
+# with [mct]: >= 4 marks on the floor, [u, v] in the frame (0-1) and [X, Y] measured (cm), the same
+# floor axes for every camera - cows are then handed over by where they stand
+# floor_points = [[0.10, 0.90, 0, 0], [0.90, 0.90, 800, 0], [0.80, 0.20, 800, 1200], [0.20, 0.20, 0, 1200]]
 # optional: a part of the view to grey out before the detector (one polygon or a list),
 # for what the size cut does not catch - e.g. a neighbour's pen behind a rail
 # exclude = [[0.0, 0.0], [1.0, 0.0], [1.0, 0.15], [0.0, 0.15]]

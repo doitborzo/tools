@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import http.client
 import io
 import json
 import os
@@ -105,10 +106,10 @@ class RemoteZip:
                 if len(data) != end - start + 1:
                     raise IOError(f"short read {len(data)} of {end - start + 1}")
                 return data
-            except (urllib.error.URLError, IOError, TimeoutError, ConnectionError) as e:
+            except (urllib.error.URLError, http.client.HTTPException, IOError, TimeoutError, ConnectionError) as e:
                 if k == self.tries - 1:
                     raise
-                time.sleep(2 ** k)
+                time.sleep(_wait(e, k))
                 print(f"\n  retry {k + 1} ({e.__class__.__name__}: {e})", flush=True)
 
     def names(self):
@@ -151,14 +152,26 @@ def download(url, path, tries=8):
                         break
                     fh.write(chunk)
                     print(f"\r  {fh.tell() / 2**20:.0f} / {total / 2**20:.0f} MB", end="", flush=True)
+                got = fh.tell()
             print(flush=True)
+            if total and got < total:              # the server closed early without an error: resume it
+                raise IOError(f"cut short at {got / 2**20:.0f} of {total / 2**20:.0f} MB")
             os.replace(part, path)
             return path
-        except (urllib.error.URLError, IOError, TimeoutError, ConnectionError) as e:
+        except (urllib.error.URLError, http.client.HTTPException, IOError, TimeoutError, ConnectionError) as e:
             if k == tries - 1:
                 raise
             print(f"\n  retry {k + 1} ({e.__class__.__name__}: {e})", flush=True)
-            time.sleep(2 ** k)
+            time.sleep(_wait(e, k))
+
+
+def _wait(e, k):
+    """Seconds before retry k: doubling, or what a 429 / 503 asks for (Retry-After) when it asks for more."""
+    after = getattr(e, "headers", None) and e.headers.get("Retry-After")
+    try:
+        return max(2 ** k, min(600.0, float(after))) if after else 2 ** k
+    except ValueError:
+        return 2 ** k
 
 
 def open_zip(url, cache_dir, name, whole_below=1 << 30):
@@ -168,7 +181,7 @@ def open_zip(url, cache_dir, name, whole_below=1 << 30):
             with urllib.request.urlopen(urllib.request.Request(url, method="HEAD", headers=UA), timeout=60) as r:
                 size = int(r.headers["Content-Length"])
             break
-        except (urllib.error.URLError, IOError, TimeoutError, ConnectionError):
+        except (urllib.error.URLError, http.client.HTTPException, IOError, TimeoutError, ConnectionError):
             if k == 5:
                 raise
             time.sleep(2 ** k)
@@ -434,9 +447,10 @@ def cmd_cbvd_videos(args):
     print(f"[cbvd-videos] {len(vids)} val clips -> {out} (annotation files in {dest}/annotations)")
 
 
-def _sources(s):
+def _sources(s, data=None):
+    """Set names; with data (eval), also a set already there that is not fetched (the barn's: box_dataset.py)."""
     names = [x.strip() for x in s.split(",") if x.strip()]
-    bad = [x for x in names if x not in SOURCES]
+    bad = [x for x in names if x not in SOURCES and not (data and os.path.isdir(os.path.join(data, x)))]
     if bad:
         sys.exit(f"unknown source(s) {bad}; known: {', '.join(SOURCES)}")
     return names
@@ -471,7 +485,7 @@ def cmd_eval(args):
             own = json.load(fh)["threshold"]
         tag = os.path.basename(os.path.dirname(os.path.abspath(best)))
         report[tag] = {"detector": os.path.abspath(best), "threshold": own}
-        for name in _sources(args.sources):
+        for name in _sources(args.sources, args.data):
             folder = os.path.join(args.data, name, "valid")
             if not os.path.exists(os.path.join(folder, "_annotations.coco.json")):
                 print(f"[extra-eval] {name}: not fetched, skipped")

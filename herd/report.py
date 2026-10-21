@@ -60,15 +60,22 @@ def day_expr(cfg):
 
 def track_map(store, min_share=2 / 3):
     """track -> cow from its confirmed bursts; tracks without a clear majority are left out."""
+    aliases = store.aliases() if hasattr(store, "aliases") else {}   # a merged profile counts as its cow
+    roots = store.track_roots() if hasattr(store, "track_roots") else {}   # tracks joined across cameras
     votes = {}
     for track, cow, n in store.query("SELECT track, cow, COUNT(*) FROM bursts WHERE state='confirmed' "
                                      "GROUP BY track, cow"):
-        votes.setdefault(track, {})[cow] = n
+        cow = aliases.get(cow, cow)
+        key = roots.get(track, track)
+        votes.setdefault(key, {})[cow] = votes.get(key, {}).get(cow, 0) + n
     out = {}
     for track, v in votes.items():
         cow, n = max(v.items(), key=lambda kv: kv[1])
         if n >= min_share * sum(v.values()):
             out[track] = cow
+    for track, root in roots.items():                          # every joined track is its root's cow
+        if root in out:
+            out[track] = out[root]
     return out
 
 
@@ -94,9 +101,10 @@ def daily(store, cfg, since=None, until=None):
                {sec("s.activity='feeding'")}, {sec("s.activity='drinking'")}, {sec("s.activity='none'")}
         FROM seconds s LEFT JOIN temp.trackmap m ON s.track = m.track {w}
         GROUP BY m.cow, d""")
-    # unidentified tracks overlap in time, so their seconds are counted per track
+    # unidentified tracks overlap in time, so their seconds are counted per track (once per second)
     nan_rows = store.query(f"""
-        SELECT {day.replace('ts', 's.ts')} AS d, COUNT(*) FROM seconds s LEFT JOIN temp.trackmap m
+        SELECT {day.replace('ts', 's.ts')} AS d, COUNT(DISTINCT s.track || ':' || CAST(s.ts AS INTEGER))
+        FROM seconds s LEFT JOIN temp.trackmap m
         ON s.track = m.track {w + (' AND' if w else 'WHERE')} m.cow IS NULL GROUP BY d""")
     bw = w.replace("s.ts", "b.ts")
     bursts = store.query(f"""

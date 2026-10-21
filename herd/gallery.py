@@ -118,16 +118,17 @@ class Gallery:
         os.replace(js + ".part", js)
 
     # ------------------------------------------------------------------ match
-    def match(self, fp, quality_max=0.0, quality_mean=0.0, area=0.05):
-        """-> {"state": confirmed|tentative|unknown, "cow", "sim", "margin", "p"}."""
-        fp = _norm(fp)
-        if not self.cows:
-            return {"state": "unknown", "cow": None, "sim": None, "margin": None, "p": None}
+    def _sims(self, fp):
+        """Every cow's best prototype similarity to fp -> (ids, sims)."""
         ids = list(self.cows)
-        best_per_cow = np.array([float(np.max(self.cows[c]["prototypes"] @ fp)) for c in ids])
-        order = np.argsort(-best_per_cow)
-        best, sim = ids[order[0]], float(best_per_cow[order[0]])
-        second = float(best_per_cow[order[1]]) if len(ids) > 1 else -1.0
+        return ids, np.array([float(np.max(self.cows[c]["prototypes"] @ fp)) for c in ids])
+
+    def _decide(self, ids, sims, i, allowed, quality_max, quality_mean, area):
+        """The decision for cow ids[i]; the margin is to the best other cow still allowed (a cow known
+        to be elsewhere at this moment is not a rival)."""
+        sim = float(sims[i])
+        rivals = [float(sims[k]) for k in allowed if k != i]
+        second = max(rivals) if rivals else -1.0
         margin = sim - second
         if self.abstain:
             row = {"sim": sim, "margin": margin, "quality_max": quality_max, "quality_mean": quality_mean,
@@ -144,7 +145,60 @@ class Gallery:
             state = "tentative"
         else:
             state = "unknown"
-        return {"state": state, "cow": best if state != "unknown" else None, "sim": sim, "margin": margin, "p": p}
+        return {"state": state, "cow": ids[i] if state != "unknown" else None, "sim": sim, "margin": margin,
+                "p": p}
+
+    @staticmethod
+    def _unknown():
+        return {"state": "unknown", "cow": None, "sim": None, "margin": None, "p": None}
+
+    def match(self, fp, quality_max=0.0, quality_mean=0.0, area=0.05, exclude=()):
+        """-> {"state": confirmed|tentative|unknown, "cow", "sim", "margin", "p"}.
+        exclude: cows that cannot be this one (seen elsewhere at the same time)."""
+        fp = _norm(fp)
+        if not self.cows:
+            return self._unknown()
+        ids, sims = self._sims(fp)
+        allowed = [k for k, c in enumerate(ids) if c not in exclude]
+        if not allowed:
+            return self._unknown()
+        i = max(allowed, key=lambda k: sims[k])
+        return self._decide(ids, sims, i, allowed, quality_max, quality_mean, area)
+
+    def match_batch(self, items, exclude=None):
+        """Bursts seen at the same moment (one camera's burst) -> one decision each, no cow given to two
+        of them: the assignment that maximises the summed similarity (Hungarian; greedy without scipy).
+        items [{"fingerprint", "quality_max", "quality_mean", "area"}]; exclude: per item, cows it cannot be."""
+        exclude = exclude or [()] * len(items)
+        if not self.cows or not items:
+            return [self._unknown() for _ in items]
+        fps = [_norm(it["fingerprint"]) for it in items]
+        ids = list(self.cows)
+        S = np.stack([self._sims(fp)[1] for fp in fps])                  # (items, cows)
+        banned = np.array([[c in ex for c in ids] for ex in exclude], bool)
+        # exp(sim / 0.05), not sim: a near-certain match is never given away to lift a weaker one's
+        # similarity (summed sims would swap A 1.0 / B 0.8 against a second burst's A 0.95 / B 0.7)
+        cost = np.where(banned, 10.0, -np.exp((np.clip(S, -1.0, 1.0) - 1.0) / 0.05))
+        try:
+            from scipy.optimize import linear_sum_assignment
+            rows, cols = linear_sum_assignment(cost)
+        except ImportError:                                               # greedy, best pairs first
+            rows, cols, ur, uc = [], [], set(), set()
+            for flat in np.argsort(cost, axis=None):
+                r, c = divmod(int(flat), cost.shape[1])
+                if r not in ur and c not in uc:
+                    rows.append(r), cols.append(c), ur.add(r), uc.add(c)
+        assigned = {int(r): int(c) for r, c in zip(rows, cols) if not banned[r, c]}
+        out = []
+        for r, it in enumerate(items):
+            taken = {c for rr, c in assigned.items() if rr != r}              # the other bursts' cows
+            allowed = [k for k in range(len(ids)) if not banned[r, k] and k not in taken]
+            if r not in assigned or not allowed:
+                out.append(self._unknown())
+                continue
+            out.append(self._decide(ids, S[r], assigned[r], allowed, it.get("quality_max", 0.0),
+                                    it.get("quality_mean", 0.0), it.get("area", 0.05)))
+        return out
 
     def observe(self, decision, fp, ts, track):
         """Record a decided burst: confirmed -> the cow's history; unknown -> the pool."""
@@ -195,36 +249,65 @@ class Gallery:
                 self.cows[c]["prototypes"] = spherical_kmeans(X, k).astype(np.float32)
         self.pool = [p for p in self.pool if p["ts"] >= keep_after]
 
-    def enroll(self, now):
-        """Group the unknown pool into new cows. Bursts of one track are one cow,
-        so tracks are grouped (by their mean fingerprint), greedily, then the
-        groups seen often enough become cows."""
+    def enroll(self, now, cannot_link=None):
+        """Group the unknown pool into new cows. Bursts of one track are one cow, so tracks are grouped:
+        average-linkage agglomeration of their mean fingerprints, where two groups never merge if any
+        track of one was seen at the same time as any track of the other (cannot_link: two cows). The
+        groups seen often enough become cows - unless the herd is full (max_cows), then they wait."""
         if not self.pool:
             return []
+        cannot_link = cannot_link or set()
         by_track = {}
         for p in self.pool:
             by_track.setdefault(p["track"], []).append(p)
         units = [(tr, _norm(np.mean([p["fp"] for p in ps], 0)), ps) for tr, ps in by_track.items()]
         units.sort(key=lambda u: -len(u[2]))
-        groups = []                                    # [centre, [units]]
+        n = len(units)
+        U = np.stack([u[1] for u in units])
+        sim_sum = U @ U.T                                   # cluster x cluster sums of member similarities
+        size = np.ones(n)
+        apart = np.zeros((n, n), bool)
+        for a in range(n):
+            for b in range(a + 1, n):
+                ta, tb = units[a][0], units[b][0]
+                if (min(ta, tb), max(ta, tb)) in cannot_link:
+                    apart[a, b] = apart[b, a] = True
+        members = {k: [k] for k in range(n)}
         thr = self.cfg["new_cow_similarity"]
-        for u in units:
-            sims = [float(g[0] @ u[1]) for g in groups]
-            if sims and max(sims) >= thr:
-                g = groups[int(np.argmax(sims))]
-                g[1].append(u)
-                g[0] = _norm(np.mean([x[1] for x in g[1]], 0))
-            else:
-                groups.append([u[1], [u]])
+        while len(members) > 1:
+            keys = list(members)
+            best, pair = thr, None
+            for i, a in enumerate(keys):
+                for b in keys[i + 1:]:
+                    if apart[a, b]:
+                        continue
+                    v = sim_sum[a, b] / (size[a] * size[b])
+                    if v >= best:
+                        best, pair = v, (a, b)
+            if pair is None:
+                break
+            a, b = pair                                     # b into a
+            members[a] += members.pop(b)
+            sim_sum[a, :] += sim_sum[b, :]
+            sim_sum[:, a] += sim_sum[:, b]
+            size[a] += size[b]
+            apart[a, :] |= apart[b, :]
+            apart[:, a] |= apart[:, b]
+        groups = sorted(members.values(), key=lambda m: -sum(len(units[k][2]) for k in m))
         day = dt.datetime.fromtimestamp(now, dt.timezone.utc).strftime("%Y%m%d")
         made = []
-        for centre, members in groups:
-            bursts = [p for _, _, ps in members for p in ps]
+        self.held_back = 0
+        limit = int(self.cfg.get("max_cows") or 0)
+        for g in groups:
+            bursts = [p for k in g for p in units[k][2]]
             if len(bursts) < self.cfg["new_cow_min_bursts"]:
                 continue
-            n = self.next_new.get(day, 0) + 1
-            self.next_new[day] = n
-            cid = f"new-{day}-{n:02d}"
+            if limit and len(self.cows) >= limit:           # the herd is full: no new id, the bursts wait
+                self.held_back += 1
+                continue
+            k_new = self.next_new.get(day, 0) + 1
+            self.next_new[day] = k_new
+            cid = f"new-{day}-{k_new:02d}"
             X = np.stack([p["fp"] for p in bursts])
             k = min(self.cfg["prototypes_per_cow"], max(1, len(bursts) // 5))
             self.cows[cid] = {"prototypes": spherical_kmeans(X, k).astype(np.float32), "created": now,
@@ -235,10 +318,11 @@ class Gallery:
             self.pool = [p for p in self.pool if id(p) not in used]
         return made
 
-    def nightly(self, now):
+    def nightly(self, now, cannot_link=None):
         """retire -> rebuild -> enroll; returns what changed, for the log."""
         gone = self.retire(now)
         self.rebuild(now)
-        made = self.enroll(now)
+        made = self.enroll(now, cannot_link)
         self.save()
-        return {"retired": gone, "enrolled": made, "cows": len(self.cows), "pool": len(self.pool)}
+        return {"retired": gone, "enrolled": made, "held_back_herd_full": getattr(self, "held_back", 0),
+                "cows": len(self.cows), "pool": len(self.pool)}

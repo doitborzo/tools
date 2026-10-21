@@ -18,6 +18,9 @@ nothing is analysed at 25 fps except bursts:
 
 Cameras see the barn from above and partly overlap: each camera's mask (in
 config) covers only the floor it owns, so a cow is counted by one camera.
+With [mct] enabled each camera tracks in its wider tracking_mask and one
+GlobalTracker (mct.py) gives a cow one track across cameras by her frame id;
+seconds and bursts are still written only by the camera whose mask owns her.
 
     python pipeline.py --config barn.toml                     # live, RTSP urls in config
     python pipeline.py --config barn.toml --start 2026-10-07T06:00:00   # files, as recorded at that time
@@ -38,41 +41,76 @@ import time
 
 import numpy as np
 
-from common import (ACTIVITIES, POSTURES, blank_excluded, crop, device, in_zone, interpolate_box, iou,
-                    load_config)
+from common import (ACTIVITIES, DEFAULTS, POSTURES, blank_excluded, crop, device, in_mask, in_zone, interpolate_box,
+                    iou, load_config, same_place)
 from motion import motion_features
 
 
 # ------------------------------------------------------------------ tracker
 
 class Tracker:
-    """IoU tracker for 1 fps: cows move little in a second, seen from above."""
+    """IoU tracker for 1 fps: cows move little in a second, seen from above.
 
-    def __init__(self, cam, min_iou=0.3, max_age_s=5):
+    The detector loses lying cows for seconds to minutes: her box back at the same place (common.same_place)
+    within still_s is her, and within still_long_s when she had not moved for still_for_s before - one
+    that walked is not waited for that long (another cow may lie down where she was)."""
+
+    def __init__(self, cam, min_iou=0.3, max_age_s=5, still_s=0.0, still_iou=0.5, still_contain=0.8,
+                 still_for_s=30.0, still_moved=0.3, still_long_s=0.0):
         self.cam, self.min_iou, self.max_age = cam, min_iou, max_age_s
-        self.tracks = {}            # id -> {"box", "last"}
+        self.still_s, self.still_iou, self.still_contain = still_s, still_iou, still_contain
+        self.still_long = still_long_s
+        self.still_for, self.still_moved = still_for_s, still_moved
+        self.tracks = {}            # id -> {"box", "last", "anchor", "since"}
         self.history = collections.defaultdict(lambda: collections.deque(maxlen=120))
-        self.n = 0
+        self.n, self.prev = 0, None
+
+    def _held(self, t, ts):
+        """Still waited for at ts, lost at the same place."""
+        age = ts - t["last"]
+        return age <= self.still_s or (age <= self.still_long and t["last"] - t["since"] >= self.still_for)
+
+    def _seen(self, tid, ts, box):
+        prev = self.tracks.get(tid)
+        anchor, since = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2), ts
+        if prev is not None and math.hypot(prev["anchor"][0] - anchor[0], prev["anchor"][1] - anchor[1]) \
+                <= self.still_moved * max(box[3] - box[1], 1e-6):
+            anchor, since = prev["anchor"], prev["since"]
+        self.tracks[tid] = {"box": box, "last": ts, "anchor": anchor, "since": since}
 
     def update(self, ts, boxes):
+        live = lambda t: self.prev is None or self.prev - t["last"] <= self.max_age   # alive at the last second
         pairs = sorted(((iou(t["box"], b), tid, j) for tid, t in self.tracks.items()
-                        for j, b in enumerate(boxes)), reverse=True)
+                        if live(t) for j, b in enumerate(boxes)), reverse=True)
         used_t, used_b, out = set(), set(), []
         for v, tid, j in pairs:
             if v < self.min_iou or tid in used_t or j in used_b:
                 continue
             used_t.add(tid), used_b.add(j)
-            self.tracks[tid] = {"box": boxes[j], "last": ts}
+            self._seen(tid, ts, boxes[j])
+            out.append((tid, boxes[j]))
+        # lying still, lost a while: back at the same place
+        held = sorted(((iou(t["box"], b), tid, j) for tid, t in self.tracks.items()
+                       if tid not in used_t and not live(t) and self._held(t, ts)
+                       for j, b in enumerate(boxes) if j not in used_b), reverse=True)
+        for v, tid, j in held:
+            if tid in used_t or j in used_b or not same_place(self.tracks[tid]["box"], boxes[j], self.still_iou,
+                                                               self.still_contain):
+                continue
+            used_t.add(tid), used_b.add(j)
+            self._seen(tid, ts, boxes[j])
             out.append((tid, boxes[j]))
         for j, b in enumerate(boxes):
             if j not in used_b:
                 self.n += 1
                 tid = f"{self.cam}-{int(ts)}-{self.n}"
-                self.tracks[tid] = {"box": b, "last": ts}
+                self._seen(tid, ts, b)
                 out.append((tid, b))
-        self.tracks = {k: v for k, v in self.tracks.items() if ts - v["last"] <= self.max_age}
+        self.tracks = {k: v for k, v in self.tracks.items()
+                       if ts - v["last"] <= self.max_age or self._held(v, ts)}
         for tid, b in out:
             self.history[tid].append((ts, b))
+        self.prev = ts
         return out
 
     def track_at(self, ts, box):
@@ -127,6 +165,13 @@ class Models:
         self.gpu = GpuLock()
         self.dev = device()
         ck_path = cfg["model"]["checkpoint"]
+        for what, path, needs in (("[model] checkpoint", ck_path, None),
+                                  ("[detector] weights", cfg["detector"]["weights"], "det_train_meta.json")):
+            if detector is not None and needs:
+                continue
+            if not path or not os.path.exists(os.path.join(path, needs) if needs else path):
+                raise SystemExit(f'{what} = "{path}": no such {"best/ folder" if needs else "file"} - set it in the '
+                                 f'config (in Docker: `models` lists what the image has, `init` fills it in)')
         self.model, ck = HerdModel.load(ck_path, map_location=self.dev)
         self.model.to(self.dev).eval()
         feat = ck.get("features", {})
@@ -160,6 +205,14 @@ class Models:
             self.rum_model.load_state_dict(rk["state"])
             self.rum_model_thr = float(rk["threshold"])
             self.motion_dim = max(self.motion_dim, rk["kw"].get("motion_dim", 0))
+        # reid.py's identity model, when the config names one: the fingerprint (bursts, and one frame a
+        # second for mct.py) comes from it - taught on cows with ids - and the gallery takes its abstain.json
+        self.id_model, self.id_abstain, self.id_thresholds = None, None, {}
+        ip = cfg["model"].get("identity")
+        if ip:
+            from reid import identity_thresholds, load_identity
+            self.id_model, self.id_abstain = load_identity(ip, self.features_meta, self.dev)
+            self.id_thresholds = identity_thresholds(ip)   # its own similarity thresholds (reid.calibrate)
         # The cut-off calibrated with the model: "ruminating" per burst, summed
         # into minutes by the reports (the one that keeps the share true).
         try:
@@ -201,12 +254,21 @@ class Models:
                 self._sync()
         return torch.cat(out) if out else torch.zeros((0, self.encoder.out_dim), device=self.dev)
 
-    def frame_heads(self, feats, boxes, urgent=True, kind="heads"):
+    def frame_heads(self, feats, boxes, urgent=True, kind="heads", with_id=False):
+        """Posture and activity per box; with_id also the frame id (model.frame_fingerprint)."""
         from model import box_pos
         with self.gpu(urgent, kind), self.torch.no_grad():
             pos = self.torch.tensor([box_pos(b) for b in boxes], device=self.dev).float()
             o = self.model.frame(feats, pos)
-            return o["posture"].softmax(-1).cpu().numpy(), o["activity"].softmax(-1).cpu().numpy()
+            pp, pa = o["posture"].softmax(-1).cpu().numpy(), o["activity"].softmax(-1).cpu().numpy()
+            if not with_id:
+                return pp, pa
+            if self.id_model is not None:
+                x = feats.float().unsqueeze(1)
+                o = self.id_model(x, x.new_zeros(len(x), 1), self.torch.ones(len(x), 1, dtype=self.torch.bool,
+                                                                               device=self.dev), pos)
+                return pp, pa, o["fingerprint"].float().cpu().numpy()
+            return pp, pa, self.model.frame_fingerprint(feats.float(), pos).float().cpu().numpy()
 
     def burst(self, feats, times, valid, boxes, motion=None, urgent=False, kind="temporal"):
         from model import box_pos
@@ -228,6 +290,12 @@ class Models:
                                    torch.as_tensor(valid, device=self.dev).unsqueeze(0),
                                    motion=mot if self.rum_model.motion_dim else None)
                 out["rumination"] = float(r["rumination"][0].sigmoid())
+            if self.id_model is not None:
+                i = self.id_model(feats.unsqueeze(0).float(), torch.as_tensor(times, device=self.dev).unsqueeze(0).float(),
+                                  torch.as_tensor(valid, device=self.dev).unsqueeze(0), pos)
+                out["fingerprint"] = i["fingerprint"][0].cpu().numpy()
+                out["quality_max"] = float(i["weights"][0].max())
+                out["quality_mean"] = float(i["quality"][0][torch.as_tensor(valid, device=self.dev)].mean())
         if self.rum_model is not None:
             out["ruminating"] = bool(out["rumination"] >= self.rum_model_thr)
             return out
@@ -292,13 +360,17 @@ class Camera:
         self.buffer = collections.deque()
         self.buffer_s = self.burst_s + 3
         self.buf_lock, self.trk_lock = threading.Lock(), threading.Lock()
-        self.tracker = Tracker(self.id, cfg["tracker"]["iou"], cfg["tracker"]["max_age_s"])
+        tk = cfg["tracker"]
+        self.tracker = Tracker(self.id, tk["iou"], tk["max_age_s"], tk.get("still_s", 0.0), tk.get("still_iou", 0.5),
+                               tk.get("still_contain", 0.8), tk.get("still_for_s", 30.0), tk.get("still_moved", 0.3),
+                               tk.get("still_long_s", 0.0))
         self.next_second = start_ts
         # Cameras burst in turn, not all at once: one GPU, an even load.
         self.next_burst = start_ts + self.burst_every * index / max(1, n_cams)
         self.stats = collections.Counter()
         self.timings = None          # a list to record every tick and burst into (stress.py)
         self.cache = None            # barn_dataset.TrainingCache, when [training_cache] enabled
+        self.glob = None             # mct.GlobalTracker, when [mct] enabled: one track per cow across cameras
 
     def push(self, ts, frame_rgb):
         h, w = frame_rgb.shape[:2]
@@ -318,7 +390,7 @@ class Camera:
         """Boxes in the camera's working zone; the rest (far, too small, another
         camera's floor) are dropped here and never tracked or identified."""
         h, w = img.shape[:2]
-        keep = [b for b in boxes if in_zone(b, self.cam, w, h)]
+        keep = [b for b in boxes if in_zone(b, self.cam, w, h, tracking=self.glob is not None)]
         self.stats["boxes_outside_zone"] += len(boxes) - len(keep)
         return keep
 
@@ -362,8 +434,14 @@ class Camera:
     def second(self, ts, img):
         start = time.time()
         boxes = self.zone(self.models.detect(self.blank(img), urgent=True, kind="second_detect"), img)
+        if self.glob is not None:
+            return self._second_global(ts, img, boxes, start)
         with self.trk_lock:
             tracked = self.tracker.update(ts, boxes)
+        if len(tracked) > 1 and hasattr(self.gallery, "together"):
+            self.gallery.together([tid for tid, _ in tracked], ts, [b for _, b in tracked])   # two cows, with evidence
+        if tracked and hasattr(self.gallery, "counted"):
+            self.gallery.counted(self.id, ts, [tid for tid, _ in tracked])                # in its zone: counted here
         if tracked:
             size = self.models.crop_size
             feats = self.models.encode(crops_of([(img, b) for _, b in tracked], size, self.models.margin),
@@ -375,6 +453,40 @@ class Camera:
         self.stats["seconds"] += 1
         self.stats["cow_seconds"] += len(tracked)
         self._time("second", ts, start=start, end=time.time(), cows=len(tracked))
+
+    def _second_global(self, ts, img, boxes, start):
+        """The second with mct.py: every box in the tracking zone is encoded first, its frame id
+        carries the cow from camera to camera; only the boxes this camera owns (its mask) are
+        counted, so a cow in an overlap is one row, under one track, whichever camera sees her."""
+        rows, owned_n = [], 0
+        if boxes:
+            feats = self.models.encode(crops_of([(img, b) for b in boxes], self.models.crop_size, self.models.margin),
+                                       urgent=True, kind="second_encode")
+            pp, pa, ids = self.models.frame_heads(feats, boxes, with_id=True)
+            lying = POSTURES.index("lying")
+            gids = self.glob.update(self.id, ts, [{"box": b, "emb": e, "p_lying": float(p[lying])}
+                                                  for b, e, p in zip(boxes, ids, pp)])
+            if len(gids) > 1 and hasattr(self.gallery, "together"):
+                self.gallery.together(gids, ts, boxes)              # two cows, with evidence (mct.CoSeen)
+            for gid, b, p, a in zip(gids, boxes, pp, pa):
+                if in_mask(b, self.mask):
+                    rows.append((self.id, gid, ts, *b, POSTURES[int(p.argmax())], ACTIVITIES[int(a.argmax())],
+                                 float(p[POSTURES.index("lying")])))
+            owned_n = len(rows)
+            if rows:
+                self.store.seconds(rows)
+                if hasattr(self.gallery, "counted"):
+                    self.gallery.counted(self.id, ts, [r[1] for r in rows])
+        self.stats["seconds"] += 1
+        self.stats["cow_seconds"] += owned_n
+        self.stats["cow_seconds_tracked_not_owned"] += len(boxes) - owned_n
+        self._time("second", ts, start=start, end=time.time(), cows=owned_n)
+
+    def _track_of(self, ts, box):
+        if self.glob is not None:
+            return self.glob.track_at(self.id, ts, box)
+        with self.trk_lock:
+            return self.tracker.track_at(ts, box)
 
     # 7 s at 25 fps
     def burst(self, t0, frames):
@@ -390,13 +502,15 @@ class Camera:
         size = self.models.crop_size
         cows = crops_n = rum_yes = 0
         rum_p = []
+        done = []                                   # the burst's cows, decided together below
         for ch in chains:
             if len(ch) < max(2, 0.5 * len(sampled)):      # seen in too little of the burst
                 continue
             times = sorted(ch)
             mid = times[len(times) // 2]
-            with self.trk_lock:
-                tid = self.tracker.track_at(mid, ch[mid]) or f"{self.id}-burst-{int(t0)}-{times[0]:.0f}"
+            if self.glob is not None and not in_mask(ch[mid], self.mask):
+                continue                                  # tracked here, counted by the camera that owns it
+            tid = self._track_of(mid, ch[mid]) or f"{self.id}-burst-{int(t0)}-{times[0]:.0f}"
             valid = np.array([times[0] - 0.5 <= ts <= times[-1] + 0.5 for ts, _ in frames])
             boxes = [interpolate_box(ch, ts) for ts, _ in frames]
             t = time.perf_counter()
@@ -418,25 +532,36 @@ class Camera:
             t = time.perf_counter()
             out = self.models.burst(feats, rel, valid, boxes, motion)
             part["temporal"] += time.perf_counter() - t
-            t = time.perf_counter()
             area = float(np.mean([(b[2] - b[0]) * (b[3] - b[1]) for b in ch.values()]))
-            decision = self.gallery.decide(out, area, t0, tid)
-            self.store.burst((self.id, tid, t0, decision["state"], decision["cow"], decision["sim"],
-                              decision["margin"], decision["p"], out["rumination"], out["posture"],
-                              out["activity"], out["lameness"], out["quality_max"], int(valid.sum()),
-                              int(out["ruminating"])))
-            part["gallery"] += time.perf_counter() - t
-            if self.cache is not None:
-                from model import box_pos
-                self.cache.add(self.id, tid, t0, feats.float().cpu().numpy(), rel, valid, motion,
-                               np.mean([box_pos(b) for b in boxes], 0), crops[len(crops) // 2],
-                               {"state": decision["state"], "cow": decision["cow"], "sim": decision["sim"],
-                                "p": decision["p"], "area": area})
+            # kept until the burst's decision: only what the training cache needs, not every crop
+            keep_feats = feats.float().cpu().numpy() if self.cache is not None else None
+            done.append((tid, out, area, keep_feats, rel, valid, motion, boxes, crops[len(crops) // 2]))
             cows += 1
             crops_n += len(crops)
             rum_p.append(round(out["rumination"], 3))
             rum_yes += out["ruminating"]
+        # the burst's cows are decided together: they were all there at once, so no cow twice
+        t = time.perf_counter()
+        if len(done) > 1 and hasattr(self.gallery, "together"):
+            # seven seconds side by side is evidence enough, unless the two chains are one cow's
+            self.gallery.together([d[0] for d in done], t0, [d[7][len(d[7]) // 2] for d in done],
+                                  weight=self.cfg["identity"].get("cannot_link_min_s", 5))
+        decisions = (self.gallery.decide_batch([(d[1], d[2], d[0]) for d in done], t0)
+                     if hasattr(self.gallery, "decide_batch") else
+                     [self.gallery.decide(d[1], d[2], t0, d[0]) for d in done])
+        for (tid, out, area, feats, rel, valid, motion, boxes, mid_crop), decision in zip(done, decisions):
+            self.store.burst((self.id, tid, t0, decision["state"], decision["cow"], decision["sim"],
+                              decision["margin"], decision["p"], out["rumination"], out["posture"],
+                              out["activity"], out["lameness"], out["quality_max"], int(valid.sum()),
+                              int(out["ruminating"])))
+            if self.cache is not None:
+                from model import box_pos
+                self.cache.add(self.id, tid, t0, feats, rel, valid, motion,
+                               np.mean([box_pos(b) for b in boxes], 0), mid_crop,
+                               {"state": decision["state"], "cow": decision["cow"], "sim": decision["sim"],
+                                "p": decision["p"], "area": area})
             self.stats[f"id_{decision['state']}"] += 1
+        part["gallery"] += time.perf_counter() - t
         self.stats["bursts"] += 1
         self._time("burst", t0, start=start, end=time.time(), ready=t0 + self.burst_s, frames=len(frames),
                    detected=len(sampled), chains=len(chains), cows=cows, crops=crops_n,
@@ -445,12 +570,25 @@ class Camera:
 
 
 class SharedGallery:
-    """The gallery behind a lock, with the nightly job and the weekly change-over."""
+    """The gallery behind a lock, with the nightly job and the weekly change-over.
+
+    It also keeps who-was-where-when: tracks seen at the same moment are two cows (cannot_link,
+    from each camera's tracker and from the chains of one burst), and a cow confirmed on one
+    track is that track's for claim_s - another track seen at the same time cannot be the same
+    cow unless its burst is clearly surer (claim_steal_margin); otherwise that cow is ruled out
+    for it and the next one is tried."""
 
     def __init__(self, gallery, store, cfg, start_ts):
         self.g, self.store, self.cfg = gallery, store, cfg
         self.lock = threading.Lock()
         self.next_nightly = self._next_hour(start_ts, cfg["farm"]["nightly_hour"])
+        self.cannot_link = set(store.cannot_link_pairs(start_ts - cfg["identity"]["history_days"] * 86400)) \
+            if hasattr(store, "cannot_link_pairs") else set()
+        self._pending_links, self._last_flush = [], start_ts
+        from mct import CoSeen
+        self.co_seen = CoSeen(cfg["identity"].get("cannot_link_min_s", 5), cfg["identity"].get("cannot_link_max_iou", 0.3))
+        self.claims = {}                         # cow -> (track, ts, p or sim)
+        self._counted, self._counted_n, self._counted_pruned = {}, {}, start_ts   # counted(): second -> cam -> tracks
 
     def _next_hour(self, ts, hour):
         tz = dt.timezone(dt.timedelta(hours=self.cfg["farm"]["timezone_offset_hours"]))
@@ -459,20 +597,117 @@ class SharedGallery:
             t += dt.timedelta(days=1)
         return t.timestamp()
 
-    def decide(self, out, area, ts, track):
+    def together(self, tracks, ts, boxes=None, weight=1):
+        """Tracks seen at the same moment by one camera. With their boxes: two different cows once
+        seen so in cannot_link_min_s moments with boxes apart (mct.CoSeen; weight: moments this
+        sighting counts for). Without boxes: every pair at once."""
+        if boxes is not None:
+            pairs = self.co_seen.add(tracks, boxes, weight)
+        else:
+            tracks = sorted(set(tracks))
+            pairs = [(a, b) for i, a in enumerate(tracks) for b in tracks[i + 1:]]
         with self.lock:
-            if self.g.migration_due(ts):
-                self.store.event(ts, "change-over", "weekly cow change-over started")
-            if ts >= self.next_nightly:
-                res = self.g.nightly(ts)
-                self.store.event(ts, "nightly", json.dumps(res))
-                self.next_nightly = self._next_hour(ts, self.cfg["farm"]["nightly_hour"])
-            d = self.g.match(out["fingerprint"], out["quality_max"], out["quality_mean"], area)
-            self.g.observe(d, out["fingerprint"], ts, track)
-            return d
+            for k in pairs:
+                if k not in self.cannot_link:
+                    self.cannot_link.add(k)
+                    self._pending_links.append(k)
+            if self._pending_links and (len(self._pending_links) >= 500 or ts - self._last_flush >= 60):
+                self.store.add_cannot_link(self._pending_links, ts)
+                self._pending_links, self._last_flush = [], ts
+
+    def counted(self, cam, ts, tracks):
+        """The tracks a camera counts this second (in its mask). The masks share no floor - each patch of it is
+        one camera's - so a cow is counted by one camera at a time: two tracks counted by two cameras at the
+        same second for counted_apart_s seconds are two cows (cannot_link), the night never makes one of them.
+        (Seconds, not one: a cow on the line between two masks may be counted by both a moment.)"""
+        need = self.cfg["identity"].get("counted_apart_s", 10)
+        if not need or not tracks:
+            return
+        sec = int(ts)
+        with self.lock:
+            at = self._counted.setdefault(sec, {})
+            at[cam] = set(tracks)
+            new = []
+            for other, theirs in at.items():
+                if other == cam:
+                    continue
+                for a in tracks:
+                    for b in theirs:
+                        if a == b:
+                            continue
+                        k = (min(a, b), max(a, b))
+                        n, _ = self._counted_n.get(k, (0, ts))
+                        self._counted_n[k] = (n + 1, ts)
+                        if n + 1 >= need and k not in self.cannot_link:
+                            new.append(k)
+            for k in new:
+                self.cannot_link.add(k)
+                self._pending_links.append(k)
+            for old in [s_ for s_ in self._counted if s_ < sec - 5]:
+                del self._counted[old]
+            if ts - self._counted_pruned > 600:              # pairs not seen together for an hour: forgotten
+                self._counted_n = {k: v for k, v in self._counted_n.items() if ts - v[1] <= 3600}
+                self._counted_pruned = ts
+
+    def separate(self, pairs, ts):
+        """Pairs of tracks seen at the same moment (cameras with no floor in common): two cows each."""
+        with self.lock:
+            for a, b in pairs:
+                k = (min(a, b), max(a, b))
+                if a != b and k not in self.cannot_link:
+                    self.cannot_link.add(k)
+                    self._pending_links.append(k)
+
+    def apart(self, a, b):
+        return a != b and (min(a, b), max(a, b)) in self.cannot_link
+
+    def _maintain(self, ts):
+        if self.g.migration_due(ts):
+            self.store.event(ts, "change-over", "weekly cow change-over started")
+        if ts >= self.next_nightly:
+            res = self.g.nightly(ts, self.cannot_link)
+            self.store.event(ts, "nightly", json.dumps(res))
+            self.next_nightly = self._next_hour(ts, self.cfg["farm"]["nightly_hour"])
+        hold = self.cfg["identity"].get("claim_s", 120.0)
+        self.claims = {c: v for c, v in self.claims.items() if ts - v[1] <= hold}
+
+    def decide_batch(self, items, ts):
+        """items [(out, area, track)] seen at the same moment (one burst) -> a decision each."""
+        steal = self.cfg["identity"].get("claim_steal_margin", 0.08)
+        conf = lambda d: d["p"] if d.get("p") is not None else (d.get("sim") or 0.0)
+        with self.lock:
+            self._maintain(ts)
+            q = [{"fingerprint": o["fingerprint"], "quality_max": o["quality_max"], "quality_mean": o["quality_mean"],
+                  "area": a} for o, a, _ in items]
+            ds = self.g.match_batch(q)
+            for k, (o, a, tr) in enumerate(items):
+                d = ds[k]
+                if d["state"] != "confirmed":
+                    continue
+                cow = d["cow"]
+                held = self.claims.get(cow)
+                if held and self.apart(tr, held[0]) and conf(d) <= held[2] + steal:
+                    # that cow is on a track seen at the same time, with a burst at least as sure:
+                    # not her - the next cow, with every cow held elsewhere ruled out
+                    ex = {c for c, (t2, _, _) in self.claims.items() if self.apart(tr, t2)}
+                    ex |= {x["cow"] for j, x in enumerate(ds) if j != k and x.get("cow")}
+                    d = ds[k] = self.g.match(o["fingerprint"], o["quality_max"], o["quality_mean"], a, exclude=ex)
+                    self.store.event(ts, "claim-kept", json.dumps({"cow": cow, "held_by": held[0], "track": tr,
+                                                                   "now": d.get("cow"), "state": d["state"]}))
+                if d["state"] == "confirmed":
+                    self.claims[d["cow"]] = (tr, ts, conf(d))
+            for (o, a, tr), d in zip(items, ds):
+                self.g.observe(d, o["fingerprint"], ts, tr)
+            return ds
+
+    def decide(self, out, area, ts, track):
+        return self.decide_batch([(out, area, track)], ts)[0]
 
     def save(self):
         with self.lock:
+            if self._pending_links:                      # the last minute's two-cows, before the night reads them
+                self.store.add_cannot_link(self._pending_links, self._last_flush)
+                self._pending_links = []
             self.g.save()
 
 
@@ -485,21 +720,73 @@ def frames_from(url, start_ts=None):
     if not cap.isOpened():
         raise RuntimeError(f"cannot open {url}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    if not 1.0 <= fps <= 120.0:                # a container's time base, not a frame rate (some .mkv)
+        fps = 25.0
     live = start_ts is None
-    i = 0
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    i, t, bad = 0, -1.0, 0
     while True:
         ok, f = cap.read()
         if not ok:
-            break
-        yield (time.time() if live else start_ts + i / fps), cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+            # a damaged stretch of a recording (a recorder's file): skip it, unless this is its end
+            bad += 1
+            if live or bad > 100 or (n and cap.get(cv2.CAP_PROP_POS_FRAMES) >= n - 1):
+                break
+            continue
+        bad = 0
+        if not live:
+            # the file's own clock (its frames' time stamps) - right when the rate it states is not
+            ms = cap.get(cv2.CAP_PROP_POS_MSEC)
+            t = ms / 1000.0 if ms / 1000.0 > t else t + 1.0 / fps
+        yield (time.time() if live else start_ts + t), cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
         i += 1
     cap.release()
 
 
-def run_file(camera, url, start_ts):
-    for ts, img in frames_from(url, start_ts):
-        camera.push(ts, img)
-        camera.step(ts)
+class Lockstep:
+    """Recordings of several cameras played together: no camera more than ahead_s ahead of the others still
+    playing, on the barn's clock. Live cameras keep together by the wall clock; files played as fast as each
+    can go drift apart by minutes - and what spans cameras (the [mct] tracker, its pruning by time, a cow on
+    two cameras at the same second, the gallery's claims) needs the same moment from all of them. A camera
+    whose recording begins later holds no one up before it begins; one that is done, none at all."""
+
+    def __init__(self, starts, ahead_s=1.0):
+        self.pos = dict(starts)                 # cam -> where it is (its start until it begins)
+        self.done, self.ahead = set(), ahead_s
+        self.cv = threading.Condition()
+
+    def wait(self, cam, ts):
+        with self.cv:
+            self.pos[cam] = ts
+            self.cv.notify_all()
+            while any(o != cam and o not in self.done and t < ts - self.ahead for o, t in self.pos.items()):
+                self.cv.wait(timeout=1.0)
+
+    def finish(self, cam):
+        with self.cv:
+            self.done.add(cam)
+            self.cv.notify_all()
+
+
+def run_file(camera, url, start_ts, every_s=60.0, lockstep=None):
+    """A recording on its own clock, as fast as it can go (with lockstep: as the slowest camera with it);
+    where it is, every every_s of recording."""
+    t0, said = time.time(), start_ts
+    try:
+        for ts, img in frames_from(url, start_ts):
+            if lockstep is not None:
+                lockstep.wait(camera.id, ts)
+            camera.push(ts, img)
+            camera.step(ts)
+            if ts - said >= every_s:
+                said = ts
+                done = ts - start_ts
+                print(f"[{camera.id}] {int(done // 60)}:{int(done % 60):02d} of the recording "
+                      f"({done / max(1e-6, time.time() - t0):.1f}x real time)", flush=True)
+    finally:
+        if lockstep is not None:
+            lockstep.finish(camera.id)
+    print(f"[{camera.id}] the recording is done", flush=True)
 
 
 def run_live(camera, source, stop):
@@ -537,7 +824,8 @@ def run_live(camera, source, stop):
         th.join()
 
 
-def run(cfg, start=None, models=None, max_wall_s=None):
+def run(cfg, start=None, models=None, max_wall_s=None, status=None):
+    """status (a dict): "interrupted" is set when Ctrl+C stopped it before the files ended."""
     import gallery as gallery_mod
     from store import Store
     store = Store(cfg["store"]["path"])
@@ -545,10 +833,30 @@ def run(cfg, start=None, models=None, max_wall_s=None):
     abstain = json.load(open(ab_path, encoding="utf-8")) if os.path.exists(ab_path) else None
     folder = os.path.join(os.path.dirname(os.path.abspath(cfg["store"]["path"])), "gallery")
     start_ts = start if start is not None else time.time()
-    shared = SharedGallery(gallery_mod.Gallery(folder, cfg, abstain), store, cfg, start_ts)
     models = models or Models(cfg)
+    if getattr(models, "id_model", None) is not None:
+        abstain = models.id_abstain          # the NaN model fitted on the identity model's fingerprints
+        from reid import apply_thresholds
+        # each model's similarities sit elsewhere: its calibrated thresholds, where barn.toml left the default
+        if not apply_thresholds(cfg, getattr(models, "id_thresholds", {}) or {}, DEFAULTS,
+                                lambda x: print(f"[run] {x}", flush=True)) \
+                and cfg["mct"]["reacquire_sim"] == DEFAULTS["mct"]["reacquire_sim"]:
+            # an identity model without a calibration (an older reid.py): MmCows' best for the first one
+            cfg["mct"]["reacquire_sim"] = 0.9
+            print("[run] [mct] reacquire_sim 0.9 with the identity model (no thresholds.json)", flush=True)
+    shared = SharedGallery(gallery_mod.Gallery(folder, cfg, abstain), store, cfg, start_ts)
     cams = [Camera(c, i, len(cfg["cameras"]), cfg, models, shared, store, start_ts)
             for i, c in enumerate(cfg["cameras"])]
+    if cfg["mct"]["enabled"]:
+        from mct import FloorTracker, FusedSeconds, GlobalTracker, TrackletLinker
+        mode = cfg["mct"].get("mode")
+        if mode in ("fused", "link"):               # all cameras at once, a second at a time
+            t = (FloorTracker if mode == "fused" else TrackletLinker)(cfg, store, shared.separate)
+            glob = FusedSeconds(t, [c["id"] for c in cfg["cameras"]])
+        else:
+            glob = GlobalTracker(cfg, store, shared.separate)
+        for cam in cams:
+            cam.glob = glob
     if cfg["training_cache"]["enabled"]:
         from barn_dataset import TrainingCache
         meta = dict(models.features_meta, dim=models.features_meta.get("dim") or models.encoder.out_dim)
@@ -558,8 +866,11 @@ def run(cfg, start=None, models=None, max_wall_s=None):
         print(f"[run] keeping every {cache.every_n}th burst for training in {cache.folder}", flush=True)
     stop = threading.Event()
     threads = []
+    # files: each from its own start (start_ts, when its recording began later than the others'), together
+    lock = Lockstep({c["id"]: c.get("start_ts", start_ts) for c in cfg["cameras"]}) if start is not None else None
     for cam, c in zip(cams, cfg["cameras"]):
-        target = (lambda cam=cam, c=c: run_file(cam, c["url"], start_ts)) if start is not None else \
+        target = (lambda cam=cam, c=c: run_file(cam, c["url"], c.get("start_ts", start_ts), lockstep=lock)) \
+            if start is not None else \
                  (lambda cam=cam, c=c: run_live(cam, lambda: frames_from(c["url"]), stop))
         th = threading.Thread(target=target, daemon=True)
         th.start()
@@ -573,6 +884,8 @@ def run(cfg, start=None, models=None, max_wall_s=None):
                 break
     except KeyboardInterrupt:
         stop.set()
+        if status is not None:
+            status["interrupted"] = True
     shared.save()
     return {c.id: dict(c.stats) for c in cams}
 

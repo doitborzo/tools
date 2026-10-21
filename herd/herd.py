@@ -8,6 +8,8 @@ Training (on CBVD-5 today, on the barn's own footage later):
     herd.py degrade  --split train|val      spoilt burst frames (occlusion, mud, blur, dark), for --quality
     herd.py train                           temporal transformer + all heads on those vectors
     herd.py eval                            val scores + cowbench-format results
+    herd.py frame-id --out R                one frame -> its burst's fingerprint (mct.py tracks by it)
+    herd.py reid fetch|extract|train        identity taught on public sets with cow ids (reid_pod.sh)
     herd.py eval-det --run R                the same on the detector's boxes: detector misses count
     herd.py calibrate --detector D          the detector's boxes reshaped to the annotation's habit
     herd.py show-dets --src DIR --detector D  every box a detector draws on a folder / video, as an HTML gallery
@@ -16,11 +18,29 @@ Training (on CBVD-5 today, on the barn's own footage later):
 Running:
     herd.py run --config barn.toml [--start ISO]   cameras (RTSP) or files -> herd.sqlite
     herd.py stress --model M --detector D          one GPU: a burst alone, then 5 cameras live
+    herd.py show-ids --config barn.toml --cam cam1 --video F --start ISO   who is who, drawn on a recorded file
 
 Barn data for identity (once the barn runs with [training_cache] enabled):
-    herd.py barn sheet --cache C --out tracks.html     one thumbnail per track, to write merges.csv
+    herd.py barn sheet --cache C --out tracks.html     the labelling page: name each track's cow -> merges.csv
+    herd.py barn export --cache C --merges merges.csv   -> herd_barn_feat_*.tgz for the identity model (reid_pod.sh)
+    herd.py barn video --config barn.toml --videos DIR --out D   recorded camera files -> D/training_cache
     herd.py barn build --cache C --out F [--merges merges.csv] [--val-from DAY]
     then train --extra-train F/train, eval --extra-val F/val
+Cameras' zones, drawn on their pictures:
+    herd.py zones page --config barn.toml --videos DIR --out D    D/zones.html -> cameras.toml
+    herd.py zones apply --config barn.toml --cameras cameras.toml
+Recordings for them:
+    herd.py record --config barn.toml --out DIR --minutes 60   every camera at once -> DIR/<cam>_<time>.mp4
+    herd.py fix-videos --videos DIR --out DIR2             damaged recordings -> clean .mp4 the tools read
+A dress rehearsal on recordings (two passes: the gallery fills, then who is who, drawn per camera):
+    herd.py trial --config barn.toml --videos DIR --out D [--boxes B --labels L]   (L: your ids -> IDF1)
+Cameras sharing floor calibrated by the cows moving in both (nothing measured; then [mct] link):
+    herd.py autocalib --config barn.toml --store D/pass2/herd.sqlite --videos DIR --out C [--apply]
+The models on the barn's own labels (nothing trained on them):
+    herd.py check --config barn.toml [--det herd_det_barn_X.tgz] [--ids herd_barn_ids_X.tgz]
+Cow boxes on the barn's cameras (detector training):
+    herd.py boxes frames --config barn.toml --videos DIR --out D   frames + the detector's guess + D/boxes.html
+    herd.py boxes export --data D --labels labels.json            -> herd_det_barn_*.tgz (run_pod.sh detector)
 
 Reports:
     herd.py report --config barn.toml csv [--end DAY]       the 3-day CSV
@@ -71,12 +91,18 @@ def main():
     if cmd in ("motion", "keys", "degrade"):
         import cbvd_bursts
         return cbvd_bursts.main([cmd] + argv)
-    if cmd in ("train", "eval"):
+    if cmd in ("train", "eval", "frame-id"):
         import train
         return train.main([cmd] + argv)
     if cmd == "calibrate":
         import calib_boxes
         return calib_boxes.main(argv)
+    if cmd == "reid":
+        import reid
+        return reid.main(argv)
+    if cmd == "show-ids":
+        import show_ids
+        return show_ids.main(argv)
     if cmd == "show-dets":
         import show_dets
         return show_dets.main(argv)
@@ -95,6 +121,27 @@ def main():
     if cmd == "barn":
         import barn_dataset
         return barn_dataset.main(argv)
+    if cmd == "boxes":
+        import box_dataset
+        return box_dataset.main(argv)
+    if cmd == "zones":
+        import zone_page
+        return zone_page.main(argv)
+    if cmd == "autocalib":
+        import autocalib
+        return autocalib.main(argv)
+    if cmd == "trial":
+        import trial
+        return trial.main(argv)
+    if cmd == "check":
+        import check
+        return check.main(argv)
+    if cmd == "fix-videos":
+        import fix_videos
+        return fix_videos.main(argv)
+    if cmd == "record":
+        import record
+        return record.main(argv)
     if cmd == "report":
         import report
         return report.main(argv)

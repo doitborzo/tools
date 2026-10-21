@@ -132,6 +132,8 @@ by more than one batch.
 
 ## In the barn
 
+Docker Desktop (Windows / Mac): `docker/README.md` - one image with the code and the models.
+
 ```bash
 cp herd/config.example.toml barn.toml          # cameras, masks, paths
 python herd/herd.py run --config barn.toml                         # live
@@ -141,6 +143,11 @@ python herd/herd.py report --config barn.toml alerts --day 2026-10-07
 python herd/herd.py report --config barn.toml verdict --alert 12 --confirmed yes --diagnosis "..."
 python herd/herd.py report --config barn.toml alert-stats
 python herd/herd.py gallery --config barn.toml
+python herd/herd.py barn sheet --cache barn/training_cache --out tracks.html   # name the cows -> merges.csv
+python herd/herd.py barn export --cache barn/training_cache --merges merges.csv # -> herd_barn_feat_*.tgz (reid_pod.sh)
+python herd/herd.py barn video --config barn.toml --videos rec --out barn_video  # recordings -> barn_video/training_cache
+python herd/herd.py boxes frames --config barn.toml --videos rec --out boxes     # frames + boxes.html to correct
+python herd/herd.py boxes export --data boxes --labels labels.json             # -> herd_det_barn_*.tgz (run_pod.sh detector)
 ```
 
 CSV columns: `period_start, period_end, cow_id, label, observed_min, lying_min,
@@ -156,15 +163,28 @@ time on tracks no cow could be given.
 | `model.py` | DINOv2 frame encoder, frame heads, temporal transformer, losses |
 | `motion.py` | the rhythm of a burst's crops: what rumination (chewing) looks like |
 | `degrade.py` | bursts spoilt on purpose (occlusion, mud, blur, dark): what the quality heads learn on |
-| `barn_dataset.py` | the barn's own bursts (training cache) -> identity training across tracks and days |
+| `barn_dataset.py` | the barn's own bursts (training cache, live or from recordings: `barn video`): the labelling page, `merges.csv`, the export to the identity model (`barn` in `reid.py`) and to `train.py --extra-train` |
+| `zone_page.py` | the cameras' masks and excluded zones drawn on their pictures -> `[[cameras]]` |
+| `autocalib.py` | cameras sharing floor calibrated by the cows that move in both, or by the same floor spots clicked on both pictures (`--pick`, `--points`): floor mapping, lens bend, clock lag |
+| `trial.py` | a dress rehearsal on recordings: two passes (the gallery fills, then who is who), drawn per camera |
+| `check.py` | the detector and the identity models scored on the barn's own labels (boxes export / ids) |
+| `fix_videos.py` | damaged recordings encoded again into clean .mp4 the tools read |
+| `record.py` | every camera recorded at once, files named as the dataset tools read them |
+| `box_dataset.py` | cow boxes on frames of the barn's recordings: the detector's guess, a page to correct them, COCO export for `run_pod.sh detector` |
 | `cbvd_bursts.py` | CBVD-5 -> bursts + keyframes -> Stage A vectors |
 | `train.py` | Stage A training, re-ID / posture / rumination scoring, cowbench export |
 | `eval_det.py` | the 1 fps heads on the detector's boxes: detector error included, cut-off sweep |
 | `abstain.py` | the NaN model |
 | `gallery.py` | prototypes, matching, enrolment, change-over, retirement |
 | `pipeline.py` | cameras -> 1 fps + bursts -> store |
+| `mct.py` | one track per cow across cameras (`[mct]`; a frame id from the herd model on one frame) |
+| `mct_eval.py`, `mct_pod.sh` | that tracker scored on MmCows' four synchronised cameras (GUIDE 4.8) |
+| `show_ids.py` | `herd.py show-ids`: who is who, drawn on a recorded file from the store (video + stills) |
+| `reid.py`, `reid_pod.sh` | identity taught on sets with cow ids (MultiCamCows2024, Cows2021, OpenCows2020, AerialCattle2017, CowDataset - from WildlifeReID-10k -, CoBRA, SideViewCows2026, MmCows by its human labels), trained from scratch on all of them (`--init` fine-tunes); `[model] identity` |
+| `eval_pod.sh` | the MmCows check again on a fresh pod with a trained identity model (herd_reid_*.tgz): no training, no training sets; thresholds recalibrated on 7/25 (`CALIBRATE=0`: as they are) |
 | `stress.py` | a burst alone, then N cameras live on one GPU: lag, burst time, GPU share |
 | `store.py`, `report.py` | SQLite; per-cow days, CSV, alerts, verdicts |
+| `SETUP.md` | setting up a barn step by step: server, models, masks, systemd, reports |
 | `tests/` | `python herd/tests/run_all.py` |
 
 Stage B (LoRA on the frame encoder, end to end on images) is the next step if

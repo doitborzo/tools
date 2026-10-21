@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sys
 import tomllib
 
@@ -34,11 +35,28 @@ DEFAULTS = {
     "farm": {"timezone_offset_hours": 0, "migration_weekday": 1, "migration_hour": 10, "nightly_hour": 2},
     "sampling": {"fps": 1.0, "burst_every_s": 60, "burst_seconds": 7.0, "burst_fps": 25.0,
                  "burst_detect_fps": 5.0, "frame_width": 1920},   # Full HD: far cows keep their pixels
-    "model": {"checkpoint": "", "encoder": "facebook/dinov2-small", "crop": 224, "grid": 2, "rumination": ""},
+    "model": {"checkpoint": "", "encoder": "facebook/dinov2-small", "crop": 224, "grid": 2, "rumination": "",
+              "identity": ""},
     "detector": {"weights": "", "threshold": None, "tiles": None},   # None: as the detector was trained
-    "tracker": {"iou": 0.3, "max_age_s": 5},
+    # still_*: a cow lost is waited for still_s at the same place, still_long_s when she had not moved for
+    # still_for_s before (as [mct])
+    "tracker": {"iou": 0.3, "max_age_s": 5, "still_s": 60.0, "still_long_s": 300.0, "still_iou": 0.5,
+                "still_contain": 0.8, "still_for_s": 30.0, "still_moved": 0.3},
     "identity": {"prototypes_per_cow": 6, "history_days": 7, "max_error": 0.01,
-                 "new_cow_similarity": 0.55, "new_cow_min_bursts": 20, "retire_after_hours": 48},
+                 "new_cow_similarity": 0.55, "new_cow_min_bursts": 20, "retire_after_hours": 48,
+                 # the herd's size (0: no limit): at it, no new ids are made - unknown bursts wait in the pool
+                 "max_cows": 0,
+                 # nightly merge of one cow's split profiles (gallery.deduplicate)
+                 "merge_similarity": 0.68, "merge_max_conflict_rate": 0.005,
+                 # a cow's claim by a track holds this long; a track seen at the same time
+                 # elsewhere takes it only with a clearly better burst
+                 "claim_s": 120.0, "claim_steal_margin": 0.08,
+                 # two tracks of one camera are two cows once seen together this many seconds with
+                 # boxes overlapping less than cannot_link_max_iou (mct.CoSeen)
+                 "cannot_link_min_s": 5, "cannot_link_max_iou": 0.3,
+                 # tracks two cameras count (their masks, which share no floor) at the same second this many
+                 # seconds: two cows (0: off - when masks were drawn overlapping)
+                 "counted_apart_s": 10},
     "lameness": {"enabled": False},
     "alerts": {"baseline_days": 7, "min_baseline_days": 3, "min_observed_minutes": 120,
                "mad_z": 3.0, "rumination_drop": 0.20, "lying_directions": ["low", "high"],
@@ -54,6 +72,49 @@ DEFAULTS = {
     # `exclude` polygons (the far zone) are greyed out before the detector sees the
     # frame. Per camera the same keys override these. herd.py eval-det suggests values.
     "zone": {"min_box_pct": 0.0, "min_box_side_px": 0, "blank_excluded": True},
+    # one track per cow across cameras (mct.py), off by default; a cow's frame id is the herd
+    # model's transformer on one frame. Cameras then track in their `tracking_mask` (overlapping the
+    # neighbours') and still count only in their `mask`.
+    "mct": {"enabled": False, "neighbours": [], "disjoint": [], "portals": [],
+            "w_iou": 0.65, "ema": 0.2,
+            "reacquire_s": 10.0, "reacquire_sim": 0.7, "reacquire_dist": 0.15,
+            # late: a new track with late_n frame ids over late_s s against the tracks its camera lost in
+            # the late_window_s before, near (late_dist) - track fingerprint against track fingerprint
+            # (mean of frame ids); off at late_sim 0 - set it (e.g. thresholds.json's late_sim) to try it;
+            # MmCows, twice: the same IDF1 with it, purity a point lower
+            "late_sim": 0.0, "late_margin": 0.03, "late_n": 3, "late_s": 3.0, "late_window_s": 60.0,
+            "late_dist": 0.3,
+            # a cow lying or standing still: her box back at the same place within still_s is her (the same
+            # place: boxes overlapping still_iou, or one still_contain inside the other - a cow half hidden
+            # by her neighbour); one that had not moved for still_for_s before she was lost is waited for
+            # still_long_s (the detector loses lying cows for minutes: barn, 4 cameras, 8 min - tracks 108
+            # -> 31 on one camera); one that walked is not (another cow may lie down where she was)
+            "still_s": 60.0, "still_iou": 0.5, "still_contain": 0.8, "still_long_s": 300.0, "still_for_s": 30.0,
+            "still_moved": 0.3,
+            "handover_s": 2.5, "handover_min_sim": 0.5, "handover_margin": 0.05, "portal_extra_sim": 0.08,
+            # with calibrated cameras (proj_mat or floor_points): a cow is passed on by where she
+            # stands - within handover_dist of a cow another camera sees, the next one at least
+            # handover_dist_margin further (units of the calibration, e.g. cm). apart_dist > 0:
+            # cows seen at the same second this far apart by two cameras are two cows
+            "handover_dist": 100.0, "handover_dist_margin": 50.0, "apart_dist": 0.0,
+            # mode "fused" (calibrated cameras): every second all cameras on one floor plan - points of
+            # different cameras within fuse_dist are one cow, one tracker on the floor (mct.FloorTracker);
+            # boxes cut by the frame's edge (edge_margin) weigh edge_weight; points off floor_area (a
+            # polygon in floor units) are phantoms and stay with their camera
+            "mode": "handover", "fuse_dist": 160.0, "fuse_gate": 150.0, "max_speed": 80.0,
+            "edge_margin": 0.01, "edge_weight": 0.15, "floor_area": [], "height_penalty": 40.0,
+            # mode "link": each camera tracks its own cows, tracks of two cameras are joined when for
+            # link_min_s seconds they were each other's nearest on the floor within link_dist, in
+            # link_share of the seconds both were seen (mct.TrackletLinker; reports follow track_links)
+            # MmCows with the identity model (frame-against-frame, calibrated): link_dist 160 against 120 -
+            # IDF1 over all cameras 0.496 -> 0.540, purity 72 -> 77%, wrong joins 2095 -> 1682
+            "link_dist": 160.0, "link_min_s": 5, "link_share": 0.6,
+            # strict joining (off at 0): the next cow link_margin further; no join of two groups holding
+            # tracks seen together link_contra_s seconds but near in less than link_contra of them
+            # MmCows: link_margin 50 halved the wrong joins (2330 -> 1309) at the same IDF1 (0.498);
+            # link_contra barely helped and with the margin cost IDF1 - off
+            "link_margin": 50.0, "link_contra_s": 10, "link_contra": 0.0,
+            "body_height_lying": 55.0, "body_height_standing": 90.0},
     "cameras": [],
 }
 
@@ -88,6 +149,21 @@ def iou(a, b):
     inter = iw * ih
     union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
     return inter / union if union > 0 else 0.0
+
+
+def same_place(a, b, min_iou=0.5, contain=0.8):
+    """Box b where box a was: overlapping min_iou, or the smaller one contain inside the other with the
+    centres within half a box height (a cow half hidden by her neighbour)."""
+    import numpy as np
+    if iou(a, b) >= min_iou:
+        return True
+    if not contain:
+        return False
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    small = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    d = np.hypot((a[0] + a[2] - b[0] - b[2]) / 2, (a[1] + a[3] - b[1] - b[3]) / 2)
+    return small > 0 and ix * iy / small >= contain and d <= 0.5 * max(a[3] - a[1], b[3] - b[1])
 
 
 def in_polygon(x, y, poly):
@@ -134,14 +210,80 @@ def zone_min_area(cam):
     return pct / 100.0 if pct else (cam.get("min_box_area") or 0.0)
 
 
-def in_zone(box, cam, w, h):
+def in_zone(box, cam, w, h, tracking=False):
     """The camera's working zone: its mask (box centre), outside its exclude
-    polygons (box centre), and big enough. A cow outside it is not tried at all."""
+    polygons (box centre), and big enough. A cow outside it is not tried at all.
+
+    tracking: the zone it tracks in (mct.py) - its `tracking_mask`, which may reach into the
+    neighbours' floor, so a cow is followed across the overlap; what it counts stays in_mask."""
     cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
     if any(in_polygon(cx, cy, p) for p in _polys(cam.get("exclude"))):
         return False
-    return in_mask(box, cam.get("mask")) and big_enough(box, w, h, zone_min_area(cam),
+    mask = (cam.get("tracking_mask") or cam.get("mask")) if tracking else cam.get("mask")
+    return in_mask(box, mask) and big_enough(box, w, h, zone_min_area(cam),
                                                           cam.get("min_box_side_px", 0))
+
+
+def homography(src, dst):
+    """3x3 H with dst ~ H @ src from >= 4 point pairs (DLT)."""
+    import numpy as np
+    src, dst = np.asarray(src, float), np.asarray(dst, float)
+
+    def norm(p):                       # Hartley: centred, mean distance sqrt(2) - many points, cm and 0-1 alike
+        c = p.mean(0)
+        s = np.sqrt(2) / max(np.mean(np.hypot(*(p - c).T)), 1e-12)
+        return np.array([[s, 0, -s * c[0]], [0, s, -s * c[1]], [0, 0, 1.0]])
+    Ts, Td = norm(src), norm(dst)
+    a = np.c_[src, np.ones(len(src))] @ Ts.T
+    b = np.c_[dst, np.ones(len(dst))] @ Td.T
+    x, y, u, v = a[:, 0], a[:, 1], b[:, 0], b[:, 1]
+    z, o = np.zeros(len(x)), np.ones(len(x))
+    A = np.r_[np.c_[-x, -y, -o, z, z, z, u * x, u * y, u], np.c_[z, z, z, -x, -y, -o, v * x, v * y, v]]
+    Hn = np.linalg.eigh(A.T @ A)[1][:, 0].reshape(3, 3)           # the null vector; 9 x 9 whatever the points
+    H = np.linalg.inv(Td) @ Hn @ Ts
+    return H / H[2, 2]
+
+
+def floor_mapper(cam, mct):
+    """A camera's box -> where the cow is on the floor, or None for a camera without calibration.
+
+    proj_mat (3x4, world -> pixels of a proj_size [w, h] image, e.g. MmCows'): the box centre is taken
+    back to the plane at the cow's body height - body_height_lying / _standing, mixed by p(lying) -
+    since a lying cow's centre is much lower than a standing one's. floor_points [[u, v, X, Y], ...]
+    (>= 4, u v in 0-1 of the frame, X Y measured on the floor): a floor homography, applied to the
+    box's bottom centre (where a cow touches the floor, as seen from above-and-aside)."""
+    import numpy as np
+    if cam.get("proj_mat"):
+        P = np.asarray(cam["proj_mat"], float).reshape(3, 4)
+        w, h = cam.get("proj_size") or (1.0, 1.0)
+        lo, hi = mct["body_height_lying"], mct["body_height_standing"]
+
+        def f(box, p_lying=0.5):
+            z = p_lying * lo + (1 - p_lying) * hi
+            H = np.stack([P[:, 0], P[:, 1], P[:, 2] * z + P[:, 3]], 1)
+            q = np.linalg.solve(H, [(box[0] + box[2]) / 2 * w, (box[1] + box[3]) / 2 * h, 1.0])
+            return (float(q[0] / q[2]), float(q[1] / q[2]))
+        return f
+    pts = cam.get("floor_points")
+    if pts and len(pts) >= 4:
+        k, ar = cam.get("distortion") or 0.0, cam.get("aspect") or 16 / 9      # herd.py autocalib writes both
+        und = (lambda u, v: undistort(u, v, k, ar)) if k else (lambda u, v: (u, v))
+        Hinv = homography([und(u, v) for u, v, _, _ in pts], [(x, y) for _, _, x, y in pts])
+
+        def g(box, p_lying=0.5):
+            q = Hinv @ np.array([*und((box[0] + box[2]) / 2, box[3]), 1.0])
+            return (float(q[0] / q[2]), float(q[1] / q[2]))
+        return g
+    return None
+
+
+def undistort(u, v, k, aspect=16 / 9):
+    """A point of a frame (0-1) as a lens without barrel distortion would show it: the one-parameter
+    division model about the centre, r normalised to 1 at the corners (k < 0 straightens a wide lens's
+    barrel). Works on numbers and on numpy arrays."""
+    x, y = (u - 0.5) * aspect, v - 0.5
+    s = 1.0 / (1.0 + k * (x * x + y * y) / (0.25 * aspect * aspect + 0.25))
+    return 0.5 + x * s / aspect, 0.5 + y * s
 
 
 _BLANK_CACHE = {}
@@ -209,6 +351,55 @@ def crop(image_rgb, box, size, margin=0.1):
 
 
 # --------------------------------------------------------------------- io
+
+VIDEO_EXT = (".mp4", ".mkv", ".avi", ".mov", ".ts", ".h264", ".h265", ".dav")
+_STAMP = re.compile(r"(20\d{2})[-_.]?(\d{2})[-_.]?(\d{2})[T _-]?(\d{2})[-_.:h]?(\d{2})[-_.:m]?(\d{2})")
+
+
+def recording_start(path, tz_hours):
+    """The local time in a recording's name (2026-10-20_06-00-00, 20261020T060000, ...) -> unix time, or None."""
+    import datetime as dt
+    m = _STAMP.search(os.path.basename(path)) or _STAMP.search(path)
+    if not m:
+        return None
+    try:
+        t = dt.datetime(*map(int, m.groups()), tzinfo=dt.timezone(dt.timedelta(hours=tz_hours)))
+    except ValueError:
+        return None
+    return t.timestamp()
+
+
+def recordings(folder, cam_ids, tz_hours):
+    """Video files under folder -> ([(camera id, path, start unix time)], [files not understood]): the
+    camera is the config id standing alone in the file's path (cam1 in cam1_2026-10-20_06-00-00.mp4 or
+    cam1/06-00.mp4, not in cam10), the start the local time in its name."""
+    found, bad = [], []
+    ids = sorted(cam_ids, key=len, reverse=True)
+    for d, _, fs in os.walk(folder):
+        for f in sorted(fs):
+            if not f.lower().endswith(VIDEO_EXT):
+                continue
+            path = os.path.join(d, f)
+            rel = os.path.relpath(path, folder)
+            cam = next((c for c in ids if re.search(rf"(?<![A-Za-z0-9]){re.escape(c)}(?![A-Za-z0-9])", rel)), None)
+            ts = recording_start(rel, tz_hours)
+            if cam is None or ts is None:
+                bad.append(path)
+            else:
+                found.append((cam, path, ts))
+    return sorted(found, key=lambda x: (x[2], x[0])), bad
+
+
+def sessions(recs, gap_s=300):
+    """Recordings -> groups played together: each camera once, starts within gap_s of the group's first."""
+    groups = []
+    for cam, path, ts in recs:
+        g = groups[-1] if groups else None
+        if g is None or ts - g[0][2] > gap_s or any(c == cam for c, _, _ in g):
+            groups.append([])
+        groups[-1].append((cam, path, ts))
+    return groups
+
 
 def read_jsonl(path):
     if not os.path.exists(path):
