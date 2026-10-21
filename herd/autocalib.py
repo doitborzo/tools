@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import blank_excluded, homography, in_zone, load_config, recordings, undistort  # noqa: E402
 
 K_GRID = (0.0, -0.1, -0.2, -0.3)
+K_GRID_POINTS = (0.0, -0.1, -0.2, -0.3, -0.4, -0.5)   # clicked spots: wide lenses may bend more
 MIN_COWS = 4                 # moving cows that agree on the floor mapping, at least
 
 
@@ -491,12 +492,171 @@ def draw(path, videos, cam_a, cam_b, TA, TB, H, lag, kA, kB, arA, arB):
     return path
 
 
+def pick_page(out, videos, pairs, at):
+    """OUT/pick.html: each pair's two pictures of one moment side by side, to click the same spots of the
+    floor on both - OUT/pick/<cam>.jpg beside it."""
+    import cv2
+    os.makedirs(os.path.join(out, "pick"), exist_ok=True)
+    data = []
+    for a, b in pairs:
+        missing = [c for c in (a, b) if not videos.get(c)]
+        if missing:
+            sys.exit(f"[calib] {', '.join(missing)}: no recordings (named <cam>_YYYY-MM-DD_HH-MM-SS)")
+        s = max(videos[a][0][1], videos[b][0][1]) + at
+        imgs = []
+        for cam in (a, b):
+            img = frame_at(videos, cam, s)
+            if img is None:
+                sys.exit(f"[calib] {cam}: no picture {at:.0f} s into its recording (--at)")
+            name = f"pick/{cam}_{int(s)}.jpg"
+            cv2.imwrite(os.path.join(out, name), img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            imgs.append(name)
+        data.append({"a": a, "b": b, "imgA": imgs[0], "imgB": imgs[1]})
+    path = os.path.join(out, "pick.html")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(PICK.replace("__DATA__", json.dumps(data)))
+    return path
+
+
+PICK = r"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Same spots on two cameras</title>
+<style>
+:root { --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; --line: #d9d9d4; --card: #fff; --accent: #c2410c; }
+@media (prefers-color-scheme: dark) { :root { --bg: #161615; --fg: #ecece8; --muted: #9a9a94; --line: #34342f;
+  --card: #1f1f1d; --accent: #fb923c; } }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, sans-serif; }
+header { position: sticky; top: 0; z-index: 5; background: var(--bg); border-bottom: 1px solid var(--line);
+  padding: 10px 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+header h1 { font-size: 17px; margin: 0 12px 0 0; }
+button { font: inherit; padding: 5px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--card);
+  color: var(--fg); cursor: pointer; }
+button.main { background: var(--accent); border-color: var(--accent); color: #fff; }
+.help { padding: 8px 16px; color: var(--muted); max-width: 1100px; }
+.help b { color: var(--fg); }
+section { padding: 8px 16px 20px; border-bottom: 1px solid var(--line); }
+section h2 { font-size: 16px; margin: 6px 0; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.state { color: var(--muted); font-weight: normal; }
+.views { display: flex; gap: 8px; }
+.view { flex: 1 1 0; min-width: 0; height: 74vh; overflow: auto; border: 1px solid var(--line); background: #000; }
+.inner { position: relative; }
+.inner img { width: 100%; display: block; cursor: crosshair; user-select: none; -webkit-user-drag: none; }
+.cap { color: var(--muted); font-size: 13px; margin: 2px 0; }
+.mk { position: absolute; width: 14px; height: 14px; margin: -9px 0 0 -9px; border: 3px solid; border-radius: 50%;
+  cursor: pointer; }
+.mk span { position: absolute; left: 14px; top: -12px; font: bold 16px system-ui; text-shadow: 0 0 3px #000, 0 0 3px #000; }
+.mk.pending { border-style: dashed; animation: blink 1s infinite; }
+@keyframes blink { 50% { opacity: .35; } }
+@media (max-width: 700px) { .views { flex-direction: column; } .view { height: 45vh; } }
+</style></head><body>
+<header><h1>Same spots on two cameras</h1>
+<button class="main" id="save">Save points.json</button><button id="clear">Clear all</button>
+<span class="state" id="total"></span></header>
+<div class="help">Click a spot on one picture, then <b>the same spot</b> on the other: a pair, numbered alike.
+Spots <b>on the floor</b> - the foot of a post where it enters the ground, a corner of the trough at the floor,
+a mark or a drain on the floor; not a cow's back, not the top rail (they stand above the floor and mislead).
+Spread them over the floor both cameras see, not all along one fence: <b>6-10 pairs</b> (7 or more and the
+wide lens's bend is found too). Click a numbered mark to remove it; + / - zoom. Save, put points.json beside this
+page and run autocalib with --points.</div>
+<main id="pairs"></main>
+<script>
+const DATA = __DATA__;
+const KEY = "autocalib-points:" + DATA.map(d => d.imgA + d.imgB).join(",");
+const COL = ["#ef4444", "#22c55e", "#3b82f6", "#eab308", "#d946ef", "#06b6d4", "#f97316", "#a3e635", "#f472b6",
+             "#60a5fa", "#facc15", "#34d399"];
+let points = {}, pending = {}, zoom = {};
+try { points = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) { points = {}; }
+const key = d => d.a + ":" + d.b;
+function keep() { try { localStorage.setItem(KEY, JSON.stringify(points)); } catch (e) {} }
+function mark(inner, u, v, n, cls) {
+  const m = document.createElement("div");
+  m.className = "mk " + (cls || "");
+  m.style.left = (u * 100) + "%"; m.style.top = (v * 100) + "%";
+  const c = COL[(n - 1) % COL.length];
+  m.style.borderColor = c;
+  const t = document.createElement("span"); t.textContent = n; t.style.color = c; m.appendChild(t);
+  inner.appendChild(m);
+  return m;
+}
+function render() {
+  let total = 0;
+  DATA.forEach((d, i) => {
+    const k = key(d), pts = points[k] || [];
+    total += pts.length;
+    const sec = document.getElementById("pair" + i);
+    sec.querySelector(".state").textContent = pts.length + " pairs" + (pts.length < 6 ? " - 6 or more, please" : "");
+    ["A", "B"].forEach(side => {
+      const inner = sec.querySelector(".inner" + side);
+      inner.querySelectorAll(".mk").forEach(m => m.remove());
+      inner.style.width = (100 * (zoom[k] || 1)) + "%";
+      pts.forEach((p, j) => {
+        const m = mark(inner, side === "A" ? p[0] : p[2], side === "A" ? p[1] : p[3], j + 1);
+        m.title = "remove pair " + (j + 1);
+        m.onclick = ev => { ev.stopPropagation();
+          if (confirm("Remove pair " + (j + 1) + "?")) { pts.splice(j, 1); points[k] = pts; keep(); render(); } };
+      });
+      const pd = pending[k];
+      if (pd && pd.side === side) mark(inner, pd.u, pd.v, pts.length + 1, "pending");
+    });
+  });
+  document.getElementById("total").textContent = total + " pairs clicked";
+}
+function click(d, side, ev) {
+  const r = ev.target.getBoundingClientRect();
+  const u = (ev.clientX - r.left) / r.width, v = (ev.clientY - r.top) / r.height;
+  const k = key(d), pd = pending[k];
+  if (pd && pd.side !== side) {
+    const a = side === "A" ? [u, v] : [pd.u, pd.v], b = side === "B" ? [u, v] : [pd.u, pd.v];
+    (points[k] = points[k] || []).push([+a[0].toFixed(5), +a[1].toFixed(5), +b[0].toFixed(5), +b[1].toFixed(5)]);
+    delete pending[k]; keep();
+  } else {
+    pending[k] = {side, u, v};
+  }
+  render();
+}
+const main = document.getElementById("pairs");
+DATA.forEach((d, i) => {
+  const s = document.createElement("section");
+  s.id = "pair" + i;
+  s.innerHTML = `<h2>${d.a} &harr; ${d.b} <span class="state"></span>
+    <button data-z="1.5">+</button><button data-z="0.667">&minus;</button><button data-u="1">Undo last</button></h2>
+    <div class="views"><div><div class="cap">${d.a}</div></div><div><div class="cap">${d.b}</div></div></div>`;
+  const views = s.querySelector(".views");
+  views.innerHTML = "";
+  ["A", "B"].forEach(side => {
+    const col = document.createElement("div"); col.style.flex = "1 1 0"; col.style.minWidth = "0";
+    col.innerHTML = `<div class="cap">${side === "A" ? d.a : d.b}</div><div class="view"><div class="inner inner${side}">
+      <img src="${side === "A" ? d.imgA : d.imgB}" alt="${side === "A" ? d.a : d.b}" draggable="false"></div></div>`;
+    col.querySelector("img").addEventListener("click", ev => click(d, side, ev));
+    views.appendChild(col);
+  });
+  s.querySelectorAll("button[data-z]").forEach(b => b.onclick = () => {
+    const k = key(d); zoom[k] = Math.min(6, Math.max(1, (zoom[k] || 1) * +b.dataset.z)); render(); });
+  s.querySelector("button[data-u]").onclick = () => {
+    const k = key(d);
+    if (pending[k]) delete pending[k]; else if ((points[k] || []).length) points[k].pop();
+    keep(); render(); };
+  main.appendChild(s);
+});
+document.getElementById("save").onclick = () => {
+  const blob = new Blob([JSON.stringify({pairs: points}, null, 1)], {type: "application/json"});
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "points.json"; a.click();
+};
+document.getElementById("clear").onclick = () => {
+  if (confirm("Remove every pair on this page?")) { points = {}; pending = {}; keep(); render(); } };
+render();
+</script></body></html>
+"""
+
+
 def toml_value(v):
     return json.dumps(v)
 
 
-def apply_config(path, calib, link_dist):
-    """barn.toml: the calibrated cameras' floor_points / distortion / aspect, and [mct] link on."""
+def apply_config(path, calib, link_dist, shared=()):
+    """barn.toml: the calibrated cameras' floor_points / distortion / aspect, and [mct] link on; the camera
+    pairs found to share floor taken out of [mct] disjoint."""
+    old_disjoint = load_config(path)["mct"].get("disjoint", [])
     text = open(path, encoding="utf-8").read()
     shutil.copy(path, path + ".bak")
     blocks = re.split(r"(?m)^(?=\[\[cameras\]\])", text)
@@ -515,6 +675,16 @@ def apply_config(path, calib, link_dist):
     if m:
         end = re.search(r"(?m)^\[", text[m.end():])
         sec = text[m.end(): m.end() + end.start()] if end else text[m.end():]
+        keep = [x for x in old_disjoint if frozenset(x) not in {frozenset(ab) for ab in shared}]
+        d = re.search(r"(?m)^disjoint\s*=\s*\[", sec)
+        if d and len(keep) != len(old_disjoint):
+            depth, i = 0, d.end() - 1                              # the array's end: its brackets matched
+            while i < len(sec):
+                depth += {"[": 1, "]": -1}.get(sec[i], 0)
+                if depth == 0:
+                    break
+                i += 1
+            sec = sec[:d.start()] + f"disjoint = {json.dumps(keep)}" + sec[i + 1:]
         for k, v in (("enabled", "true"), ("mode", '"link"'), ("link_dist", str(int(link_dist)))):
             if re.search(rf"(?m)^{k}\s*=", sec):
                 sec = re.sub(rf"(?m)^{k}\s*=[^#\n]*", f"{k} = {v}    ", sec, count=1)
@@ -540,22 +710,31 @@ def main(argv=None, live=None):
     p.add_argument("--max-lag", type=int, default=90, help="the cameras' clocks may differ by this many s")
     p.add_argument("--apply", action="store_true", help="write the result into the config (barn.toml.bak kept)")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--pick", action="store_true", help="no cows walking: write OUT/pick.html - the pairs' pictures "
+                   "side by side, to click the same spots of the floor on both (no measuring)")
+    p.add_argument("--at", type=float, default=60.0, help="--pick: the pictures this many s into the recordings")
+    p.add_argument("--points", default=None, help="the spots clicked on pick.html (its points.json): the floor "
+                   "mapping from them instead of from walking cows")
     args = p.parse_args(argv)
     from store import Store
     import cv2
     cfg = load_config(args.config)
     ids = [c["id"] for c in cfg["cameras"]]
-    if not args.videos and not args.store:
+    if not args.videos and not args.store and not args.points:
         p.error("--videos (the recordings) or --store (a run's boxes) is needed")
     disjoint = {frozenset(x) for x in cfg["mct"].get("disjoint", [])}
-    pairs = [tuple(x.split(":")) for x in args.pairs] if args.pairs else \
-        [(a, b) for a, b in itertools.combinations(ids, 2) if frozenset((a, b)) not in disjoint]
+    if args.pairs:
+        pairs = [tuple(x.split(":")) for x in args.pairs]
+    elif args.points:
+        pairs = [tuple(k.split(":")) for k in json.load(open(args.points, encoding="utf-8")).get("pairs", {})]
+    else:
+        pairs = [(a, b) for a, b in itertools.combinations(ids, 2) if frozenset((a, b)) not in disjoint]
     for a, b in pairs:
         for x in (a, b):
             if x not in ids:
                 sys.exit(f"[calib] {x}: no such camera in {args.config} ({', '.join(ids)})")
     os.makedirs(args.out, exist_ok=True)
-    videos, aspect = collections.defaultdict(list), {c: 16 / 9 for c in ids}
+    videos, aspect, size = collections.defaultdict(list), {c: 16 / 9 for c in ids}, {}
     if args.videos:
         recs, _ = recordings(args.videos, ids, cfg["farm"]["timezone_offset_hours"])
         for cam, path, ts in sorted(recs, key=lambda r: r[2]):
@@ -565,9 +744,19 @@ def main(argv=None, live=None):
             w, h = cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
             cap.release()
             if w and h:
-                aspect[cam] = w / h
+                aspect[cam], size[cam] = w / h, (int(w), int(h))
+    if args.pick:
+        if not args.videos:
+            p.error("--pick needs --videos")
+        page = pick_page(args.out, videos, pairs, args.at)
+        print(f"[calib] {page}: open it in a browser, click the same floor spots on both pictures of each pair, "
+              f"Save (points.json), put it into {args.out} and run again with --points "
+              f"{os.path.join(args.out, 'points.json')}")
+        return
     used = sorted({x for ab in pairs for x in ab})
-    if args.store:
+    if args.points and not args.store and not args.videos:
+        T = {}
+    elif args.store:
         store = Store(args.store)
         T = {c: load_tracks(store, c) for c in used}
         cut = [c["id"] for c in cfg["cameras"] if c["id"] in used and c.get("mask")]
@@ -580,6 +769,15 @@ def main(argv=None, live=None):
             if not videos.get(c):
                 sys.exit(f"[calib] {c}: no recordings in {args.videos} (named {c}_YYYY-MM-DD_HH-MM-SS)")
             T[c] = detect_tracks(cfg, c, videos[c], args.out, live=live)
+    if args.points:
+        found = from_points(args.points, pairs if args.pairs else None, T, aspect, size, args.out)
+    else:
+        found = from_motion(pairs, T, videos, aspect, args)
+    finish(args, cfg, found, T, videos, aspect)
+
+
+def from_motion(pairs, T, videos, aspect, args):
+    """The pairs' floor mappings from the cows that walk on both cameras."""
     rng = np.random.default_rng(args.seed)
     found = {}
     for a, b in pairs:
@@ -602,7 +800,7 @@ def main(argv=None, live=None):
             share, n, chance = agreement(T[a], T[b], H, lag, kA, kB, aspect[a], aspect[b])
             if best is None or (share - chance, len(inl)) > (best["share"] - best["chance"], best["inliers"]):
                 best = {"H": H, "inliers": len(inl), "share": share, "chance": chance, "checked": n, "kA": kA,
-                        "kB": kB, "lag": lag, "moving": agree}
+                        "kB": kB, "lag": lag, "moving": len(agree)}
         if best is None or best["inliers"] < MIN_COWS or best["share"] < 0.35 or best["share"] - best["chance"] < 0.2:
             why = f"{len(mv)} cows moving in both, {MIN_COWS} needed" if best is None else \
                 f"best: {best['inliers']} cows, {best['share']:.0%} of the other's cows land on one - " \
@@ -615,62 +813,168 @@ def main(argv=None, live=None):
         found[(a, b)] = best
     if not found:
         sys.exit("[calib] no camera pair with shared floor - nothing written. A longer recording (an hour or more, "
-                 "with cows getting up and walking through the overlap: feeding time) helps")
-    # one floor plan: from a reference camera along the pairs found (B -> A homographies chained)
+                 "with cows getting up and walking through the overlap: feeding time) helps - or click the same "
+                 "floor spots on both pictures: --pick")
+    return found
+
+
+def loo_errors(pa, pb):
+    """Each clicked spot's error when the mapping is fitted on all the others (leave one out): B -> A, in
+    A's (undistorted) picture fractions. A wrong click stands out; a lens that only bends to fit does not
+    win."""
+    out = np.zeros(len(pa))
+    for i in range(len(pa)):
+        keep = np.arange(len(pa)) != i
+        H = homography(pb[keep], pa[keep])
+        out[i] = np.hypot(*(apply_h(H, pb[i:i + 1])[0] - pa[i]))
+    return np.where(np.isfinite(out), out, 1e9)
+
+
+def from_points(path, only, T, aspect, size, out):
+    """The pairs' floor mappings from the spots clicked on pick.html (the same spot of the floor on both
+    pictures): a homography B -> A; with 7 spots or more each lens's bend too (the one whose mapping best
+    predicts each spot from the others)."""
+    data = json.load(open(path, encoding="utf-8"))
+    found = {}
+    for key, pts in data.get("pairs", {}).items():
+        a, b = key.split(":")
+        if only and (a, b) not in only:
+            continue
+        P = np.array(pts, float).reshape(-1, 4)
+        if len(P) < 4:
+            print(f"[calib] {a}-{b}: {len(P)} spots clicked - 4 at least (6-10 is better); skipped", flush=True)
+            continue
+        A0, B0 = P[:, :2], P[:, 2:]
+        sv = np.linalg.svd(A0 - A0.mean(0), compute_uv=False)
+        if sv[1] < 0.15 * sv[0]:
+            print(f"[calib] {a}-{b}: the spots lie almost on one line on {a} - add some away from it", flush=True)
+        grid = itertools.product(K_GRID_POINTS, K_GRID_POINTS) if len(P) >= 7 else [(0.0, 0.0)]
+        best = None
+        for kA, kB in grid:
+            pa = np.c_[undistort(A0[:, 0], A0[:, 1], kA, aspect[a])]
+            pb = np.c_[undistort(B0[:, 0], B0[:, 1], kB, aspect[b])]
+            err = loo_errors(pa, pb) if len(P) >= 5 else np.zeros(len(P))
+            score = float(np.median(err)) + 0.002 * (abs(kA) + abs(kB))      # straight lenses when it is a tie
+            if best is None or score < best[0]:
+                best = (score, kA, kB, err, homography(pb, pa))
+        _, kA, kB, err, H = best
+        wa = size.get(a, (1920, 1080))[0]
+        px = err * wa
+        r = {"H": H, "kA": kA, "kB": kB, "lag": 0, "spots": len(P),
+             "spot_error_px": [round(float(x), 1) for x in px]}
+        bad = [i + 1 for i, x in enumerate(px) if len(P) >= 5 and x > max(3 * np.median(px), 0.03 * wa)]
+        lens = f"lens {a} k={kA}, {b} k={kB}" if len(P) >= 7 else "lenses taken straight (7 spots or more to fit them)"
+        print(f"[calib] {a}-{b}: {len(P)} spots, each predicted from the others within {np.median(px):.0f} px "
+              f"(median, on {a}); {lens}", flush=True)
+        if bad:
+            print(f"[calib] {a}-{b}: spot(s) {', '.join(map(str, bad))} off by "
+                  f"{', '.join(f'{px[i - 1]:.0f}' for i in bad)} px - clicked on the same spot on both? "
+                  "(fix them on pick.html, save, run again)", flush=True)
+        if T.get(a) and T.get(b):
+            share, n, chance = agreement(T[a], T[b], H, 0, kA, kB, aspect[a], aspect[b])
+            r.update(share=share, chance=chance, checked=n)
+            print(f"[calib] {a}-{b}: check on the cows - {share:.0%} of {b}'s {n} cow-seconds over {a}'s picture "
+                  f"land on one of {a}'s cows ({chance:.0%} would by chance)", flush=True)
+        found[(a, b)] = r
+    if not found:
+        sys.exit(f"[calib] no camera pair with 4 spots or more in {path} - nothing written")
+    return found
+
+
+def components(found):
+    """The cameras joined by the pairs found, in groups: [(reference camera, {camera: H camera -> reference})]."""
     graph = collections.defaultdict(list)
     for (a, b), r in found.items():
         graph[a].append((b, r["H"]))                              # maps b -> a
         graph[b].append((a, np.linalg.inv(r["H"])))
-    ref = next(iter(found))[0]
-    to_ref = {ref: np.eye(3)}
+    seen, out = set(), []
+    for a, _ in found:
+        if a in seen:
+            continue
+        to_ref, queue = {a: np.eye(3)}, [a]
+        while queue:
+            x = queue.pop(0)
+            for y, Hyx in graph[x]:
+                if y not in to_ref:
+                    to_ref[y] = to_ref[x] @ Hyx
+                    queue.append(y)
+        seen |= set(to_ref)
+        out.append((a, to_ref))
+    return out
+
+
+GROUP_APART = 100000.0          # cm: two groups of cameras that share no floor, far apart on the plan
+
+
+def cow_spread(TA, TB, MA, MB, kA, kB, arA, arB, lag):
+    """How far one cow's two floor points lie apart on the plan: every second, A's and B's cows that are each
+    other's nearest (within 4 m)."""
+    byA, byB = collections.defaultdict(list), collections.defaultdict(list)
+    for tr in TA.values():
+        for s, p in tr.items():
+            byA[s].append(p[:2])
+    for tr in TB.values():
+        for s, p in tr.items():
+            byB[s - lag].append(p[:2])
+    out = []
+    for s in list(byB)[::5]:
+        if s not in byA:
+            continue
+        a, b = np.array(byA[s]), np.array(byB[s])
+        qa = apply_h(MA, np.c_[undistort(a[:, 0], a[:, 1], kA, arA)])
+        qb = apply_h(MB, np.c_[undistort(b[:, 0], b[:, 1], kB, arB)])
+        D = np.hypot(*(qa[:, None, :] - qb[None, :, :]).transpose(2, 0, 1))
+        bx, by = D.argmin(1), D.argmin(0)
+        out += [D[x, y] for x, y in enumerate(bx) if by[y] == x and D[x, y] < 400]
+    return out
+
+
+def finish(args, cfg, found, T, videos, aspect):
+    """One floor plan per group of cameras that share floor (about cm), the link distance, the pictures,
+    calib.json and, with --apply, barn.toml."""
     lens = {}
     for (a, b), r in found.items():
         lens.setdefault(a, r["kA"]), lens.setdefault(b, r["kB"])
-    queue = [ref]
-    while queue:
-        x = queue.pop(0)
-        for y, Hyx in graph[x]:
-            if y not in to_ref:
-                to_ref[y] = to_ref[x] @ Hyx
-                queue.append(y)
-    R = straighten(T[ref], lens[ref], aspect[ref])
-    # the link distance: how far one cow's two points lie apart on the plan (the moving pairs that agree)
+    plan, refs = {}, []
+    for g, (ref, to_ref) in enumerate(components(found)):
+        R = straighten(T.get(ref) or {}, lens[ref], aspect[ref])
+        shift = np.array([[1, 0, g * GROUP_APART], [0, 1, 0], [0, 0, 1.0]])
+        for cam, Hc in to_ref.items():
+            plan[cam] = shift @ R @ Hc
+        refs.append(ref)
     spread = []
     for (a, b), r in found.items():
-        corr = pair_points(T[a], T[b], r["moving"], r["lag"], r["kA"], r["kB"], aspect[a], aspect[b])
-        for i in np.flatnonzero(pair_errors(r["H"], corr) < 0.6):
-            pb, pa, _, _ = corr[i]
-            qa = apply_h(R @ to_ref[a], pa)
-            qb = apply_h(R @ to_ref[a] @ r["H"], pb)
-            spread += list(np.hypot(*(qa - qb).T))
-    link = float(np.clip(1.5 * np.percentile(spread, 90), 80, 300)) if spread else 160.0
+        if T.get(a) and T.get(b):
+            spread += cow_spread(T[a], T[b], plan[a], plan[a] @ r["H"], r["kA"], r["kB"], aspect[a], aspect[b],
+                                 r["lag"])
+    link = float(np.clip(1.5 * np.percentile(spread, 75), 80, 300)) if spread else 160.0
     calib = {}
-    for cam, Hc in to_ref.items():
+    for cam, M in plan.items():
         k, ar = lens[cam], aspect[cam]
-        pts = [p for tr in T[cam].values() for p in tr.values()]
-        uv = np.array([p_[:2] for p_ in pts])
-        lo, hi = np.percentile(uv, 5, 0), np.percentile(uv, 95, 0)
+        uv = np.array([p_[:2] for tr in (T.get(cam) or {}).values() for p_ in tr.values()])
+        lo, hi = (np.percentile(uv, 5, 0), np.percentile(uv, 95, 0)) if len(uv) >= 20 else \
+            (np.array([0.05, 0.3]), np.array([0.95, 0.95]))
         fp = []
         for u, v in grid_points((lo, hi)):
-            q = apply_h(R @ Hc, np.array([undistort(u, v, k, ar)]))[0]
+            q = apply_h(M, np.array([undistort(u, v, k, ar)]))[0]
             fp.append([round(float(u), 4), round(float(v), 4), round(float(q[0]), 1), round(float(q[1]), 1)])
         calib[cam] = {"floor_points": fp, "distortion": k, "aspect": round(ar, 4)}
     pics = []
     for (a, b), r in found.items():
-        pic = draw(os.path.join(args.out, f"{a}_{b}.jpg"), videos, a, b, T[a], T[b], r["H"], r["lag"],
-                   r["kA"], r["kB"], aspect[a], aspect[b])
+        pic = draw(os.path.join(args.out, f"{a}_{b}.jpg"), videos, a, b, T.get(a) or {}, T.get(b) or {}, r["H"],
+                   r["lag"], r["kA"], r["kB"], aspect[a], aspect[b])
         if pic:
             pics.append(pic)
-    report = {"pairs": {f"{a}:{b}": {k: v for k, v in r.items() if k not in ("H", "moving")} | {"moving": len(r["moving"])}
-                        for (a, b), r in found.items()},
-              "reference": ref, "link_dist": round(link), "cameras": calib}
+    report = {"pairs": {f"{a}:{b}": {k: v for k, v in r.items() if k != "H"} for (a, b), r in found.items()},
+              "reference": refs[0], "references": refs, "link_dist": round(link), "cameras": calib}
     with open(os.path.join(args.out, "calib.json"), "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2)
-    print(f"[calib] one floor plan for {', '.join(sorted(calib))} (about cm, from {ref}); link_dist {link:.0f}")
+    groups = " and ".join("{" + ", ".join(sorted(to)) + "}" for _, to in components(found))
+    print(f"[calib] floor plan (about cm) for {groups}; link_dist {link:.0f}")
     if pics:
         print("[calib] look: " + ", ".join(pics) + " - the red crosses should sit on the green circles")
     if args.apply:
-        apply_config(args.config, calib, link)
+        apply_config(args.config, calib, link, [tuple(ab) for ab in found])
         print(f"[calib] {args.config}: floor_points, distortion for {', '.join(sorted(calib))}; [mct] enabled, "
               f"mode link, link_dist {link:.0f} (the old file: {args.config}.bak)")
     else:

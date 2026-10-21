@@ -306,6 +306,32 @@ numbered alike) - it shows whether the recording had enough cows walking. If no 
 an hour or more (the feeding time is best) and run `autocalib` on that. A few minutes of cows lying
 is not enough: their boxes only twitch, and a twitch is no evidence of where a cow stands.
 
+**No cows walking: click the same spots on both pictures.** Nothing is measured; you only show
+which spot of one picture is which spot of the other:
+
+```bash
+docker compose run --rm herd autocalib --config /data/barn.toml --videos /data/rec_fixed --out /data/calib --pairs cam1:cam2 cam3:cam4 --pick
+```
+
+1. Open `docker/data/calib/pick.html` in a browser: each camera pair's pictures of one moment side by side.
+2. Click a spot on one picture, then the same spot on the other (they get the same number). Spots **on
+   the floor**: the foot of a post, a corner of the trough where it stands on the floor, a drain or a
+   mark on the floor - not a cow's back or the top rail. 6-10 pairs, spread over the floor both
+   cameras see (7 or more: the wide lens's bend is found too). `+` / `-` zoom; click a number to
+   remove it.
+3. **Save points.json** (it goes to your Downloads) and put it into `docker/data/calib/`.
+4. Run:
+
+```bash
+docker compose run --rm herd autocalib --config /data/barn.toml --videos /data/rec_fixed --out /data/calib --points /data/calib/points.json --apply
+```
+
+The log says per pair how well each spot is predicted from the others (a few px is good) and names a
+spot that is off - clicked on two different places: fix it on the page (it remembers your clicks),
+save, run again. Then the check on the cows (share, and what chance alone would give) and the
+pictures `calib/cam1_cam2.jpg`, `calib/cam3_cam4.jpg`. With `--apply` the pairs also leave `[mct]
+disjoint`; two groups of cameras that share no floor are kept far apart on the plan.
+
 ## 7. The barn, live
 
 ```bash

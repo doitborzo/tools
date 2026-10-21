@@ -18,13 +18,19 @@ def _distort(q, k, ar=16 / 9):
     return p
 
 
-def _rows(lag=7, kB=-0.2, seconds=600, seed=0):
-    """Two views of one floor, cows walking and lying: (cam, track, ts, x1, y1, x2, y2) every second."""
+def _views():
+    """Floor (cm, 10 x 8 m) -> each camera's picture (0-1), lenses aside."""
     from common import homography
-    rng = np.random.default_rng(seed)
     floor = [(0, 0), (1000, 0), (1000, 800), (0, 800)]
     HA = homography(floor, [(0.1, 0.35), (0.9, 0.35), (0.98, 0.95), (0.02, 0.95)])       # from one side
     HB = homography(floor, [(0.85, 0.3), (0.95, 0.9), (0.1, 0.92), (0.2, 0.32)])         # from another corner
+    return HA, HB
+
+
+def _rows(lag=7, kB=-0.2, seconds=600, seed=0):
+    """Two views of one floor, cows walking and lying: (cam, track, ts, x1, y1, x2, y2) every second."""
+    rng = np.random.default_rng(seed)
+    HA, HB = _views()
     cows = []
     for i in range(14):
         p = rng.uniform([100, 100], [900, 700])
@@ -215,3 +221,88 @@ def test_a_full_pen_of_lying_cows_is_no_calibration():
             raise AssertionError("calibrated two pens of lying cows")
         except SystemExit as e:
             assert "no camera pair" in str(e)
+
+
+def _seen(H, p, k):
+    q = H @ np.array([p[0], p[1], 1.0])
+    return _distort((q[0] / q[2], q[1] / q[2]), k)
+
+
+def test_clicked_spots_instead_of_walking_cows():
+    """No cow walks: the same floor spots clicked on both pictures give the mapping and the bent lens; a
+    wrong click is named; the pair leaves [mct] disjoint; the cows then land on each other."""
+    import autocalib
+    from common import floor_mapper, load_config
+    from store import Store
+    with tempfile.TemporaryDirectory() as d:
+        st = _scene(d, lag=0)
+        HA, HB = _views()
+        rng = np.random.default_rng(5)
+        spots = [(150, 150), (850, 120), (900, 700), (120, 650), (500, 400), (300, 300), (700, 500), (500, 700),
+                 (650, 200)]
+        pts = []
+        for p in spots:
+            ua, va = _seen(HA, p, 0.0)
+            ub, vb = _seen(HB, p, -0.2)
+            pts.append([ua + rng.normal(0, 0.001), va + rng.normal(0, 0.001), ub + rng.normal(0, 0.001),
+                        vb + rng.normal(0, 0.001)])
+        pts[4][2] += 0.12                                                    # one spot clicked wrong
+        pj = os.path.join(d, "points.json")
+        json.dump({"pairs": {"cam1:cam2": pts}}, open(pj, "w"))
+        cfg = os.path.join(d, "barn.toml")
+        open(cfg, "w").write(CONFIG.replace("disjoint = []", 'disjoint = [["cam1", "cam2"],\n  ["cam1", "cam9"]]'))
+        out = os.path.join(d, "calib")
+        import io
+        import contextlib
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            autocalib.main(["--config", cfg, "--store", st, "--out", out, "--points", pj, "--apply"])
+        assert "spot(s) 5 off" in log.getvalue(), log.getvalue()
+        pts.pop(4)                                                           # fixed on the page: clicked again
+        json.dump({"pairs": {"cam1:cam2": pts}}, open(pj, "w"))
+        autocalib.main(["--config", cfg, "--store", st, "--out", out, "--points", pj, "--apply"])
+        pair = json.load(open(os.path.join(out, "calib.json")))["pairs"]["cam1:cam2"]
+        assert pair["kA"] == 0.0 and pair["kB"] in (-0.1, -0.2, -0.3) and pair["share"] > 0.8, pair
+        c = load_config(cfg)
+        assert c["mct"]["disjoint"] == [["cam1", "cam9"]] and c["mct"]["mode"] == "link"
+        cams = {x["id"]: x for x in c["cameras"]}
+        fa, fb = floor_mapper(cams["cam1"], c["mct"]), floor_mapper(cams["cam2"], c["mct"])
+        s = Store(st)
+        ra = {r[0].split("-")[1] + f"@{int(r[1])}": r[2:] for r in s.query("SELECT track, ts, x1, y1, x2, y2 FROM seconds WHERE cam='cam1'")}
+        rb = {r[0].split("-")[1] + f"@{int(r[1])}": r[2:] for r in s.query("SELECT track, ts, x1, y1, x2, y2 FROM seconds WHERE cam='cam2'")}
+        both = sorted(set(ra) & set(rb))[::25]
+        d_same = [np.hypot(*np.subtract(fa(ra[k]), fb(rb[k]))) for k in both]
+        assert np.median(d_same) < 0.5 * c["mct"]["link_dist"], (np.median(d_same), c["mct"]["link_dist"])
+
+
+def test_two_groups_of_cameras_kept_apart_on_the_plan():
+    """cam1-cam2 and cam3-cam4 share floor, the groups none: their plans are far apart, never near."""
+    import autocalib
+    HA, HB = _views()
+    pts = [[*_seen(HA, p, 0.0), *_seen(HB, p, 0.0)] for p in [(150, 150), (850, 120), (900, 700), (120, 650),
+                                                                 (500, 400), (300, 600)]]
+    with tempfile.TemporaryDirectory() as d:
+        pj = os.path.join(d, "points.json")
+        json.dump({"pairs": {"cam1:cam2": pts, "cam3:cam4": pts}}, open(pj, "w"))
+        cfg = os.path.join(d, "barn.toml")
+        open(cfg, "w").write(CONFIG + '[[cameras]]\nid = "cam3"\nurl = "rtsp://c"\n[[cameras]]\nid = "cam4"\nurl = "rtsp://d"\n')
+        out = os.path.join(d, "calib")
+        autocalib.main(["--config", cfg, "--out", out, "--points", pj])
+        cams = json.load(open(os.path.join(out, "calib.json")))["cameras"]
+        x = {c: np.mean([p[2] for p in cams[c]["floor_points"]]) for c in cams}
+        assert abs(x["cam1"] - x["cam2"]) < 5000 and abs(x["cam3"] - x["cam4"]) < 5000
+        assert abs(x["cam1"] - x["cam3"]) > 50000, x
+
+
+def test_pick_page():
+    import autocalib
+    with tempfile.TemporaryDirectory() as d:
+        rec, _ = _videos(d, seconds=40)
+        cfg = os.path.join(d, "barn.toml")
+        open(cfg, "w").write(CONFIG)
+        out = os.path.join(d, "calib")
+        autocalib.main(["--config", cfg, "--videos", rec, "--out", out, "--pick", "--at", "10"])
+        html = open(os.path.join(out, "pick.html"), encoding="utf-8").read()
+        data = json.loads(html.split("const DATA = ", 1)[1].split(";\n", 1)[0])
+        assert [(x["a"], x["b"]) for x in data] == [("cam1", "cam2")]
+        assert all(os.path.getsize(os.path.join(out, x[k])) > 1000 for x in data for k in ("imgA", "imgB"))

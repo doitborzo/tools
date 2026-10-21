@@ -660,6 +660,7 @@ class TrackletLinker:
         self.cam_tracker = GlobalTracker(solo, None, None)
         self.floor = {c["id"]: floor_mapper(c, m) for c in cfg["cameras"]}
         self.dist = m.get("link_dist", 120.0)
+        self.disjoint = {frozenset(p) for p in m.get("disjoint", [])}   # no floor shared: never compared
         self.min_s = m.get("link_min_s", 5)
         self.share = m.get("link_share", 0.6)
         # strict joining: the next cow at least link_margin further than the pair; and no join that would
@@ -747,6 +748,8 @@ class TrackletLinker:
             cams = [c for c in per_cam if pts[c] is not None and pts[c]]
             for i, ca in enumerate(cams):
                 for cb in cams[i + 1:]:
+                    if frozenset((ca, cb)) in self.disjoint:
+                        continue
                     D = np.array([[self._d(p, q) for q in pts[cb]] for p in pts[ca]])
                     for x, ga in enumerate(ids[ca]):
                         for y, gb in enumerate(ids[cb]):

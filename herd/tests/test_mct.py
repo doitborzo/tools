@@ -521,6 +521,21 @@ def test_linker_refuses_a_chain_that_joins_cows_apart():
     assert lk.stats["linked"] >= 1 and lk.stats["link_contradicted"] >= 1
 
 
+def test_linker_leaves_disjoint_cameras_alone():
+    """Two cameras in [mct] disjoint whose floor plans happen to coincide: their cows are never joined."""
+    import mct
+    pts = [[0, 0, 0, 0], [1, 0, 1000, 0], [1, 1, 1000, 1000], [0, 1, 0, 1000]]
+    box = lambda x: [x - 0.03, 0.45, x + 0.03, 0.5]
+    for disjoint, joined in (([], True), ([["a", "b"]], False)):
+        cfg = _cfg()
+        cfg["cameras"] = [{"id": c, "mask": [], "floor_points": pts} for c in ("a", "b")]
+        cfg["mct"].update(link_min_s=3, link_share=0.3, link_dist=120.0, disjoint=disjoint)
+        lk = mct.TrackletLinker(cfg)
+        for k in range(10):
+            out = lk.update_all(float(k), {"a": [{"box": box(0.3)}], "b": [{"box": box(0.3)}]})
+        assert (out["a"][0] == out["b"][0]) == joined, disjoint
+
+
 def test_late_reacquire_by_the_tracks_own_fingerprint():
     """Two cows hidden 15 s (past reacquire_s), back near where they were: one frame is too noisy to
     take them back, a few seconds of each are not - the new tracks continue the old ones; a third cow
