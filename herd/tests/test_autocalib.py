@@ -329,3 +329,22 @@ def test_spots_along_one_fence_are_refused():
         except SystemExit as e:
             assert "no camera pair calibrated" in str(e)
         assert "mode" not in open(cfg).read().split("[mct]")[1].split("[[cameras]]")[0].replace("# mode", "")
+
+
+def test_right_spots_kept_when_some_lie_near_a_line():
+    """Three spots along the trough nearly in a line and four far apart, all clicked right: all used
+    (predicting a far spot from the others is shaky there - that is not a wrong click)."""
+    import autocalib
+    HA, HB = _views()
+    spots = [(450, 400), (500, 418), (550, 437), (150, 150), (850, 120), (900, 700), (120, 650)]
+    rng = np.random.default_rng(2)
+    pts = [[*(np.array(_seen(HA, p, 0.0)) + rng.normal(0, 0.002, 2)), *(np.array(_seen(HB, p, 0.0)) + rng.normal(0, 0.002, 2))]
+           for p in spots]
+    with tempfile.TemporaryDirectory() as d:
+        pj = os.path.join(d, "points.json")
+        json.dump({"pairs": {"cam1:cam2": pts}}, open(pj, "w"))
+        cfg = os.path.join(d, "barn.toml")
+        open(cfg, "w").write(CONFIG)
+        autocalib.main(["--config", cfg, "--out", os.path.join(d, "c"), "--points", pj])
+        pair = json.load(open(os.path.join(d, "c", "calib.json")))["pairs"]["cam1:cam2"]
+        assert pair["spots_used"] == 7 and pair["spots_left_out"] == [], pair

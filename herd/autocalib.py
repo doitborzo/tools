@@ -743,7 +743,7 @@ def main(argv=None, live=None):
             cap = cv2.VideoCapture(vs[0][0])
             w, h = cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
             cap.release()
-            if w and h:
+            if w > 0 and h > 0:
                 aspect[cam], size[cam] = w / h, (int(w), int(h))
     if args.pick:
         if not args.videos:
@@ -818,31 +818,52 @@ def from_motion(pairs, T, videos, aspect, args):
     return found
 
 
-def loo_errors(pa, pb):
-    """Each clicked spot's error when the mapping is fitted on all the others (leave one out): B -> A, in
-    A's (undistorted) picture fractions. A wrong click stands out; a lens that only bends to fit does not
-    win."""
-    out = np.zeros(len(pa))
-    for i in range(len(pa)):
-        keep = np.arange(len(pa)) != i
-        H = homography(pb[keep], pa[keep])
-        out[i] = np.hypot(*(apply_h(H, pb[i:i + 1])[0] - pa[i]))
-    return np.where(np.isfinite(out), out, 1e9)
-
-
 def flatness(P):
     """How far the spots are from lying on one line: the smaller spread across over the spread along (0-1)."""
     sv = np.linalg.svd(P - P.mean(0), compute_uv=False)
     return float(sv[1] / max(sv[0], 1e-9))
 
 
+def consensus(A, B, wa, ha, thr):
+    """The largest set of spots one mapping B -> A puts within thr px of where they were clicked (every
+    4 spots tried as the mapping's seed), the mapping refitted on them -> (spots, H, each spot's px off)."""
+    def off(H):
+        q = apply_h(H, B)
+        e = np.hypot((q[:, 0] - A[:, 0]) * wa, (q[:, 1] - A[:, 1]) * ha)
+        return np.where(np.isfinite(e), e, 1e9)
+    best = None
+    for seed in itertools.combinations(range(len(A)), 4):
+        H = homography(B[list(seed)], A[list(seed)])
+        if not np.all(np.isfinite(H)):
+            continue
+        e = off(H)
+        inl = np.flatnonzero(e < thr)
+        key = (len(inl), -float(np.median(e[inl])) if len(inl) else 0.0)
+        if best is None or key > best[0]:
+            best = (key, inl, H)
+    if best is None or len(best[1]) < 4:
+        H = best[2] if best else np.eye(3)
+        return (best[1] if best else np.array([], int)), H, off(H)
+    inl = best[1]
+    for _ in range(2):                                     # refitted on all of them (the set may grow)
+        H = homography(B[inl], A[inl])
+        e = off(H)
+        grown = np.flatnonzero(e < thr)
+        if len(grown) < len(inl):
+            break
+        inl = grown
+    H = homography(B[inl], A[inl])
+    return inl, H, off(H)
+
+
 def from_points(path, only, T, aspect, size, out, videos=None):
     """The pairs' floor mappings from the spots clicked on pick.html (the same spot of the floor on both
-    pictures): a homography B -> A; with 7 spots or more each lens's bend too (the one whose mapping best
-    predicts each spot from the others).
+    pictures): a homography B -> A; with 7 spots or more each lens's bend too, when it brings the spots
+    clearly closer.
 
-    A spot that disagrees with all the others (clicked on two different places) is left out and named;
-    spots along one line (one fence) give no floor and are refused, as are spots that agree on none."""
+    The spots one mapping agrees on are used; one that disagrees with them (clicked on two different
+    places) is left out and named. Fewer than 5 that agree, or spots along one line (one fence), give no
+    floor: refused."""
     data = json.load(open(path, encoding="utf-8"))
     found = {}
     for key, pts in data.get("pairs", {}).items():
@@ -850,70 +871,50 @@ def from_points(path, only, T, aspect, size, out, videos=None):
         if only and (a, b) not in only:
             continue
         P = np.array(pts, float).reshape(-1, 4)
-        wa = size.get(a, (1920, 1080))[0]
-        if len(P) < 4:
-            print(f"[calib] {a}-{b}: {len(P)} spots clicked - 4 at least (6-10 is better); skipped", flush=True)
+        wa, ha = size.get(a, (1920, 1080))
+        thr = 0.025 * wa
+        if len(P) < 5:
+            print(f"[calib] {a}-{b}: {len(P)} spots clicked - 5 at least (7-10 is better); skipped", flush=True)
             continue
-        def fit(K):
-            """The lens pair (from the grid, 7 spots or more) whose mapping best predicts each spot from the
-            others - the median, so one wrong spot does not choose it."""
-            best = None
-            for kA, kB in itertools.product(K_GRID_POINTS, K_GRID_POINTS) if len(K) >= 7 else [(0.0, 0.0)]:
-                pa = np.c_[undistort(K[:, 0], K[:, 1], kA, aspect[a])]
-                pb = np.c_[undistort(K[:, 2], K[:, 3], kB, aspect[b])]
-                err = loo_errors(pa, pb) if len(K) >= 5 else np.zeros(len(K))
-                score = float(np.median(err)) + 0.002 * (abs(kA) + abs(kB))   # straight lenses when it is a tie
-                if best is None or score < best[0]:
-                    best = (score, kA, kB, err, homography(pb, pa))
-            return best
-
-        # the spots that disagree with the rest (with the lenses the others choose): left out, one at a time
-        keep = np.arange(len(P))
-        best = fit(P)
-        err0 = best[3]
-        for _ in range(2):
-            e = best[3]
-            if len(keep) < 6:
-                break
-            worst = int(np.argmax(e))
-            if e[worst] <= max(4 * np.median(e), 0.03):
-                break
-            keep = np.delete(keep, worst)
-            best = fit(P[keep])
-        dropped = sorted(set(range(len(P))) - set(keep.tolist()))
+        fits = {}
+        for kA, kB in itertools.product(K_GRID_POINTS, K_GRID_POINTS) if len(P) >= 7 else [(0.0, 0.0)]:
+            pa = np.c_[undistort(P[:, 0], P[:, 1], kA, aspect[a])]
+            pb = np.c_[undistort(P[:, 2], P[:, 3], kB, aspect[b])]
+            inl, H, e = consensus(pa, pb, wa, ha, thr)
+            fits[(kA, kB)] = (len(inl), float(np.median(e[inl])), inl, H, e)
+        most = max(f[0] for f in fits.values())
+        (kA, kB), (_, med, inl, H, e) = min(((k, f) for k, f in fits.items() if f[0] == most),
+                                            key=lambda kf: kf[1][1])
+        straight = fits[(0.0, 0.0)]
+        if (kA, kB) != (0.0, 0.0) and straight[0] == most and med > 0.8 * straight[1]:
+            (kA, kB), (_, med, inl, H, e) = (0.0, 0.0), straight      # a bent lens only when clearly closer
+        dropped = sorted(set(range(len(P))) - set(inl.tolist()))
+        r = {"H": H, "kA": kA, "kB": kB, "lag": 0, "spots": len(P), "spots_used": len(inl),
+             "spots_left_out": [i + 1 for i in dropped], "spot_error_px": [round(float(x), 1) for x in e]}
+        draw_spots(os.path.join(out, f"{a}_{b}_spots.jpg"), out, a, b, P, e, dropped)
         if dropped:
-            print(f"[calib] {a}-{b}: spot(s) {', '.join(str(i + 1) for i in dropped)} left out - off by "
-                  f"{', '.join(f'{err0[i] * wa:.0f}' for i in dropped)} px from where the others put it: not the same "
-                  "spot on both pictures? (fix on pick.html, save, run again)", flush=True)
-        K = P[keep]
-        flat = {c: flatness(K[:, j:j + 2]) for c, j in ((a, 0), (b, 2))}
-        line = [c for c, f in flat.items() if f < 0.12]
+            print(f"[calib] {a}-{b}: spot(s) {', '.join(str(i + 1) for i in dropped)} left out - "
+                  f"{', '.join(f'{min(e[i], 9999):.0f}' for i in dropped)} px from where the others put it: not the "
+                  "same spot on both pictures? (fix on pick.html, save, run again)", flush=True)
+        if len(inl) < 5:
+            print(f"[calib] {a}-{b}: NOT calibrated - no 5 spots agree on one floor (most: {len(inl)}): the same "
+                  f"spot of the floor on both pictures? see {a}_{b}_spots.jpg", flush=True)
+            continue
+        K = P[inl]
+        line = [c for c, j in ((a, 0), (b, 2)) if flatness(K[:, j:j + 2]) < 0.12]
         if line:
             print(f"[calib] {a}-{b}: NOT calibrated - the spots lie almost on one line on {', '.join(line)} (along "
                   "one fence?): a floor needs spots across it too - add some far from that line", flush=True)
-            draw_spots(os.path.join(out, f"{a}_{b}_spots.jpg"), out, a, b, P, err0 * wa, dropped)
             continue
-        _, kA, kB, err, H = best
-        px = err * wa
-        # the floor B's spots cover must not fold over (its horizon must not run through it)
-        corners = np.c_[undistort(*np.array([[K[:, 2].min(), K[:, 3].min()], [K[:, 2].max(), K[:, 3].min()],
-                                              [K[:, 2].max(), K[:, 3].max()], [K[:, 2].min(), K[:, 3].max()]]).T,
-                                  kB, aspect[b])]
-        wsign = np.sign(np.c_[corners, np.ones(4)] @ H[2])
-        all_px = err0 * wa
-        all_px[keep] = px
-        r = {"H": H, "kA": kA, "kB": kB, "lag": 0, "spots": len(P), "spots_used": len(K),
-             "spots_left_out": [i + 1 for i in dropped], "spot_error_px": [round(float(x), 1) for x in all_px]}
-        lens = f"lens {a} k={kA}, {b} k={kB}" if len(K) >= 7 else "lenses taken straight (7 spots or more to fit them)"
-        print(f"[calib] {a}-{b}: {len(K)} spots, each predicted from the others within {np.median(px):.0f} px "
-              f"(median, on {a}); {lens}", flush=True)
-        draw_spots(os.path.join(out, f"{a}_{b}_spots.jpg"), out, a, b, P, all_px, dropped)
-        if len(set(wsign)) > 1 or np.median(px) > 0.04 * wa:
-            why = "the mapping folds the floor over" if len(set(wsign)) > 1 else \
-                f"the spots do not agree on one floor ({np.median(px):.0f} px)"
-            print(f"[calib] {a}-{b}: NOT calibrated - {why}: check the spots on {a}_{b}_spots.jpg - the same "
-                  "spot of the floor on both pictures, spread over the floor both see", flush=True)
+        # every spot seen by both cameras is in front of both: the mapping must not put one behind A
+        pb = np.c_[undistort(K[:, 2], K[:, 3], kB, aspect[b])]
+        if len(set(np.sign(np.c_[pb, np.ones(len(pb))] @ H[2]))) > 1:
+            print(f"[calib] {a}-{b}: NOT calibrated - the mapping folds the floor over: check the spots on "
+                  f"{a}_{b}_spots.jpg", flush=True)
             continue
+        lens = f"lens {a} k={kA}, {b} k={kB}" if len(P) >= 7 else "lenses taken straight (7 spots or more to fit them)"
+        print(f"[calib] {a}-{b}: {len(inl)} of {len(P)} spots agree, within {med:.0f} px (median, on {a}); {lens}",
+              flush=True)
         if T.get(a) and T.get(b):
             share, n, chance = agreement(T[a], T[b], H, 0, kA, kB, aspect[a], aspect[b])
             r.update(share=share, chance=chance, checked=n)
@@ -946,7 +947,7 @@ def draw_spots(path, out, a, b, P, err_px, dropped):
                 (40, 40, 230) if e > max(3 * med, 60) else (60, 200, 60)
             x, y = int(p[j] * w), int(p[j + 1] * h)
             cv2.circle(img, (x, y), 10, col, 3)
-            label = str(i + 1) + ("" if np.isnan(e) or col == (60, 200, 60) else f" ({e:.0f} px)")
+            label = str(i + 1) + ("" if np.isnan(e) or col == (60, 200, 60) else f" ({min(e, 9999):.0f} px)")
             cv2.putText(img, label, (x + 12, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
             cv2.putText(img, label, (x + 12, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, col, 2)
         cv2.rectangle(img, (0, 0), (w, 44), (0, 0, 0), -1)
