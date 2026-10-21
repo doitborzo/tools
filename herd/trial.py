@@ -21,6 +21,7 @@ import argparse
 import collections
 import copy
 import datetime as dt
+import itertools
 import json
 import os
 import shutil
@@ -64,7 +65,31 @@ def summary(store_path, cfg, gallery_folder):
                     "activity": dict(collections.Counter(a for _, _, a in rows)), "bursts": states}
     meta = os.path.join(gallery_folder, "gallery.json")
     cows = len(json.load(open(meta)).get("cows", {})) if os.path.exists(meta) else 0
-    return out, cows
+    return out, cows, impossible(store, tm, cfg)
+
+
+def impossible(store, tm, cfg):
+    """What cannot be: one cow at the same second on two tracks of one camera, or on two cameras that share
+    no floor ([mct] disjoint) - two cows given one id. -> counts, per cow and over all, of named cow-seconds."""
+    disjoint = {frozenset(p) for p in cfg["mct"].get("disjoint", [])}
+    at = collections.defaultdict(lambda: collections.defaultdict(set))       # second -> cow -> {(cam, track)}
+    named = 0
+    for cam, track, ts in store.query("SELECT cam, track, ts FROM seconds"):
+        cow = tm.get(track)
+        if cow:
+            at[int(ts)][cow].add((cam, track))
+            named += 1
+    twice, apart, per_cow = 0, 0, collections.Counter()
+    for cows in at.values():
+        for cow, seen in cows.items():
+            cams = collections.Counter(c for c, _ in seen)
+            bad = sum(n - 1 for n in cams.values())
+            far = sum(1 for a, b in itertools.combinations(sorted(cams), 2) if frozenset((a, b)) in disjoint)
+            twice, apart = twice + bad, apart + far
+            if bad or far:
+                per_cow[cow] += 1
+    return {"named_cow_seconds": named, "one_cow_twice_on_one_camera": twice,
+            "one_cow_on_cameras_apart": apart, "cows_seen_where_they_cannot_be": dict(per_cow.most_common())}
 
 
 def main(argv=None):
@@ -106,7 +131,9 @@ def main(argv=None):
     g = gallery_mod.Gallery(folder, first, abstain)
     last = max(ts for _, _, ts in recs) + 3600
     res = g.nightly(last, Store(os.path.join(out, "pass1", "herd.sqlite")).cannot_link_pairs())
-    print(f"[trial] the night: {len(res['enrolled'])} cows enrolled ({res['pool']} bursts left unknown)", flush=True)
+    print(f"[trial] the night: {len(res['enrolled'])} cows enrolled ({res['pool']} bursts left unknown"
+          + (f"; {res['held_back_herd_full']} more held back: max_cows reached" if res.get("held_back_herd_full") else "")
+          + ")", flush=True)
     shutil.copytree(folder, os.path.join(out, "pass2", "gallery"))
     print("[trial] 2/3 the second pass, with those cows: who is who", flush=True)
     play(cfg, groups, os.path.join(out, "pass2", "herd.sqlite"), models)
@@ -124,8 +151,9 @@ def main(argv=None):
             shown[cam] = os.path.join(dest, "index.html")
         except SystemExit as e:
             print(f"[trial] {cam}: nothing drawn ({e})", flush=True)
-    per_cam, cows = summary(store2, cfg, os.path.join(out, "pass2", "gallery"))
-    report = {"cows_enrolled": res["enrolled"], "cows_in_gallery": cows, "cameras": per_cam, "show": shown}
+    per_cam, cows, odd = summary(store2, cfg, os.path.join(out, "pass2", "gallery"))
+    report = {"cows_enrolled": res["enrolled"], "cows_in_gallery": cows, "cameras": per_cam, "impossible": odd,
+              "held_back_herd_full": res.get("held_back_herd_full", 0), "show": shown}
     with open(os.path.join(out, "trial.json"), "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2)
     print(f"\n[trial] {len(res['enrolled'])} cows made from the first pass")
@@ -134,6 +162,15 @@ def main(argv=None):
         print(f"  {cam}: {r['cow_seconds']} cow-seconds on {r['tracks']} tracks; {r['with_a_cow']:.0%} of them given a "
               f"cow ({r['cows']} cows); bursts confirmed {b.get('confirmed', 0)}, tentative {b.get('tentative', 0)}, "
               f"unknown {b.get('unknown', 0)}")
+    n = max(1, odd["named_cow_seconds"])
+    print(f"  what cannot be: one cow twice on one camera at once {odd['one_cow_twice_on_one_camera']} s, on two "
+          f"cameras that share no floor at once {odd['one_cow_on_cameras_apart']} s "
+          f"({(odd['one_cow_twice_on_one_camera'] + odd['one_cow_on_cameras_apart']) / n:.1%} of the named "
+          f"cow-seconds) - two cows given one id; {len(odd['cows_seen_where_they_cannot_be'])} cows so")
+    if res.get("held_back_herd_full"):
+        print(f"  !! [identity] max_cows = {cfg['identity'].get('max_cows')}: the gallery was full, "
+              f"{res['held_back_herd_full']} more cows got no id - set it to the cows these cameras see (0: no "
+              "limit)")
     print(f"-> {os.path.join(out, 'trial.json')}; the videos: " + ", ".join(shown.values()))
 
 

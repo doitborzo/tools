@@ -34,6 +34,7 @@ apart on the floor; without that, one cow in an overlap is seen by two cameras a
 from __future__ import annotations
 
 import collections
+import itertools
 import threading
 import time
 
@@ -760,6 +761,11 @@ class TrackletLinker:
                     c, first, _ = self.life.get(g, (cam, ts, ts))
                     self.life[g] = (cam, first, ts)
                     self.members.setdefault(g, set())
+            if self.disjoint and self.apart is not None:       # cameras with no floor in common: two cows
+                apart = [(self.root(a), self.root(b)) for ca, cb in itertools.combinations(sorted(ids), 2)
+                         if frozenset((ca, cb)) in self.disjoint for a in ids[ca] for b in ids[cb]]
+                if apart:
+                    self.apart([(a, b) for a, b in apart if a != b], ts)
             pts = {cam: self._points(cam, per_cam[cam]) for cam in per_cam}
             cams = [c for c in per_cam if pts[c] is not None and pts[c]]
             for i, ca in enumerate(cams):

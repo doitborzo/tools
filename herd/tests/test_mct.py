@@ -537,6 +537,23 @@ def test_linker_leaves_disjoint_cameras_alone():
         assert (out["a"][0] == out["b"][0]) == joined, disjoint
 
 
+def test_linker_says_cows_on_disjoint_cameras_are_two():
+    """Link mode: cows seen at the same second by two cameras that share no floor are two cows - handed to
+    the gallery (cannot_link), so the night does not make one cow of them."""
+    import mct
+    got = []
+    cfg = _cfg()
+    cfg["cameras"] = [{"id": c, "mask": []} for c in ("a", "b", "c")]
+    cfg["mct"].update(disjoint=[["a", "c"]])
+    lk = mct.TrackletLinker(cfg, None, lambda pairs, ts: got.extend(pairs))
+    box = lambda x: [x - 0.03, 0.45, x + 0.03, 0.5]
+    for k in range(3):
+        out = lk.update_all(float(k), {"a": [{"box": box(0.2)}, {"box": box(0.6)}], "b": [{"box": box(0.2)}],
+                                       "c": [{"box": box(0.4)}]})
+    pairs = {frozenset(p) for p in got}
+    assert pairs == {frozenset((out["a"][0], out["c"][0])), frozenset((out["a"][1], out["c"][0]))}, pairs
+
+
 def test_late_reacquire_by_the_tracks_own_fingerprint():
     """Two cows hidden 15 s (past reacquire_s), back near where they were: one frame is too noisy to
     take them back, a few seconds of each are not - the new tracks continue the old ones; a third cow
@@ -667,3 +684,24 @@ def test_recordings_played_together():
     assert not any(t.is_alive() for t in th)
     assert pos == {"fast": 1199.5, "slow": 1099.5, "late": 1199.5}
     assert spread and max(spread) <= 1.5, max(spread)
+
+
+def test_trial_counts_what_cannot_be():
+    """One id on two tracks of one camera at the same second, or on two cameras that share no floor: counted."""
+    import trial
+    from store import Store
+    with tempfile.TemporaryDirectory() as d:
+        s = Store(os.path.join(d, "s.sqlite"))
+        rows = []
+        for t in range(10):
+            rows += [("cam1", "t1", 100.0 + t, 0.1, 0.1, 0.2, 0.2, "lying", "none", 0.9),
+                     ("cam1", "t2", 100.0 + t, 0.5, 0.1, 0.6, 0.2, "lying", "none", 0.9),
+                     ("cam3", "t3", 100.0 + t, 0.5, 0.1, 0.6, 0.2, "lying", "none", 0.9)]
+        s.seconds(rows)
+        tm = {"t1": "A", "t2": "A", "t3": "B"}                       # t1, t2: one camera, one second, one id
+        cfg = _cfg()
+        cfg["mct"]["disjoint"] = [["cam1", "cam3"]]
+        odd = trial.impossible(s, tm, cfg)
+        assert odd["one_cow_twice_on_one_camera"] == 10 and odd["one_cow_on_cameras_apart"] == 0
+        odd = trial.impossible(s, {"t1": "A", "t2": "C", "t3": "A"}, cfg)   # cam1 and cam3 at once
+        assert odd["one_cow_on_cameras_apart"] == 10 and odd["cows_seen_where_they_cannot_be"] == {"A": 10}
