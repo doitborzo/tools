@@ -39,7 +39,7 @@ import time
 
 import numpy as np
 
-from common import floor_mapper, in_polygon, iou
+from common import floor_mapper, in_polygon, iou, same_place
 
 NEG = -1e9
 
@@ -131,7 +131,8 @@ class GlobalTracker:
             self.neighbours[a].add(b), self.neighbours[b].add(a)
         self.disjoint = {frozenset(p) for p in m.get("disjoint", [])}
         self.portals = list(m.get("portals", []))
-        self.keep_s = max([self.max_age, m["reacquire_s"], m["handover_s"], m.get("still_s", 0)] +
+        self.keep_s = max([self.max_age, m["reacquire_s"], m["handover_s"], m.get("still_s", 0),
+                           m.get("still_long_s", 0)] +
                           [p["max_s"] for p in self.portals] +
                           [m.get("late_window_s", 60.0) + m.get("late_s", 3.0) + 2] * (m.get("late_sim", 0) > 0))
         self.floor = {cid: floor_mapper(c, m) for cid, c in self.cams.items()}
@@ -188,7 +189,7 @@ class GlobalTracker:
 
     def _same_camera(self, cam, ts, dets, out, taken):
         m = self.m
-        hold = max(m["reacquire_s"], m.get("still_s", 0))
+        hold = max(m["reacquire_s"], m.get("still_s", 0), m.get("still_long_s", 0))
         mine = [t for t in self.tracks.values() if cam in t.cams and ts - t.cams[cam]["last"] <= hold]
         if not mine or not dets:
             return
@@ -200,8 +201,9 @@ class GlobalTracker:
                 v, c = iou(seen["box"], d["box"]), self._cos(t, d)
                 if age <= self.max_age and v >= self.min_iou:
                     S[i, j] = m["w_iou"] * v + (1 - m["w_iou"]) * (0.5 if c is None else c)
-                elif age <= m.get("still_s", 0) and v >= m.get("still_iou", 1.1):
-                    S[i, j] = m["w_iou"] * v                      # lying still: back at the same place
+                elif (age <= m.get("still_s", 0) or (age <= m.get("still_long_s", 0) and self._was_still(seen))) \
+                        and self._same_place(seen["box"], d["box"], v):
+                    S[i, j] = m["w_iou"] * max(v, 0.3)            # lying still: back at the same place
                 elif age <= m["reacquire_s"] and c is not None and c >= m["reacquire_sim"]:
                     # lost a moment (hidden, missed): near where she was and still looking like her
                     (ax, ay), (bx, by) = _centre(seen["box"]), _centre(d["box"])
@@ -212,6 +214,14 @@ class GlobalTracker:
             taken.add(mine[i].gid)
             if ts - mine[i].cams[cam]["last"] > self.max_age or iou(mine[i].cams[cam]["box"], dets[j]["box"]) < self.min_iou:
                 self.stats["reacquired"] += 1
+
+    def _same_place(self, a, b, v):
+        m = self.m
+        return v >= m.get("still_iou", 1.1) or same_place(a, b, m.get("still_iou", 1.1), m.get("still_contain", 0.0))
+
+    def _was_still(self, seen):
+        """She had not moved (still_moved box heights) for still_for_s before this camera lost her."""
+        return seen.get("still_since") is not None and seen["last"] - seen["still_since"] >= self.m.get("still_for_s", 30.0)
 
     def _pick(self, cands, dets, open_, min_sim, out, taken, cam, ts, kind, from_cam):
         """Tracks cands against the open dets by frame id alone: the best assignment, each kept only
@@ -297,7 +307,13 @@ class GlobalTracker:
                        "portal", lambda t, f=p["from"]: f)
 
     def _observe(self, t, cam, ts, d):
-        t.cams[cam] = {"box": list(d["box"]), "last": ts}
+        prev, box = t.cams.get(cam), list(d["box"])
+        anchor, since = _centre(box), ts                   # where she has stayed, since when
+        if prev is not None and prev.get("anchor") is not None:
+            moved = np.hypot(prev["anchor"][0] - anchor[0], prev["anchor"][1] - anchor[1])
+            if moved <= self.m.get("still_moved", 0.3) * max(box[3] - box[1], 1e-6):
+                anchor, since = prev["anchor"], prev["still_since"]
+        t.cams[cam] = {"box": box, "last": ts, "anchor": anchor, "still_since": since}
         t.last, t.last_cam, t.n = ts, cam, t.n + 1
         if d.get("xy") is not None:
             if t.xy is not None and t.xy_ts is not None and abs(ts - t.xy_ts) < 1.0:

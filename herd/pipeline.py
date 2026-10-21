@@ -42,40 +42,75 @@ import time
 import numpy as np
 
 from common import (ACTIVITIES, DEFAULTS, POSTURES, blank_excluded, crop, device, in_mask, in_zone, interpolate_box,
-                    iou, load_config)
+                    iou, load_config, same_place)
 from motion import motion_features
 
 
 # ------------------------------------------------------------------ tracker
 
 class Tracker:
-    """IoU tracker for 1 fps: cows move little in a second, seen from above."""
+    """IoU tracker for 1 fps: cows move little in a second, seen from above.
 
-    def __init__(self, cam, min_iou=0.3, max_age_s=5):
+    The detector loses lying cows for seconds to minutes: her box back at the same place (common.same_place)
+    within still_s is her, and within still_long_s when she had not moved for still_for_s before - one
+    that walked is not waited for that long (another cow may lie down where she was)."""
+
+    def __init__(self, cam, min_iou=0.3, max_age_s=5, still_s=0.0, still_iou=0.5, still_contain=0.8,
+                 still_for_s=30.0, still_moved=0.3, still_long_s=0.0):
         self.cam, self.min_iou, self.max_age = cam, min_iou, max_age_s
-        self.tracks = {}            # id -> {"box", "last"}
+        self.still_s, self.still_iou, self.still_contain = still_s, still_iou, still_contain
+        self.still_long = still_long_s
+        self.still_for, self.still_moved = still_for_s, still_moved
+        self.tracks = {}            # id -> {"box", "last", "anchor", "since"}
         self.history = collections.defaultdict(lambda: collections.deque(maxlen=120))
-        self.n = 0
+        self.n, self.prev = 0, None
+
+    def _held(self, t, ts):
+        """Still waited for at ts, lost at the same place."""
+        age = ts - t["last"]
+        return age <= self.still_s or (age <= self.still_long and t["last"] - t["since"] >= self.still_for)
+
+    def _seen(self, tid, ts, box):
+        prev = self.tracks.get(tid)
+        anchor, since = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2), ts
+        if prev is not None and math.hypot(prev["anchor"][0] - anchor[0], prev["anchor"][1] - anchor[1]) \
+                <= self.still_moved * max(box[3] - box[1], 1e-6):
+            anchor, since = prev["anchor"], prev["since"]
+        self.tracks[tid] = {"box": box, "last": ts, "anchor": anchor, "since": since}
 
     def update(self, ts, boxes):
+        live = lambda t: self.prev is None or self.prev - t["last"] <= self.max_age   # alive at the last second
         pairs = sorted(((iou(t["box"], b), tid, j) for tid, t in self.tracks.items()
-                        for j, b in enumerate(boxes)), reverse=True)
+                        if live(t) for j, b in enumerate(boxes)), reverse=True)
         used_t, used_b, out = set(), set(), []
         for v, tid, j in pairs:
             if v < self.min_iou or tid in used_t or j in used_b:
                 continue
             used_t.add(tid), used_b.add(j)
-            self.tracks[tid] = {"box": boxes[j], "last": ts}
+            self._seen(tid, ts, boxes[j])
+            out.append((tid, boxes[j]))
+        # lying still, lost a while: back at the same place
+        held = sorted(((iou(t["box"], b), tid, j) for tid, t in self.tracks.items()
+                       if tid not in used_t and not live(t) and self._held(t, ts)
+                       for j, b in enumerate(boxes) if j not in used_b), reverse=True)
+        for v, tid, j in held:
+            if tid in used_t or j in used_b or not same_place(self.tracks[tid]["box"], boxes[j], self.still_iou,
+                                                               self.still_contain):
+                continue
+            used_t.add(tid), used_b.add(j)
+            self._seen(tid, ts, boxes[j])
             out.append((tid, boxes[j]))
         for j, b in enumerate(boxes):
             if j not in used_b:
                 self.n += 1
                 tid = f"{self.cam}-{int(ts)}-{self.n}"
-                self.tracks[tid] = {"box": b, "last": ts}
+                self._seen(tid, ts, b)
                 out.append((tid, b))
-        self.tracks = {k: v for k, v in self.tracks.items() if ts - v["last"] <= self.max_age}
+        self.tracks = {k: v for k, v in self.tracks.items()
+                       if ts - v["last"] <= self.max_age or self._held(v, ts)}
         for tid, b in out:
             self.history[tid].append((ts, b))
+        self.prev = ts
         return out
 
     def track_at(self, ts, box):
@@ -325,7 +360,10 @@ class Camera:
         self.buffer = collections.deque()
         self.buffer_s = self.burst_s + 3
         self.buf_lock, self.trk_lock = threading.Lock(), threading.Lock()
-        self.tracker = Tracker(self.id, cfg["tracker"]["iou"], cfg["tracker"]["max_age_s"])
+        tk = cfg["tracker"]
+        self.tracker = Tracker(self.id, tk["iou"], tk["max_age_s"], tk.get("still_s", 0.0), tk.get("still_iou", 0.5),
+                               tk.get("still_contain", 0.8), tk.get("still_for_s", 30.0), tk.get("still_moved", 0.3),
+                               tk.get("still_long_s", 0.0))
         self.next_second = start_ts
         # Cameras burst in turn, not all at once: one GPU, an even load.
         self.next_burst = start_ts + self.burst_every * index / max(1, n_cams)
@@ -663,17 +701,49 @@ def frames_from(url, start_ts=None):
     cap.release()
 
 
-def run_file(camera, url, start_ts, every_s=60.0):
-    """A recording on its own clock, as fast as it can go; where it is, every every_s of recording."""
+class Lockstep:
+    """Recordings of several cameras played together: no camera more than ahead_s ahead of the others still
+    playing, on the barn's clock. Live cameras keep together by the wall clock; files played as fast as each
+    can go drift apart by minutes - and what spans cameras (the [mct] tracker, its pruning by time, a cow on
+    two cameras at the same second, the gallery's claims) needs the same moment from all of them. A camera
+    whose recording begins later holds no one up before it begins; one that is done, none at all."""
+
+    def __init__(self, starts, ahead_s=1.0):
+        self.pos = dict(starts)                 # cam -> where it is (its start until it begins)
+        self.done, self.ahead = set(), ahead_s
+        self.cv = threading.Condition()
+
+    def wait(self, cam, ts):
+        with self.cv:
+            self.pos[cam] = ts
+            self.cv.notify_all()
+            while any(o != cam and o not in self.done and t < ts - self.ahead for o, t in self.pos.items()):
+                self.cv.wait(timeout=1.0)
+
+    def finish(self, cam):
+        with self.cv:
+            self.done.add(cam)
+            self.cv.notify_all()
+
+
+def run_file(camera, url, start_ts, every_s=60.0, lockstep=None):
+    """A recording on its own clock, as fast as it can go (with lockstep: as the slowest camera with it);
+    where it is, every every_s of recording."""
     t0, said = time.time(), start_ts
-    for ts, img in frames_from(url, start_ts):
-        camera.push(ts, img)
-        camera.step(ts)
-        if ts - said >= every_s:
-            said = ts
-            done = ts - start_ts
-            print(f"[{camera.id}] {int(done // 60)}:{int(done % 60):02d} of the recording "
-                  f"({done / max(1e-6, time.time() - t0):.1f}x real time)", flush=True)
+    try:
+        for ts, img in frames_from(url, start_ts):
+            if lockstep is not None:
+                lockstep.wait(camera.id, ts)
+            camera.push(ts, img)
+            camera.step(ts)
+            if ts - said >= every_s:
+                said = ts
+                done = ts - start_ts
+                print(f"[{camera.id}] {int(done // 60)}:{int(done % 60):02d} of the recording "
+                      f"({done / max(1e-6, time.time() - t0):.1f}x real time)", flush=True)
+    finally:
+        if lockstep is not None:
+            lockstep.finish(camera.id)
     print(f"[{camera.id}] the recording is done", flush=True)
 
 
@@ -754,9 +824,11 @@ def run(cfg, start=None, models=None, max_wall_s=None, status=None):
         print(f"[run] keeping every {cache.every_n}th burst for training in {cache.folder}", flush=True)
     stop = threading.Event()
     threads = []
+    # files: each from its own start (start_ts, when its recording began later than the others'), together
+    lock = Lockstep({c["id"]: c.get("start_ts", start_ts) for c in cfg["cameras"]}) if start is not None else None
     for cam, c in zip(cams, cfg["cameras"]):
-        # files: each from its own start (start_ts, when its recording began later than the others')
-        target = (lambda cam=cam, c=c: run_file(cam, c["url"], c.get("start_ts", start_ts))) if start is not None else \
+        target = (lambda cam=cam, c=c: run_file(cam, c["url"], c.get("start_ts", start_ts), lockstep=lock)) \
+            if start is not None else \
                  (lambda cam=cam, c=c: run_live(cam, lambda: frames_from(c["url"]), stop))
         th = threading.Thread(target=target, daemon=True)
         th.start()

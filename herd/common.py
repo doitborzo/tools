@@ -38,7 +38,10 @@ DEFAULTS = {
     "model": {"checkpoint": "", "encoder": "facebook/dinov2-small", "crop": 224, "grid": 2, "rumination": "",
               "identity": ""},
     "detector": {"weights": "", "threshold": None, "tiles": None},   # None: as the detector was trained
-    "tracker": {"iou": 0.3, "max_age_s": 5},
+    # still_*: a cow lost is waited for still_s at the same place, still_long_s when she had not moved for
+    # still_for_s before (as [mct])
+    "tracker": {"iou": 0.3, "max_age_s": 5, "still_s": 60.0, "still_long_s": 300.0, "still_iou": 0.5,
+                "still_contain": 0.8, "still_for_s": 30.0, "still_moved": 0.3},
     "identity": {"prototypes_per_cow": 6, "history_days": 7, "max_error": 0.01,
                  "new_cow_similarity": 0.55, "new_cow_min_bursts": 20, "retire_after_hours": 48,
                  # the herd's size (0: no limit): at it, no new ids are made - unknown bursts wait in the pool
@@ -78,8 +81,13 @@ DEFAULTS = {
             # MmCows, twice: the same IDF1 with it, purity a point lower
             "late_sim": 0.0, "late_margin": 0.03, "late_n": 3, "late_s": 3.0, "late_window_s": 60.0,
             "late_dist": 0.3,
-            # a cow lying or standing still: her box back at the same place within still_s is her
-            "still_s": 60.0, "still_iou": 0.5,
+            # a cow lying or standing still: her box back at the same place within still_s is her (the same
+            # place: boxes overlapping still_iou, or one still_contain inside the other - a cow half hidden
+            # by her neighbour); one that had not moved for still_for_s before she was lost is waited for
+            # still_long_s (the detector loses lying cows for minutes: barn, 4 cameras, 8 min - tracks 108
+            # -> 31 on one camera); one that walked is not (another cow may lie down where she was)
+            "still_s": 60.0, "still_iou": 0.5, "still_contain": 0.8, "still_long_s": 300.0, "still_for_s": 30.0,
+            "still_moved": 0.3,
             "handover_s": 2.5, "handover_min_sim": 0.5, "handover_margin": 0.05, "portal_extra_sim": 0.08,
             # with calibrated cameras (proj_mat or floor_points): a cow is passed on by where she
             # stands - within handover_dist of a cow another camera sees, the next one at least
@@ -138,6 +146,21 @@ def iou(a, b):
     inter = iw * ih
     union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
     return inter / union if union > 0 else 0.0
+
+
+def same_place(a, b, min_iou=0.5, contain=0.8):
+    """Box b where box a was: overlapping min_iou, or the smaller one contain inside the other with the
+    centres within half a box height (a cow half hidden by her neighbour)."""
+    import numpy as np
+    if iou(a, b) >= min_iou:
+        return True
+    if not contain:
+        return False
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    small = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    d = np.hypot((a[0] + a[2] - b[0] - b[2]) / 2, (a[1] + a[3] - b[1] - b[3]) / 2)
+    return small > 0 and ix * iy / small >= contain and d <= 0.5 * max(a[3] - a[1], b[3] - b[1])
 
 
 def in_polygon(x, y, poly):

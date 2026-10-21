@@ -1,5 +1,6 @@
 """Who-was-where-when in identification: cows seen at the same moment are different cows."""
 import _paths  # noqa: F401
+import collections
 import copy
 import json
 import os
@@ -588,3 +589,81 @@ def test_mct_eval_uses_the_identity_models_thresholds():
         np.savez(os.path.join(d, "emb", "cam_1.npz"), ts=np.zeros(0), stamp=json.dumps({"thresholds": cal}))
         assert mct_eval.load_thresholds(d, ["cam_1"]) == cal
         assert mct_eval.load_thresholds(d, ["cam_9"]) == {}
+
+
+def _lost_and_back(update):
+    """One camera, three cows; the detector's gaps as in the barn. -> {name: [track per second seen]}."""
+    lying, walker, hidden = _box(0.2), _box(0.5), _box(0.8)
+    seen = collections.defaultdict(list)
+    for t in range(400):
+        boxes = {}
+        if t < 60 or t >= 180:                       # lying still, then not detected for 2 minutes
+            boxes["lying"] = lying
+        if t < 50:                                   # walks off at 40 s: gone by 50 s
+            boxes["walker"] = _box(0.5 + 0.01 * max(0, t - 40))
+        if t >= 250:                                 # another cow lies down where the walker was
+            boxes["newcomer"] = walker
+        if t < 100 or t >= 120:                      # half hidden by her neighbour 20 s: a smaller box inside
+            boxes["hidden"] = hidden if t < 100 or t >= 140 else [hidden[0] + 0.05, hidden[1] + 0.06, hidden[2] - 0.02,
+                                                                   hidden[3]]
+        names = list(boxes)
+        for n, tid in zip(names, update(float(t), [boxes[n] for n in names])):
+            seen[n].append(tid)
+    return seen
+
+
+def test_lying_cow_lost_minutes_kept_walker_not():
+    """The detector loses a lying cow for 2 minutes: the same track when she is back; a cow that walked
+    off is not waited for long - another lying down there later is a new track; a half hidden cow (her
+    box smaller, inside) keeps hers. Both trackers: the camera's own and [mct]'s."""
+    import mct
+    import pipeline
+    tk = DEFAULTS["tracker"]
+    simple = pipeline.Tracker("cam1", tk["iou"], tk["max_age_s"], tk["still_s"], tk["still_iou"], tk["still_contain"],
+                              tk["still_for_s"], tk["still_moved"], tk["still_long_s"])
+    gt = mct.GlobalTracker(_mct_cfg([("cam1", {})]))
+    def by_box(ts, bs):                                  # the camera's tracker answers in its own order
+        got = {tuple(b): tid for tid, b in simple.update(ts, bs)}
+        return [got[tuple(b)] for b in bs]
+    for name, update in (("simple", by_box),
+                         ("mct", lambda ts, bs: gt.update("cam1", ts, [{"box": b, "emb": None} for b in bs]))):
+        seen = _lost_and_back(update)
+        assert len(set(seen["lying"])) == 1, (name, set(seen["lying"]))
+        assert len(set(seen["hidden"])) == 1, (name, set(seen["hidden"]))
+        assert not set(seen["newcomer"]) & set(seen["walker"]), name
+
+
+def test_recordings_played_together():
+    """Three recordings played in threads at their own speeds: none gets more than a second (and a frame)
+    ahead of another still playing; one beginning later holds no one up before it begins; one done, none."""
+    import threading
+    import time as time_
+    import pipeline
+    starts = {"fast": 1000.0, "slow": 1000.0, "late": 1060.0}
+    ends = {"fast": 1200.0, "slow": 1100.0, "late": 1200.0}
+    lock = pipeline.Lockstep(starts)
+    pos, spread = {}, []
+    guard = threading.Lock()
+
+    def play(cam, pause):
+        try:
+            ts = starts[cam]
+            while ts < ends[cam]:
+                lock.wait(cam, ts)
+                with guard:
+                    pos[cam] = ts
+                    live = [t for c, t in pos.items() if c not in lock.done]
+                    if len(pos) == 3 and min(live) >= starts["late"] + 1:   # all three playing
+                        spread.append(max(live) - min(live))
+                time_.sleep(pause)
+                ts += 0.5
+        finally:
+            lock.finish(cam)
+    th = [threading.Thread(target=play, args=(c, p)) for c, p in (("fast", 0.0), ("slow", 0.002), ("late", 0.0))]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join(timeout=60)
+    assert not any(t.is_alive() for t in th)
+    assert pos == {"fast": 1199.5, "slow": 1099.5, "late": 1199.5}
+    assert spread and max(spread) <= 1.5, max(spread)
