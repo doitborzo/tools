@@ -185,3 +185,33 @@ def test_recordings_looked_at_whole_despite_the_masks():
         n = live.calls
         autocalib.main(["--config", cfg, "--videos", rec, "--out", out], live=live)
         assert live.calls == n                                              # the boxes read back
+
+
+def test_a_full_pen_of_lying_cows_is_no_calibration():
+    """Two pens full of lying cows whose boxes all twitch together on both cameras (the picture's exposure
+    changing, a person walking past): no cow moved, so no floor is claimed - and a dense pen, where any
+    point is near some cow, does not pass the check by chance."""
+    import autocalib
+    from store import Store
+    with tempfile.TemporaryDirectory() as d:
+        s = Store(os.path.join(d, "s.sqlite"))
+        rng = np.random.default_rng(3)
+        twitch = rng.normal(0, 1, 500) * (rng.random(500) < 0.15)     # the same seconds on both cameras
+        rows = []
+        for cam in ("cam1", "cam2"):
+            for i in range(22):
+                p = rng.uniform(0.1, 0.9, 2)
+                for t in range(500):
+                    j = rng.normal(0, 0.002, 2) + 0.01 * twitch[t] * rng.normal(1, 0.3, 2)
+                    rows.append((cam, f"{cam}-{i}", 1000.0 + t, p[0] - 0.06 + j[0], p[1] - 0.1 + j[1],
+                                 p[0] + 0.06 + j[0], p[1] + j[1], "lying", "none", 0.9))
+        s.seconds(rows)
+        _, mv = autocalib.moving_pairs(autocalib.load_tracks(s, "cam1"), autocalib.load_tracks(s, "cam2"), 90)
+        assert len(mv) < 4, len(mv)                                    # the twitch is not a cow moving
+        cfg = os.path.join(d, "barn.toml")
+        open(cfg, "w").write(CONFIG)
+        try:
+            autocalib.main(["--config", cfg, "--store", os.path.join(d, "s.sqlite"), "--out", os.path.join(d, "c")])
+            raise AssertionError("calibrated two pens of lying cows")
+        except SystemExit as e:
+            assert "no camera pair" in str(e)

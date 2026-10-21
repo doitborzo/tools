@@ -43,6 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import blank_excluded, homography, in_zone, load_config, recordings, undistort  # noqa: E402
 
 K_GRID = (0.0, -0.1, -0.2, -0.3)
+MIN_COWS = 4                 # moving cows that agree on the floor mapping, at least
 
 
 # ------------------------------------------------------------------ data
@@ -174,16 +175,44 @@ def corr_at(a, b, lag, min_overlap):
     return float(np.corrcoef(x, y)[0, 1])
 
 
-def moving_pairs(TA, TB, max_lag, min_overlap=20, min_corr=0.5):
-    """Tracks of camera A and B that move together -> (lag of B behind A in s, [(track A, track B, corr)])."""
+def _motions(T, t0, n, min_overlap):
+    """Each track's motion over t0..t0+n, less what all the camera's cows 'did' together that second (the
+    picture's own jitter - exposure, compression - moves every box at once, cow or not)."""
+    M = {k: motion(v, t0, n) for k, v in T.items() if len(v) >= min_overlap}
+    if len(M) >= 4:
+        with np.errstate(all="ignore"):
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                common = np.nanmedian(np.array(list(M.values())), axis=0)
+        common = np.where(np.isnan(common), 0.0, common)
+        M = {k: m - common for k, m in M.items()}
+    return {k: m for k, m in M.items() if np.nanstd(m) > 0.02}
+
+
+OFF_LAGS = tuple(d for d in range(-60, 61, 4) if abs(d) >= 12)
+
+
+def standout(a, b, lag, min_overlap):
+    """How far a[t], b[t + lag] move together above what they do at other lags (12-60 s off): a cow that
+    gets up on both cameras at once stands out; two boxes that only jitter do not. -> (corr, margin)."""
+    c = max((x for d in (-1, 0, 1) if (x := corr_at(a, b, lag + d, min_overlap)) is not None), default=None)
+    if c is None:
+        return None, 0.0
+    off = [x for d in OFF_LAGS if (x := corr_at(a, b, lag + d, min_overlap)) is not None]
+    return c, c - (max(off) if len(off) >= 5 else 1.0)
+
+
+def moving_pairs(TA, TB, max_lag, min_overlap=20, min_corr=0.5, min_margin=0.3):
+    """Tracks of camera A and B that move together -> (lag of B behind A in s, [(track A, track B, corr)]).
+
+    A pair counts when the two move together clearly better at that lag than at other lags, and each
+    track has one partner at most (the one it moves with best)."""
     secs = [s for T in (TA, TB) for tr in T.values() for s in tr]
     if not secs:
         return 0, []
     t0, n = min(secs), max(secs) - min(secs) + 1
-    MA = {k: motion(v, t0, n) for k, v in TA.items() if len(v) >= min_overlap}
-    MB = {k: motion(v, t0, n) for k, v in TB.items() if len(v) >= min_overlap}
-    MA = {k: m for k, m in MA.items() if np.nanstd(m) > 0.02}
-    MB = {k: m for k, m in MB.items() if np.nanstd(m) > 0.02}
+    MA, MB = _motions(TA, t0, n, min_overlap), _motions(TB, t0, n, min_overlap)
     # the clocks' lag: voted by the tracks that move most (every lag tried on them only)
     top = lambda M: dict(sorted(M.items(), key=lambda kv: -np.nanstd(kv[1]) * np.sum(~np.isnan(kv[1])))[:15])
     votes = collections.Counter()
@@ -191,16 +220,22 @@ def moving_pairs(TA, TB, max_lag, min_overlap=20, min_corr=0.5):
         cs = [(c, lag) for lag in range(-max_lag, max_lag + 1) if (c := corr_at(a, b, lag, min_overlap)) is not None]
         if cs and max(cs)[0] >= min_corr:
             c, lag = max(cs)
-            votes[lag] += c
+            if standout(a, b, lag, min_overlap)[1] >= min_margin:
+                votes[lag] += c
     if not votes:
         return 0, []
     lag = max(votes, key=lambda x: (votes[x], -abs(x)))
-    pairs = []                                       # every pair at that lag (a second either way)
+    cand = []                                        # every pair at that lag (a second either way)
     for (ka, a), (kb, b) in itertools.product(MA.items(), MB.items()):
-        cs = [c for d in (-1, 0, 1) if (c := corr_at(a, b, lag + d, min_overlap)) is not None]
-        if cs and max(cs) >= min_corr:
-            pairs.append((ka, kb, max(cs)))
-    return lag, sorted(pairs, key=lambda p: -p[2])
+        c, margin = standout(a, b, lag, min_overlap)
+        if c is not None and c >= min_corr and margin >= min_margin:
+            cand.append((ka, kb, c))
+    pairs, used = [], set()
+    for ka, kb, c in sorted(cand, key=lambda p: -p[2]):
+        if ("a", ka) not in used and ("b", kb) not in used:
+            used |= {("a", ka), ("b", kb)}
+            pairs.append((ka, kb, c))
+    return lag, pairs
 
 
 # ------------------------------------------------------------------ the floor mapping
@@ -277,7 +312,11 @@ def refit(corr, H, inl, rel_thr=0.6):
 
 def agreement(TA, TB, H, lag, kA, kB, arA, arB, rel_thr=0.6):
     """Every second both cameras saw cows: B's cows mapped into A's picture that land inside it - the share
-    that lands on one of A's cows (within rel_thr of her height). -> (share, how many)."""
+    that lands on one of A's cows (within rel_thr of her height), each of A's cows taken once.
+
+    In a full pen almost any point is near some cow, so the same is counted with the mapped points
+    moved 3 cow heights aside (4 ways): what a mapping that knows nothing scores. -> (share, how many,
+    that chance share)."""
     byA, byB = collections.defaultdict(list), collections.defaultdict(list)
     for tr in TA.values():
         for s, p in tr.items():
@@ -286,6 +325,7 @@ def agreement(TA, TB, H, lag, kA, kB, arA, arB, rel_thr=0.6):
         for s, p in tr.items():
             byB[s - lag].append(p)
     hit = n = 0
+    chance = np.zeros(4)
     for s, pb in byB.items():
         pa = byA.get(s)
         if not pa:
@@ -294,11 +334,25 @@ def agreement(TA, TB, H, lag, kA, kB, arA, arB, rel_thr=0.6):
         qa = np.c_[undistort(a[:, 0], a[:, 1], kA, arA)]
         qb = apply_h(H, np.c_[undistort(b[:, 0], b[:, 1], kB, arB)])
         inside = (qb[:, 0] > 0.02) & (qb[:, 0] < 0.98) & (qb[:, 1] > 0.02) & (qb[:, 1] < 0.98)
-        for q in qb[inside]:
-            d = np.hypot(*(qa - q).T) / a[:, 2]
-            hit += d.min() < rel_thr
-            n += 1
-    return (hit / n if n else 0.0), n
+        qb = qb[inside]
+        if not len(qb):
+            continue
+        step = 3 * float(np.median(a[:, 2]))
+        for k, off in enumerate([(0, 0), (step, 0), (-step, 0), (0, step), (0, -step)]):
+            d = np.hypot(*(qa[None, :, :] - (qb + off)[:, None, :]).transpose(2, 0, 1)) / a[None, :, 2]
+            got = 0
+            for _ in range(min(d.shape)):                             # one of A's cows for one of B's
+                i, j = np.unravel_index(np.argmin(d), d.shape)
+                if d[i, j] >= rel_thr:
+                    break
+                got += 1
+                d[i, :], d[:, j] = np.inf, np.inf
+            if k == 0:
+                hit += got
+            else:
+                chance[k - 1] += got
+        n += len(qb)
+    return (hit / n if n else 0.0), n, (float(chance.mean()) / n if n else 0.0)
 
 
 def straighten(TA, kA, arA, width_cm=150.0):
@@ -479,22 +533,23 @@ def main(argv=None, live=None):
         # the pairs that agree, found once with straight lenses; each lens pair of the grid then fitted on them
         H0, inl0, _ = fit_pair(T[a], T[b], mv, lag, 0.0, 0.0, aspect[a], aspect[b], rng, rel_thr=0.9)
         agree = [mv[i] for i in inl0] if H0 is not None else []
-        for kA, kB in itertools.product(K_GRID, K_GRID) if len(agree) >= 3 else []:
+        for kA, kB in itertools.product(K_GRID, K_GRID) if len(agree) >= MIN_COWS else []:
             corr = pair_points(T[a], T[b], agree, lag, kA, kB, aspect[a], aspect[b])
             H, inl, _ = refit(corr, homography(np.concatenate([c[0] for c in corr]),
                                                np.concatenate([c[1] for c in corr])), list(range(len(corr))))
-            share, n = agreement(T[a], T[b], H, lag, kA, kB, aspect[a], aspect[b])
-            if best is None or (share, len(inl)) > (best["share"], best["inliers"]):
-                best = {"H": H, "inliers": len(inl), "share": share, "checked": n, "kA": kA, "kB": kB, "lag": lag,
-                        "moving": agree}
-        if best is None or best["inliers"] < 3 or best["share"] < 0.35:
-            why = "too few cows moving in both" if best is None else \
-                f"best: {best['inliers']} cows, {best['share']:.0%} of the other's cows land on one"
+            share, n, chance = agreement(T[a], T[b], H, lag, kA, kB, aspect[a], aspect[b])
+            if best is None or (share - chance, len(inl)) > (best["share"] - best["chance"], best["inliers"]):
+                best = {"H": H, "inliers": len(inl), "share": share, "chance": chance, "checked": n, "kA": kA,
+                        "kB": kB, "lag": lag, "moving": agree}
+        if best is None or best["inliers"] < MIN_COWS or best["share"] < 0.35 or best["share"] - best["chance"] < 0.2:
+            why = f"{len(mv)} cows moving in both, {MIN_COWS} needed" if best is None else \
+                f"best: {best['inliers']} cows, {best['share']:.0%} of the other's cows land on one - " \
+                f"{best['chance']:.0%} would by chance alone"
             print(f"[calib] {a}-{b}: no shared floor found ({why})", flush=True)
             continue
         print(f"[calib] {a}-{b}: shared floor - {best['inliers']} moving cows agree; {best['share']:.0%} of {b}'s "
-              f"{best['checked']} cow-seconds over {a}'s picture land on one of {a}'s cows; lens {a} k={best['kA']}, "
-              f"{b} k={best['kB']}", flush=True)
+              f"{best['checked']} cow-seconds over {a}'s picture land on one of {a}'s cows ({best['chance']:.0%} "
+              f"would by chance); lens {a} k={best['kA']}, {b} k={best['kB']}", flush=True)
         found[(a, b)] = best
     if not found:
         sys.exit("[calib] no camera pair with shared floor - nothing written. A longer recording (an hour or more, "

@@ -292,14 +292,17 @@ docker compose run --rm herd autocalib --config /data/barn.toml --videos /data/r
 The log says, per camera pair:
 
 - how many moving cows agree;
-- what share of the other camera's cows lands on one of this camera's cows (above ~60% is good);
+- what share of the other camera's cows lands on one of this camera's cows (above ~60% is good), and
+  what share would by chance alone (in a full pen any point is near some cow): the first has to be
+  well above the second;
 - "no shared floor" for cameras that share none.
 
 Look at `docker/data/calib/cam1_cam2.jpg`: the other camera's cows (red crosses) should sit on this
 camera's cows (green circles). Then run `trial` again: a cow in the overlap should now have one id on
 both cameras. The boxes are kept in `docker/data/calib/boxes_<cam>.json`: a second run on the same
 recordings skips the detector. If no pair is found, too few cows moved through the overlap: record
-an hour or more (the feeding time is best) and run `autocalib` on that.
+an hour or more (the feeding time is best) and run `autocalib` on that. A few minutes of cows lying
+is not enough: their boxes only twitch, and a twitch is no evidence of where a cow stands.
 
 ## 7. The barn, live
 
