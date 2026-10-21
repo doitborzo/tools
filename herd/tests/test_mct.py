@@ -772,3 +772,27 @@ def test_trial_score_finds_frames_cut_with_another_time_zone():
         sc = trial.score(st, cfg, boxes, labels)
         assert sc["clock_shift_s"] == 3600 and sc["all"]["frames"] == 8 and sc["all"]["idf1"] == 1.0, sc["all"]
         assert trial.score(st, cfg, boxes, labels, cameras=["cam2"])["all"]["frames"] == 0     # cam1 left out
+
+
+def test_tracks_counted_by_two_cameras_at_once_are_two_cows():
+    """Masks share no floor: a cow is counted by one camera at a time. Two tracks counted by cam1 and cam2 at
+    the same second for counted_apart_s seconds are two cows; a moment on the line between masks is not;
+    one track (joined across the cameras) is never apart from itself. Kept in the store by save()."""
+    import pipeline
+    from store import Store
+    with tempfile.TemporaryDirectory() as d:
+        st = Store(os.path.join(d, "s.sqlite"))
+        cfg = _cfg(counted_apart_s=10)
+        g = pipeline.SharedGallery(type("G", (), {"save": lambda self: None, "migration_due": lambda self, ts: False})(),
+                                   st, cfg, 0.0)
+        g.next_nightly = 1e12
+        for t in range(12):
+            g.counted("cam1", 100.0 + t, ["a", "joined"])
+            g.counted("cam2", 100.0 + t, ["b", "joined"])
+        for t in range(3):                                    # a moment only
+            g.counted("cam1", 200.0 + t, ["c"])
+            g.counted("cam2", 200.0 + t, ["e"])
+        assert g.apart("a", "b") and g.apart("a", "joined") and not g.apart("joined", "joined")
+        assert not g.apart("c", "e")
+        g.save()
+        assert ("a", "b") in set(st.cannot_link_pairs())

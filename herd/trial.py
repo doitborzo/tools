@@ -89,17 +89,19 @@ def impossible(store, tm, cfg):
         if cow:
             at[int(ts)][cow].add((cam, track))
             named += 1
-    twice, apart, per_cow = 0, 0, collections.Counter()
+    twice, apart, counted2, per_cow = 0, 0, 0, collections.Counter()
     for cows in at.values():
         for cow, seen in cows.items():
             cams = collections.Counter(c for c, _ in seen)
             bad = sum(n - 1 for n in cams.values())
             far = sum(1 for a, b in itertools.combinations(sorted(cams), 2) if frozenset((a, b)) in disjoint)
-            twice, apart = twice + bad, apart + far
-            if bad or far:
+            both = len(cams) - 1 - far if len(cams) > 1 else 0     # cameras sharing floor: masks share none
+            twice, apart, counted2 = twice + bad, apart + far, counted2 + max(0, both)
+            if bad or far or both > 0:
                 per_cow[cow] += 1
     return {"named_cow_seconds": named, "one_cow_twice_on_one_camera": twice,
-            "one_cow_on_cameras_apart": apart, "cows_seen_where_they_cannot_be": dict(per_cow.most_common())}
+            "one_cow_on_cameras_apart": apart, "one_cow_counted_by_two_cameras": counted2,
+            "cows_seen_where_they_cannot_be": dict(per_cow.most_common())}
 
 
 def idf1(co, n_true, n_pred):
@@ -470,10 +472,11 @@ def main(argv=None):
               f"cow ({r['cows']} cows); bursts confirmed {b.get('confirmed', 0)}, tentative {b.get('tentative', 0)}, "
               f"unknown {b.get('unknown', 0)}")
     n = max(1, odd["named_cow_seconds"])
+    bad = odd["one_cow_twice_on_one_camera"] + odd["one_cow_on_cameras_apart"] + odd["one_cow_counted_by_two_cameras"]
     print(f"  what cannot be: one cow twice on one camera at once {odd['one_cow_twice_on_one_camera']} s, on two "
-          f"cameras that share no floor at once {odd['one_cow_on_cameras_apart']} s "
-          f"({(odd['one_cow_twice_on_one_camera'] + odd['one_cow_on_cameras_apart']) / n:.1%} of the named "
-          f"cow-seconds) - two cows given one id; {len(odd['cows_seen_where_they_cannot_be'])} cows so")
+          f"cameras that share no floor at once {odd['one_cow_on_cameras_apart']} s, counted by two cameras at once "
+          f"{odd['one_cow_counted_by_two_cameras']} s ({bad / n:.1%} of the named cow-seconds) - two cows given one "
+          f"id (or masks that overlap); {len(odd['cows_seen_where_they_cannot_be'])} cows so")
     if res.get("held_back_herd_full"):
         print(f"  !! [identity] max_cows = {cfg['identity'].get('max_cows')}: the gallery was full, "
               f"{res['held_back_herd_full']} more cows got no id - set it to the cows these cameras see (0: no "

@@ -440,6 +440,8 @@ class Camera:
             tracked = self.tracker.update(ts, boxes)
         if len(tracked) > 1 and hasattr(self.gallery, "together"):
             self.gallery.together([tid for tid, _ in tracked], ts, [b for _, b in tracked])   # two cows, with evidence
+        if tracked and hasattr(self.gallery, "counted"):
+            self.gallery.counted(self.id, ts, [tid for tid, _ in tracked])                # in its zone: counted here
         if tracked:
             size = self.models.crop_size
             feats = self.models.encode(crops_of([(img, b) for _, b in tracked], size, self.models.margin),
@@ -473,6 +475,8 @@ class Camera:
             owned_n = len(rows)
             if rows:
                 self.store.seconds(rows)
+                if hasattr(self.gallery, "counted"):
+                    self.gallery.counted(self.id, ts, [r[1] for r in rows])
         self.stats["seconds"] += 1
         self.stats["cow_seconds"] += owned_n
         self.stats["cow_seconds_tracked_not_owned"] += len(boxes) - owned_n
@@ -584,6 +588,7 @@ class SharedGallery:
         from mct import CoSeen
         self.co_seen = CoSeen(cfg["identity"].get("cannot_link_min_s", 5), cfg["identity"].get("cannot_link_max_iou", 0.3))
         self.claims = {}                         # cow -> (track, ts, p or sim)
+        self._counted, self._counted_n, self._counted_pruned = {}, {}, start_ts   # counted(): second -> cam -> tracks
 
     def _next_hour(self, ts, hour):
         tz = dt.timezone(dt.timedelta(hours=self.cfg["farm"]["timezone_offset_hours"]))
@@ -609,6 +614,40 @@ class SharedGallery:
             if self._pending_links and (len(self._pending_links) >= 500 or ts - self._last_flush >= 60):
                 self.store.add_cannot_link(self._pending_links, ts)
                 self._pending_links, self._last_flush = [], ts
+
+    def counted(self, cam, ts, tracks):
+        """The tracks a camera counts this second (in its mask). The masks share no floor - each patch of it is
+        one camera's - so a cow is counted by one camera at a time: two tracks counted by two cameras at the
+        same second for counted_apart_s seconds are two cows (cannot_link), the night never makes one of them.
+        (Seconds, not one: a cow on the line between two masks may be counted by both a moment.)"""
+        need = self.cfg["identity"].get("counted_apart_s", 10)
+        if not need or not tracks:
+            return
+        sec = int(ts)
+        with self.lock:
+            at = self._counted.setdefault(sec, {})
+            at[cam] = set(tracks)
+            new = []
+            for other, theirs in at.items():
+                if other == cam:
+                    continue
+                for a in tracks:
+                    for b in theirs:
+                        if a == b:
+                            continue
+                        k = (min(a, b), max(a, b))
+                        n, _ = self._counted_n.get(k, (0, ts))
+                        self._counted_n[k] = (n + 1, ts)
+                        if n + 1 >= need and k not in self.cannot_link:
+                            new.append(k)
+            for k in new:
+                self.cannot_link.add(k)
+                self._pending_links.append(k)
+            for old in [s_ for s_ in self._counted if s_ < sec - 5]:
+                del self._counted[old]
+            if ts - self._counted_pruned > 600:              # pairs not seen together for an hour: forgotten
+                self._counted_n = {k: v for k, v in self._counted_n.items() if ts - v[1] <= 3600}
+                self._counted_pruned = ts
 
     def separate(self, pairs, ts):
         """Pairs of tracks seen at the same moment (cameras with no floor in common): two cows each."""
@@ -666,6 +705,9 @@ class SharedGallery:
 
     def save(self):
         with self.lock:
+            if self._pending_links:                      # the last minute's two-cows, before the night reads them
+                self.store.add_cannot_link(self._pending_links, self._last_flush)
+                self._pending_links = []
             self.g.save()
 
 

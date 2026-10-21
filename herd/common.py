@@ -53,7 +53,10 @@ DEFAULTS = {
                  "claim_s": 120.0, "claim_steal_margin": 0.08,
                  # two tracks of one camera are two cows once seen together this many seconds with
                  # boxes overlapping less than cannot_link_max_iou (mct.CoSeen)
-                 "cannot_link_min_s": 5, "cannot_link_max_iou": 0.3},
+                 "cannot_link_min_s": 5, "cannot_link_max_iou": 0.3,
+                 # tracks two cameras count (their masks, which share no floor) at the same second this many
+                 # seconds: two cows (0: off - when masks were drawn overlapping)
+                 "counted_apart_s": 10},
     "lameness": {"enabled": False},
     "alerts": {"baseline_days": 7, "min_baseline_days": 3, "min_observed_minutes": 120,
                "mad_z": 3.0, "rumination_drop": 0.20, "lying_directions": ["low", "high"],
