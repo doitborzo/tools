@@ -20,6 +20,7 @@ not do when the masks cut the shared floor away from one camera) - the boxes of 
 
   -> OUT/calib.json, OUT/<a>_<b>.jpg (the other camera's cows drawn onto this one's picture: they should
      sit on its cows), and with --apply the cameras' floor_points / distortion and [mct] link in barn.toml.
+     OUT/<a>_<b>_moving.jpg, found or not: both pictures, the paths of the cows that walked, the pairs.
 
     python herd/herd.py autocalib --config barn.toml --videos rec --out calib
     python herd/herd.py autocalib ... --pairs cam1:cam2 cam2:cam3 --apply
@@ -390,6 +391,69 @@ def grid_points(region, n=3):
     return [(u, v) for u in np.linspace(u0, u1, n) for v in np.linspace(v0, v1, n)]
 
 
+def frame_at(videos, cam, s):
+    """The camera's picture (BGR) at second s, from the recording that holds it."""
+    import cv2
+    if not videos.get(cam):
+        return None
+    vpath, start = max((v for v in videos[cam] if v[1] <= s), key=lambda v: v[1], default=videos[cam][0])
+    cap = cv2.VideoCapture(vpath)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(max(0, s - start) * (fps if 1.0 <= fps <= 120.0 else 25.0)))
+    ok, img = cap.read()
+    cap.release()
+    return img if ok else None
+
+
+def walked(tr):
+    """How far a track got from where it mostly was, in its own box heights (a lying cow: ~0)."""
+    p = np.array(list(tr.values()))
+    mid = np.median(p[:, :2], 0)
+    return float(np.max(np.hypot(*(p[:, :2] - mid).T)) / np.median(p[:, 2]))
+
+
+def draw_moving(path, videos, cam_a, cam_b, TA, TB, mv):
+    """What calibration has to go on, drawn whatever came of it: both cameras side by side, the path of
+    every cow that walked (orange; the rest a grey dot where she lay or stood), the pairs found moving
+    together numbered alike on both."""
+    import cv2
+    pics = []
+    for cam, T in ((cam_a, TA), (cam_b, TB)):
+        secs = sorted(s for tr in T.values() for s in tr)
+        img = frame_at(videos, cam, secs[len(secs) // 2]) if secs else None
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        img = cv2.resize(img, (int(w * 720 / h), 720))
+        h, w = img.shape[:2]
+        n = 0
+        for tr in T.values():
+            p = np.array(list(tr.values()))
+            if walked(tr) > 1.0 and len(p) >= 10:
+                n += 1
+                cv2.polylines(img, [np.int32(p[:, :2] * [w, h])], False, (0, 140, 255), 2)
+            else:
+                x, y = np.median(p[:, :2], 0)
+                cv2.circle(img, (int(x * w), int(y * h)), 4, (170, 170, 170), -1)
+        side = 0 if cam == cam_a else 1
+        for i, pr in enumerate(mv):
+            tr = T[pr[side]]
+            x, y = np.median(np.array(list(tr.values()))[:, :2], 0)
+            cv2.circle(img, (int(x * w), int(y * h)), 16, (40, 40, 230), 3)
+            cv2.putText(img, str(i + 1), (int(x * w) + 18, int(y * h) - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                        (40, 40, 230), 3)
+        cv2.rectangle(img, (0, 0), (w, 50), (0, 0, 0), -1)
+        cv2.putText(img, f"{cam}: {n} of {len(T)} tracks walked (orange)", (12, 34), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9, (255, 255, 255), 2)
+        pics.append(img)
+    img = np.hstack(pics)
+    cv2.rectangle(img, (0, img.shape[0] - 50), (img.shape[1], img.shape[0]), (0, 0, 0), -1)
+    cv2.putText(img, f"moving together on both (red, numbered alike): {len(mv)} - {MIN_COWS} or more needed",
+                (12, img.shape[0] - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    cv2.imwrite(path, img)
+    return path
+
+
 def draw(path, videos, cam_a, cam_b, TA, TB, H, lag, kA, kB, arA, arB):
     """B's cows of one second drawn onto A's picture of that second (red), A's own (green)."""
     import cv2
@@ -400,13 +464,8 @@ def draw(path, videos, cam_a, cam_b, TA, TB, H, lag, kA, kB, arA, arB):
     if not videos.get(cam_a):
         return None
     s = max(counts, key=counts.get)
-    vpath, start = max((v for v in videos[cam_a] if v[1] <= s), key=lambda v: v[1], default=videos[cam_a][0])
-    cap = cv2.VideoCapture(vpath)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(max(0, s - start) * fps))
-    ok, img = cap.read()
-    cap.release()
-    if not ok:
+    img = frame_at(videos, cam_a, s)
+    if img is None:
         return None
     h, w = img.shape[:2]
 
@@ -529,6 +588,9 @@ def main(argv=None, live=None):
             continue
         lag, mv = moving_pairs(T[a], T[b], args.max_lag)
         print(f"[calib] {a}-{b}: {len(mv)} tracks moving together (clock lag {lag:+d} s)", flush=True)
+        seen = draw_moving(os.path.join(args.out, f"{a}_{b}_moving.jpg"), videos, a, b, T[a], T[b], mv)
+        if seen:
+            print(f"[calib] {a}-{b}: what moved on both - {seen}", flush=True)
         best = None
         # the pairs that agree, found once with straight lenses; each lens pair of the grid then fitted on them
         H0, inl0, _ = fit_pair(T[a], T[b], mv, lag, 0.0, 0.0, aspect[a], aspect[b], rng, rel_thr=0.9)

@@ -300,7 +300,9 @@ The log says, per camera pair:
 Look at `docker/data/calib/cam1_cam2.jpg`: the other camera's cows (red crosses) should sit on this
 camera's cows (green circles). Then run `trial` again: a cow in the overlap should now have one id on
 both cameras. The boxes are kept in `docker/data/calib/boxes_<cam>.json`: a second run on the same
-recordings skips the detector. If no pair is found, too few cows moved through the overlap: record
+recordings skips the detector. `docker/data/calib/cam1_cam2_moving.jpg` is drawn whatever came of
+it: both cameras side by side, the paths of the cows that walked (orange), the pairs found (red,
+numbered alike) - it shows whether the recording had enough cows walking. If no pair is found, too few cows moved through the overlap: record
 an hour or more (the feeding time is best) and run `autocalib` on that. A few minutes of cows lying
 is not enough: their boxes only twitch, and a twitch is no evidence of where a cow stands.
 

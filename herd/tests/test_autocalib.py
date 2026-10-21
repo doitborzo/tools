@@ -181,7 +181,7 @@ def test_recordings_looked_at_whole_despite_the_masks():
         autocalib.main(["--config", cfg, "--videos", rec, "--out", out], live=live)
         pair = json.load(open(os.path.join(out, "calib.json")))["pairs"]["cam1:cam2"]
         assert pair["lag"] in (6, 7, 8) and pair["share"] > 0.7, pair
-        assert os.path.exists(os.path.join(out, "cam1_cam2.jpg"))
+        assert os.path.exists(os.path.join(out, "cam1_cam2.jpg")) and os.path.exists(os.path.join(out, "cam1_cam2_moving.jpg"))
         n = live.calls
         autocalib.main(["--config", cfg, "--videos", rec, "--out", out], live=live)
         assert live.calls == n                                              # the boxes read back
