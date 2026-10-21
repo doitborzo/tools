@@ -134,12 +134,15 @@ def score(store_path, cfg, boxes_dir, labels_path, max_dt=0.6, min_iou=0.3):
     tm = report.track_map(store)
     frames = {f["file"]: f for f in json.load(open(os.path.join(boxes_dir, "frames.json"), encoding="utf-8"))["frames"]}
     cams = {c["id"]: c for c in cfg["cameras"]}
+    labels = read_labels(labels_path)
+    shift = clock_shift(store, [frames[k] for k, v in labels.items() if v.get("status") == "done" and k in frames])
     co, cam_co = collections.Counter(), collections.defaultdict(collections.Counter)
     n = collections.Counter()                      # (cam, what) -> boxes
-    for file, lab in read_labels(labels_path).items():
+    for file, lab in labels.items():
         f = frames.get(file)
         if lab.get("status") != "done" or not f or f["cam"] not in cams:
             continue
+        f = dict(f, ts=f["ts"] + shift)
         cam = f["cam"]
         truth = [(b[:4], str(b[4]).strip()) for b in lab.get("boxes", []) if len(b) >= 5 and str(b[4]).strip()
                  and str(b[4]).strip().lower() != "x"]
@@ -185,11 +188,34 @@ def score(store_path, cfg, boxes_dir, labels_path, max_dt=0.6, min_iou=0.3):
     out["merged"] = {p: dict(cnt.most_common()) for p, cnt in by_pred.items() if len(big(cnt)) > 1}
     out["split"] = {t: dict(cnt.most_common()) for t, cnt in by_true.items() if len(big(cnt)) > 1}
     out["your_cows"], out["its_cows"] = len(by_true), len(by_pred)
+    out["clock_shift_s"] = shift
     return out
+
+
+def clock_shift(store, frames):
+    """Whole hours to add to the frames' clock to land in this run: frames cut with another time zone
+    (timezone_offset_hours changed since) are as many hours off. 0 when they land as they are."""
+    span = {cam: (a, b) for cam, a, b in store.query("SELECT cam, MIN(ts), MAX(ts) FROM seconds GROUP BY cam")}
+    hits = lambda off: sum(1 for f in frames if f["cam"] in span and span[f["cam"]][0] - 1 <= f["ts"] + off
+                           <= span[f["cam"]][1] + 1)
+    best = max(range(-14, 15), key=lambda h: (hits(h * 3600), -abs(h)))
+    if hits(best * 3600) <= hits(0):
+        if frames and not hits(0):
+            fr = sorted(f["ts"] for f in frames)
+            print(f"[score] none of your {len(frames)} frames is in this run: they are from "
+                  f"{dt.datetime.utcfromtimestamp(fr[0]):%Y-%m-%d %H:%M} to {dt.datetime.utcfromtimestamp(fr[-1]):%H:%M} "
+                  f"UTC, the run from {dt.datetime.utcfromtimestamp(min(a for a, _ in span.values())):%Y-%m-%d %H:%M}"
+                  f" to {dt.datetime.utcfromtimestamp(max(b for _, b in span.values())):%H:%M} UTC", flush=True)
+        return 0.0
+    print(f"[score] your frames' clock is {best:+d} h off this run's: cut with another timezone_offset_hours than "
+          f"the config has now - taken into account ({hits(best * 3600)} of {len(frames)} frames in the run)", flush=True)
+    return best * 3600.0
 
 
 def print_score(sc):
     a = sc["all"]
+    if sc.get("clock_shift_s"):
+        print(f"[score] (your frames' clock moved {sc['clock_shift_s'] / 3600:+.0f} h to this run's)")
     print(f"\n[score] against your labels: {a['your_boxes']} boxes of {sc['your_cows']} cows on {a['frames']} frames"
           + (f" ({a['frames_not_played']} frames not in this run)" if a["frames_not_played"] else ""))
     print(f"  found {a['found'] / max(1, a['your_boxes']):.0%} of your boxes, {a['found_with_a_cow'] / max(1, a['your_boxes']):.0%}"

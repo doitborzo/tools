@@ -738,3 +738,27 @@ def test_trial_scored_against_your_ids():
         a = sc["all"]
         assert a["frames"] == 4 and a["frames_not_played"] == 1 and a["your_boxes"] == 8 and a["found"] == 8
         assert abs(a["idf1"] - 0.5) < 1e-9 and list(sc["merged"]) == ["P1"] and sc["your_cows"] == 2
+
+
+def test_trial_score_finds_frames_cut_with_another_time_zone():
+    """Frames cut when timezone_offset_hours was one more: an hour off the run - found and scored."""
+    import trial
+    from store import Store
+    with tempfile.TemporaryDirectory() as d:
+        st = os.path.join(d, "s.sqlite")
+        s = Store(st)
+        s.seconds([("cam1", "t1", float(t), 0.1, 0.4, 0.3, 0.6, "lying", "none", 0.9) for t in range(5000, 5100)])
+        for k in range(3):
+            s.burst(("cam1", "t1", 5000.0 + k, "confirmed", "P1", 0.9, 0.2, 0.9, 0.1, "lying", "none", None, 0.5, 100))
+        boxes = os.path.join(d, "boxes")
+        os.makedirs(boxes)
+        frames = [{"file": f"f{t}.jpg", "cam": "cam1", "ts": float(t) - 3600, "w": 1920, "h": 1080}
+                  for t in range(5010, 5090, 10)]
+        json.dump({"frames": frames}, open(os.path.join(boxes, "frames.json"), "w"))
+        labels = os.path.join(d, "labels.json")
+        json.dump({"frames": {f["file"]: {"status": "done", "boxes": [[0.1, 0.4, 0.3, 0.6, "4"]]} for f in frames}},
+                  open(labels, "w"))
+        cfg = _cfg()
+        cfg["cameras"] = [{"id": "cam1", "mask": []}]
+        sc = trial.score(st, cfg, boxes, labels)
+        assert sc["clock_shift_s"] == 3600 and sc["all"]["frames"] == 8 and sc["all"]["idf1"] == 1.0, sc["all"]
