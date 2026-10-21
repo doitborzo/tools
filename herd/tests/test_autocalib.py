@@ -1,5 +1,6 @@
 """Cameras calibrated by the cows themselves: two views of one floor, cows walking and lying."""
 import _paths  # noqa: F401
+import collections
 import json
 import os
 import tempfile
@@ -17,9 +18,9 @@ def _distort(q, k, ar=16 / 9):
     return p
 
 
-def _scene(d, lag=7, kB=-0.2, seconds=600, seed=0):
+def _rows(lag=7, kB=-0.2, seconds=600, seed=0):
+    """Two views of one floor, cows walking and lying: (cam, track, ts, x1, y1, x2, y2) every second."""
     from common import homography
-    from store import Store
     rng = np.random.default_rng(seed)
     floor = [(0, 0), (1000, 0), (1000, 800), (0, 800)]
     HA = homography(floor, [(0.1, 0.35), (0.9, 0.35), (0.98, 0.95), (0.02, 0.95)])       # from one side
@@ -34,7 +35,6 @@ def _scene(d, lag=7, kB=-0.2, seconds=600, seed=0):
                 p = np.clip(p + rng.normal(0, 25, 2), 50, 950)
             path.append(p.copy())
         cows.append(path)
-    store = Store(os.path.join(d, "s.sqlite"))
     rows = []
     for cam, H, k, off in (("cam1", HA, 0.0, 0), ("cam2", HB, kB, lag)):
         for i, path in enumerate(cows):
@@ -45,8 +45,14 @@ def _scene(d, lag=7, kB=-0.2, seconds=600, seed=0):
                     continue
                 u, v = u + rng.normal(0, 0.004), v + rng.normal(0, 0.004)
                 h, w = 0.12, 0.14
-                rows.append((cam, f"{cam}-{i}", 1000.0 + t + off, u - w / 2, v - h, u + w / 2, v, "lying", "none", 0.5))
-    store.seconds(rows)
+                rows.append((cam, f"{cam}-{i}", 1000.0 + t + off, u - w / 2, v - h, u + w / 2, v))
+    return rows
+
+
+def _scene(d, **kw):
+    from store import Store
+    store = Store(os.path.join(d, "s.sqlite"))
+    store.seconds([r + ("lying", "none", 0.5) for r in _rows(**kw)])
     return os.path.join(d, "s.sqlite")
 
 
@@ -117,3 +123,65 @@ def test_no_shared_floor_is_said_so():
             raise AssertionError("calibrated two pens that share no floor")
         except SystemExit as e:
             assert "no camera pair" in str(e)
+
+
+BITS = 11                                                     # the second, written into the picture's top row
+
+
+def _videos(d, lag=7, seconds=600, fps=2, size=(320, 180)):
+    """The scene as two recordings with the same start time, cam2's clock lag s behind: each frame carries
+    its second in white blocks, so the stand-in detector knows which boxes it shows."""
+    import cv2
+    boxes = collections.defaultdict(list)
+    for cam, _, ts, *b in _rows(lag=lag, seconds=seconds):
+        boxes[(cam, int(ts) - 1000)].append(b)
+    rec = os.path.join(d, "rec")
+    os.makedirs(rec)
+    for n, cam in enumerate(("cam1", "cam2")):
+        w = cv2.VideoWriter(os.path.join(rec, f"{cam}_2026-10-20_06-00-00.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
+                            fps, size)
+        for i in range(seconds * fps):
+            img = np.full((size[1], size[0], 3), 40, np.uint8)
+            code = i // fps + (n << (BITS - 1))
+            for bit in range(BITS):
+                if code >> bit & 1:
+                    img[0:20, bit * 24 + 2:bit * 24 + 22] = 255
+            w.write(img)
+        w.release()
+    return rec, boxes
+
+
+class _CodeLive:
+    """The detector: reads the second (and the camera) off the picture, gives that second's cows."""
+
+    def __init__(self, boxes):
+        self.boxes, self.calls = boxes, 0
+
+    def many(self, imgs):
+        out = []
+        for img in imgs:
+            a = np.asarray(img)
+            code = sum(1 << bit for bit in range(BITS) if a[2:18, bit * 24 + 5:bit * 24 + 19].mean() > 128)
+            cam = "cam2" if code >> (BITS - 1) else "cam1"
+            out.append([{"bbox": b, "det_score": 0.9} for b in self.boxes.get((cam, code & ((1 << (BITS - 1)) - 1)), [])])
+        self.calls += len(imgs)
+        return out
+
+
+def test_recordings_looked_at_whole_despite_the_masks():
+    """The masks cut the overlap away from cam1 (a run would store none of its cows there): the detector
+    looks at the recordings again, on the whole picture, and a second run reads its boxes back."""
+    import autocalib
+    with tempfile.TemporaryDirectory() as d:
+        rec, boxes = _videos(d)
+        cfg = os.path.join(d, "barn.toml")
+        open(cfg, "w").write(CONFIG.replace('url = "rtsp://a"', 'url = "rtsp://a"\nmask = [[0, 0], [0.05, 0], [0.05, 0.05], [0, 0.05]]'))
+        out = os.path.join(d, "calib")
+        live = _CodeLive(boxes)
+        autocalib.main(["--config", cfg, "--videos", rec, "--out", out], live=live)
+        pair = json.load(open(os.path.join(out, "calib.json")))["pairs"]["cam1:cam2"]
+        assert pair["lag"] in (6, 7, 8) and pair["share"] > 0.7, pair
+        assert os.path.exists(os.path.join(out, "cam1_cam2.jpg"))
+        n = live.calls
+        autocalib.main(["--config", cfg, "--videos", rec, "--out", out], live=live)
+        assert live.calls == n                                              # the boxes read back

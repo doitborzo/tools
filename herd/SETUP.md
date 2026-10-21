@@ -221,8 +221,8 @@ The vet's answers (`verdict`) are what tell whether the alerts are worth anythin
      are joined once their floor points agree for a few seconds — the best mode on
      MmCows), and give each camera a `tracking_mask` slightly wider than its `mask`.
 
-  No marks to measure: `herd.py autocalib --config barn.toml --store <a run on recordings>/herd.sqlite
-  --videos <recordings> --out calib --apply` finds the cows that move at the same moments on two
+  No marks to measure: `herd.py autocalib --config barn.toml --videos <recordings> --out calib
+  --apply` looks at every second of the recordings with the detector (whole picture) and finds the cows that move at the same moments on two
   cameras and fits the floor mapping (and each wide lens's bend, and the clocks' lag) from them -
   `docker/README.md` section 6.
 

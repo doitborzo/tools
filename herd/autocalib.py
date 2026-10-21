@@ -3,8 +3,9 @@
 
 [mct] link joins one cow's tracks on two cameras by where she stands on the floor, which needs every
 camera's picture mapped onto one floor plan (floor_points). Marks measured by hand are not needed:
-a cow that gets up, walks or turns does it at the same moment on every camera that sees her. From a
-run on recordings (herd.py trial, or herd.py run --start) - the boxes of every second of every camera:
+a cow that gets up, walks or turns does it at the same moment on every camera that sees her. The
+detector looks at every second of the recordings, on each camera's whole picture (a run's store will
+not do when the masks cut the shared floor away from one camera) - the boxes of every second:
 
   1. each track's motion (how far her box moved each second, in her own heights) on each camera; the
      tracks of two cameras that move together (correlated over 20 s and more) are the same cow - and
@@ -20,7 +21,7 @@ run on recordings (herd.py trial, or herd.py run --start) - the boxes of every s
   -> OUT/calib.json, OUT/<a>_<b>.jpg (the other camera's cows drawn onto this one's picture: they should
      sit on its cows), and with --apply the cameras' floor_points / distortion and [mct] link in barn.toml.
 
-    python herd/herd.py autocalib --config barn.toml --store trial/pass2/herd.sqlite --videos rec --out calib
+    python herd/herd.py autocalib --config barn.toml --videos rec --out calib
     python herd/herd.py autocalib ... --pairs cam1:cam2 cam2:cam3 --apply
 """
 
@@ -39,7 +40,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from common import homography, load_config, recordings, undistort  # noqa: E402
+from common import blank_excluded, homography, in_zone, load_config, recordings, undistort  # noqa: E402
 
 K_GRID = (0.0, -0.1, -0.2, -0.3)
 
@@ -48,9 +49,97 @@ K_GRID = (0.0, -0.1, -0.2, -0.3)
 
 def load_tracks(store, cam):
     """{track: {second: (u, v, box height, box width)}} - u v the box's bottom centre (0-1)."""
+    return _tracks(store.query("SELECT track, ts, x1, y1, x2, y2 FROM seconds WHERE cam = ?", (cam,)))
+
+
+def detect_tracks(cfg, cam, recs, out, live=None, every_s=1.0):
+    """The camera's cows over its whole picture, every second of its recordings, tracked -> as load_tracks.
+
+    A run's store has only the cows in each camera's own mask - and overlapping cameras' masks are cut
+    so that the shared floor belongs to one of them: the other never stores the cows there. So the
+    detector looks again here, on the whole picture (only the exclude zone grey, as in the barn); the
+    boxes are kept in OUT/boxes_<cam>.json and a second run on the same recordings reads them back."""
+    import cv2
+    from PIL import Image
+    from pipeline import Tracker
+    cache = os.path.join(out, f"boxes_{cam}.json")
+    names = [os.path.basename(p_) for p_, _ in recs]
+    if os.path.exists(cache):
+        old = json.load(open(cache, encoding="utf-8"))
+        if old.get("files") == names:
+            print(f"[calib] {cam}: boxes of {len(names)} recordings from {cache}", flush=True)
+            return _tracks(old["rows"])
+    if live is None:
+        import detector as det_mod
+        weights = cfg["detector"]["weights"]
+        if not weights or not os.path.isdir(weights):
+            sys.exit(f"[calib] [detector] weights = {weights!r}: no detector there (herd.py autocalib needs it to "
+                     "see the cows on the whole picture; or give --store of a run)")
+        live = det_mod.Live(weights, threshold=cfg["detector"]["threshold"] or None,
+                            tiles=cfg["detector"].get("tiles"))
+    c = next(x for x in cfg["cameras"] if x["id"] == cam)
+    whole = {**c, "mask": None, "tracking_mask": None}            # the whole picture, minus exclude
+    width = cfg["sampling"]["frame_width"]
+    tracker, rows = Tracker(cam), []
+
+    def flush(batch):
+        for (ts, w, h), found in zip([b[0] for b in batch], live.many([b[1] for b in batch])):
+            boxes = [d["bbox"] for d in found if in_zone(d["bbox"], whole, w, h)]
+            for tid, b in tracker.update(ts, boxes):
+                rows.append([tid, ts, *[round(float(v), 4) for v in b]])
+        batch.clear()
+
+    for path, start in recs:
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            print(f"[calib] {cam}: cannot open {path}", flush=True)
+            continue
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        fps = fps if 1.0 <= fps <= 120.0 else 25.0
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        t, bad, last, said, batch = -1.0, 0, None, 0.0, []
+        while True:
+            if not cap.grab():                                    # a damaged stretch: skipped, as frames_from
+                bad += 1
+                if bad > 100 or (n and cap.get(cv2.CAP_PROP_POS_FRAMES) >= n - 1):
+                    break
+                continue
+            bad = 0
+            ms = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            t = ms if ms > t else t + 1.0 / fps
+            sec = int(t // every_s)
+            if sec == last:
+                continue
+            last = sec
+            ok, f = cap.retrieve()
+            if not ok:
+                continue
+            img = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+            h, w = img.shape[:2]
+            if w > width:
+                img = cv2.resize(img, (width, int(h * width / w)), interpolation=cv2.INTER_AREA)
+                h, w = img.shape[:2]
+            if c.get("blank_excluded", True):
+                img = blank_excluded(img, c.get("exclude"))
+            batch.append(((float(start + sec * every_s), w, h), Image.fromarray(img)))
+            if len(batch) == 8:
+                flush(batch)
+            if t - said >= 60:
+                said = t
+                print(f"\r[calib] {cam}: {os.path.basename(path)} {int(t // 60)} min, {len(rows)} cow-seconds",
+                      end="", flush=True)
+        flush(batch)
+        cap.release()
+    print(f"\r[calib] {cam}: {len(rows)} cow-seconds in {len(recs)} recordings" + " " * 20, flush=True)
+    os.makedirs(out, exist_ok=True)
+    with open(cache, "w", encoding="utf-8") as fh:
+        json.dump({"files": names, "rows": rows}, fh)
+    return _tracks(rows)
+
+
+def _tracks(rows):
     out = collections.defaultdict(dict)
-    for track, ts, x1, y1, x2, y2 in store.query(
-            "SELECT track, ts, x1, y1, x2, y2 FROM seconds WHERE cam = ?", (cam,)):
+    for track, ts, x1, y1, x2, y2 in rows:
         out[track][int(round(ts))] = ((x1 + x2) / 2, y2, max(y2 - y1, 0.02), max(x2 - x1, 0.02))
     return out
 
@@ -252,10 +341,12 @@ def draw(path, videos, cam_a, cam_b, TA, TB, H, lag, kA, kB, arA, arB):
     import cv2
     counts = collections.Counter(s for tr in TA.values() for s in tr) + collections.Counter(
         s - lag for tr in TB.values() for s in tr)
-    if not counts or cam_a not in videos:
+    if not counts:
+        return None
+    if not videos.get(cam_a):
         return None
     s = max(counts, key=counts.get)
-    vpath, start = videos[cam_a]
+    vpath, start = max((v for v in videos[cam_a] if v[1] <= s), key=lambda v: v[1], default=videos[cam_a][0])
     cap = cv2.VideoCapture(vpath)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     cap.set(cv2.CAP_PROP_POS_FRAMES, int(max(0, s - start) * fps))
@@ -323,11 +414,13 @@ def apply_config(path, calib, link_dist):
     load_config(path)                                             # still a config
 
 
-def main(argv=None):
+def main(argv=None, live=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", required=True)
-    p.add_argument("--store", required=True, help="a run on recordings (herd.py trial: trial/pass2/herd.sqlite)")
-    p.add_argument("--videos", default=None, help="the recordings (for the pictures, and their sizes)")
+    p.add_argument("--videos", default=None, help="the recordings: the detector looks at every second of them, on "
+                   "the whole picture (boxes kept in OUT, a second run reads them back)")
+    p.add_argument("--store", default=None, help="instead: a run's boxes (its store) - only when no camera's mask "
+                   "cuts the shared floor away (a run stores the cows in each camera's mask only)")
     p.add_argument("--out", required=True)
     p.add_argument("--pairs", nargs="*", default=None, help="camera pairs to calibrate, cam1:cam2 (default: every "
                    "pair not in [mct] disjoint)")
@@ -339,28 +432,46 @@ def main(argv=None):
     import cv2
     cfg = load_config(args.config)
     ids = [c["id"] for c in cfg["cameras"]]
-    store = Store(args.store)
-    T = {c: load_tracks(store, c) for c in ids}
-    videos, aspect = {}, {c: 16 / 9 for c in ids}
-    if args.videos:
-        recs, _ = recordings(args.videos, ids, cfg["farm"]["timezone_offset_hours"])
-        for cam, path, ts in recs:
-            if cam not in videos:
-                videos[cam] = (path, ts)
-                cap = cv2.VideoCapture(path)
-                w, h = cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-                cap.release()
-                if w and h:
-                    aspect[cam] = w / h
+    if not args.videos and not args.store:
+        p.error("--videos (the recordings) or --store (a run's boxes) is needed")
     disjoint = {frozenset(x) for x in cfg["mct"].get("disjoint", [])}
     pairs = [tuple(x.split(":")) for x in args.pairs] if args.pairs else \
         [(a, b) for a, b in itertools.combinations(ids, 2) if frozenset((a, b)) not in disjoint]
+    for a, b in pairs:
+        for x in (a, b):
+            if x not in ids:
+                sys.exit(f"[calib] {x}: no such camera in {args.config} ({', '.join(ids)})")
     os.makedirs(args.out, exist_ok=True)
+    videos, aspect = collections.defaultdict(list), {c: 16 / 9 for c in ids}
+    if args.videos:
+        recs, _ = recordings(args.videos, ids, cfg["farm"]["timezone_offset_hours"])
+        for cam, path, ts in sorted(recs, key=lambda r: r[2]):
+            videos[cam].append((path, ts))
+        for cam, vs in videos.items():
+            cap = cv2.VideoCapture(vs[0][0])
+            w, h = cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            cap.release()
+            if w and h:
+                aspect[cam] = w / h
+    used = sorted({x for ab in pairs for x in ab})
+    if args.store:
+        store = Store(args.store)
+        T = {c: load_tracks(store, c) for c in used}
+        cut = [c["id"] for c in cfg["cameras"] if c["id"] in used and c.get("mask")]
+        if cut:
+            print(f"[calib] {', '.join(cut)}: a mask - the run stored only the cows inside it; if it cuts the shared "
+                  "floor away, give --videos instead of --store", flush=True)
+    else:
+        T = {}
+        for c in used:
+            if not videos.get(c):
+                sys.exit(f"[calib] {c}: no recordings in {args.videos} (named {c}_YYYY-MM-DD_HH-MM-SS)")
+            T[c] = detect_tracks(cfg, c, videos[c], args.out, live=live)
     rng = np.random.default_rng(args.seed)
     found = {}
     for a, b in pairs:
         if not T.get(a) or not T.get(b):
-            print(f"[calib] {a}-{b}: no boxes of {a if not T.get(a) else b} in {args.store}")
+            print(f"[calib] {a}-{b}: no cows seen on {a if not T.get(a) else b}")
             continue
         lag, mv = moving_pairs(T[a], T[b], args.max_lag)
         print(f"[calib] {a}-{b}: {len(mv)} tracks moving together (clock lag {lag:+d} s)", flush=True)
@@ -386,8 +497,8 @@ def main(argv=None):
               f"{b} k={best['kB']}", flush=True)
         found[(a, b)] = best
     if not found:
-        sys.exit("[calib] no camera pair with shared floor - nothing written. A longer recording with cows walking "
-                 "through the overlap helps (herd.py trial on it first)")
+        sys.exit("[calib] no camera pair with shared floor - nothing written. A longer recording (an hour or more, "
+                 "with cows getting up and walking through the overlap: feeding time) helps")
     # one floor plan: from a reference camera along the pairs found (B -> A homographies chained)
     graph = collections.defaultdict(list)
     for (a, b), r in found.items():

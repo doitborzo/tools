@@ -84,7 +84,7 @@ docker/data on your computer is /data here: the config, the recordings, everythi
   trial --config /data/barn.toml --videos /data/rec_fixed --out /data/trial
                                  a dress rehearsal on the recordings: the gallery fills, then who is who
                                  drawn per camera (trial/show_<cam>/index.html)
-  autocalib --config /data/barn.toml --store /data/trial/pass2/herd.sqlite --videos /data/rec_fixed --out /data/calib --apply
+  autocalib --config /data/barn.toml --videos /data/rec_fixed --out /data/calib --apply
                                  cameras sharing floor calibrated by the cows moving in both ([mct] link)
   check --config /data/barn.toml   the models on your labels: the detector on herd_det_barn_*.tgz, the
                                  identity model on herd_barn_ids_*.tgz (the newest in /data)

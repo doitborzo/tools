@@ -275,8 +275,10 @@ cows: who is who. It writes:
 
 **Cameras that share floor, calibrated without measuring anything.** A cow seen by two cameras should
 be one cow. `[mct] link` joins her two tracks by where she stands on one floor plan. Marks measured by
-hand are not needed: a cow that gets up or walks does it at the same moment on both cameras. From the
-rehearsal's boxes, `autocalib` does four things:
+hand are not needed: a cow that gets up or walks does it at the same moment on both cameras. The
+detector looks at every second of the recordings, on each camera's whole picture (the rehearsal's
+store will not do: the masks cut the shared floor away from one of the two cameras). Then
+`autocalib` does four things:
 
 - finds those cows and the two cameras' clock difference;
 - fits the floor mapping between the cameras and each wide lens's bend;
@@ -284,7 +286,7 @@ rehearsal's boxes, `autocalib` does four things:
 - writes it all into `barn.toml`.
 
 ```bash
-docker compose run --rm herd autocalib --config /data/barn.toml --store /data/trial/pass2/herd.sqlite --videos /data/rec_fixed --out /data/calib --apply
+docker compose run --rm herd autocalib --config /data/barn.toml --videos /data/rec_fixed --out /data/calib --pairs cam1:cam2 --apply
 ```
 
 The log says, per camera pair:
@@ -295,8 +297,9 @@ The log says, per camera pair:
 
 Look at `docker/data/calib/cam1_cam2.jpg`: the other camera's cows (red crosses) should sit on this
 camera's cows (green circles). Then run `trial` again: a cow in the overlap should now have one id on
-both cameras. If no pair is found, too few cows moved through the overlap: record longer (the
-feeding time is best) and run `trial` and `autocalib` on that.
+both cameras. The boxes are kept in `docker/data/calib/boxes_<cam>.json`: a second run on the same
+recordings skips the detector. If no pair is found, too few cows moved through the overlap: record
+an hour or more (the feeding time is best) and run `autocalib` on that.
 
 ## 7. The barn, live
 
